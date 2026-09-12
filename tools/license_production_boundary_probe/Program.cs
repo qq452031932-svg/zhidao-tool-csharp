@@ -12,7 +12,13 @@ internal static class Program
                 !DateTimeOffset.TryParseExact(args[1], "O", null, System.Globalization.DateTimeStyles.RoundtripKind, out var now) || now.Offset != TimeSpan.Zero ||
                 !Path.IsPathFullyQualified(args[3])) return Emit("invalid_invocation", 2);
             var root = Path.GetFullPath(args[3]);
-            Directory.CreateDirectory(root);
+            var approvedBase = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SuperPan", "Licensing", "BoundaryProbe"));
+            var rootInfo = new DirectoryInfo(root);
+            if (!rootInfo.Exists || rootInfo.Attributes.HasFlag(FileAttributes.ReparsePoint) ||
+                !string.Equals(rootInfo.Parent?.FullName, approvedBase, StringComparison.OrdinalIgnoreCase) ||
+                !rootInfo.Name.StartsWith("probe-", StringComparison.Ordinal) ||
+                !File.Exists(Path.Combine(root, ".superpan-boundary-probe-root")) ||
+                !File.Exists(Path.Combine(root, "licenses.dat"))) return Emit("invalid_store_root", 2);
             var trust = ReadTrust();
             var clock = new FixedTimeProvider(now);
             using var verifier = new SignedLicenseEnvelopeVerifier(trust.Options, clock);

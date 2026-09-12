@@ -2,84 +2,85 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidatePattern('^https://[^\s;,]+$')][string]$Endpoint,
-    [Parameter(Mandatory)][string]$ManifestAPath,
-    [Parameter(Mandatory)][string]$ManifestBCPath,
-    [Parameter(Mandatory)][string]$InstalledResponseSigningKeyId,
-    [Parameter(Mandatory)][string]$InstalledResponseSigningSpkiDerBase64,
-    [Parameter(Mandatory)][string]$ChallengePath,
-    [Parameter(Mandatory)][string]$ChallengeSignatureBase64,
+    [Parameter(Mandatory)][string]$ClientRootA,
+    [Parameter(Mandatory)][string]$ClientRootBC,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedSourceCommit,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9.-]+$')][string]$ServerHost,
+    [Parameter(Mandatory)][string]$ProbeStoreRoot,
+    [Parameter(Mandatory)][DateTimeOffset]$ProbeUtcNow,
     [Parameter(Mandatory)][string]$EvidencePath,
     [ValidateRange(10,3600)][int]$PhaseTimeoutSeconds = 900
 )
 $ErrorActionPreference = 'Stop'; Set-StrictMode -Version Latest
 
-function Read-Manifest([string]$Path) {
-    $full = [IO.Path]::GetFullPath($Path)
-    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'Client trust manifest is missing.' }
-    $value = Get-Content -LiteralPath $full -Raw | ConvertFrom-Json
-    if ($value.origin -cne 'https://ota.fanfh.cn' -or $value.superPanProduct -cne '8270e8d7-1791-487d-ad76-0da7a0cbed12' -or
-        $value.currentTlsSpki -cnotmatch '^[0-9a-f]{64}$' -or $value.nextTlsSpki -cnotmatch '^[0-9a-f]{64}$' -or
-        $value.currentTlsSpki -ceq $value.nextTlsSpki -or $value.signingKeyId -match 'placeholder|changeme|example' -or
-        [string]::IsNullOrWhiteSpace($value.signingSpkiDerBase64)) { throw 'Client trust manifest is invalid.' }
+function Read-VerifiedClientRoot([string]$Root) {
+    $root = [IO.Path]::GetFullPath($Root); $manifestPath = Join-Path $root 'production-license-clients.json'; $signaturePath = $manifestPath + '.p7s'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or -not (Test-Path -LiteralPath $signaturePath -PathType Leaf)) { throw 'Signed client manifest is missing.' }
+    $bytes = [IO.File]::ReadAllBytes($manifestPath)
+    $cms = [Security.Cryptography.Pkcs.SignedCms]::new([Security.Cryptography.Pkcs.ContentInfo]::new($bytes), $true); $cms.Decode([IO.File]::ReadAllBytes($signaturePath)); $cms.CheckSignature($true)
+    if ($cms.SignerInfos.Count -ne 1) { throw 'Client manifest must have exactly one signer.' }
+    $value = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+    if ($value.sourceCommit -cne $ExpectedSourceCommit -or $value.origin -cne 'https://ota.fanfh.cn' -or
+        $value.superPanProduct -cne '8270e8d7-1791-487d-ad76-0da7a0cbed12' -or $value.currentTlsSpki -cnotmatch '^[0-9a-f]{64}$' -or
+        $value.nextTlsSpki -cnotmatch '^[0-9a-f]{64}$' -or $value.currentTlsSpki -ceq $value.nextTlsSpki -or
+        $cms.SignerInfos[0].Certificate.Thumbprint -cne $value.artifacts[0].signerThumbprint) { throw 'Signed client manifest identity is invalid.' }
+    $expected = @{}
+    foreach ($file in @($value.files)) {
+        if ($file.path -notmatch '^(superpan|smoke-nonshipping|boundary-probe-nonshipping)/[^/].*$' -or $file.path -match '\.\.') { throw 'Manifest file path is invalid.' }
+        $path = [IO.Path]::GetFullPath((Join-Path $root $file.path.Replace('/',[IO.Path]::DirectorySeparatorChar)))
+        if (-not $path.StartsWith($root.TrimEnd([IO.Path]::DirectorySeparatorChar)+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase) -or -not $expected.TryAdd($path,$file.sha256)) { throw 'Manifest path escapes or duplicates.' }
+    }
+    $actual = @(foreach ($role in @('superpan','smoke-nonshipping','boundary-probe-nonshipping')) { Get-ChildItem -LiteralPath (Join-Path $root $role) -File -Recurse | Select-Object -ExpandProperty FullName })
+    if ($actual.Count -ne $expected.Count) { throw 'Client tree contains missing or extra files.' }
+    foreach ($path in $actual) { if (-not $expected.ContainsKey($path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected[$path]) { throw 'Client artifact hash mismatch.' } }
+    foreach ($artifact in @($value.artifacts)) {
+        $path = Join-Path (Join-Path $root $artifact.role) $artifact.file; $auth = Get-AuthenticodeSignature -LiteralPath $path
+        if ($auth.Status -ne 'Valid' -or $auth.SignerCertificate.Thumbprint -cne $artifact.signerThumbprint -or $null -eq $auth.TimeStamperCertificate -or
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.sha256) { throw 'Exact client Authenticode identity is invalid.' }
+    }
     return $value
 }
 
-function Import-CanonicalP256([string]$Base64) {
-    $der = [Convert]::FromBase64String($Base64)
-    $key = [Security.Cryptography.ECDsa]::Create()
-    try {
-        $read = 0
-        $key.ImportSubjectPublicKeyInfo($der, [ref]$read)
-        if ($read -ne $der.Length -or $key.KeySize -ne 256 -or [Convert]::ToBase64String($key.ExportSubjectPublicKeyInfo()) -cne $Base64) { throw 'invalid' }
-        return $key
-    } catch { $key.Dispose(); throw 'Response-signing SPKI must be canonical ECDSA P-256 DER base64.' }
-}
-
 function Get-ObservedTlsSpki([Uri]$Uri) {
-    $port = if ($Uri.IsDefaultPort) { 443 } else { $Uri.Port }
-    $captured = $null
-    $client = [Net.Sockets.TcpClient]::new()
+    $port = if ($Uri.IsDefaultPort) { 443 } else { $Uri.Port }; $captured = $null; $client = [Net.Sockets.TcpClient]::new()
     try {
-        $client.Connect($Uri.DnsSafeHost, $port)
-        $callback = { param($sender,$certificate,$chain,$errors) $script:capturedCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificate); return $errors -eq [Net.Security.SslPolicyErrors]::None }
-        $stream = [Net.Security.SslStream]::new($client.GetStream(), $false, $callback)
-        try { $stream.AuthenticateAsClient($Uri.DnsSafeHost); $captured = $script:capturedCertificate }
-        finally { $stream.Dispose(); Remove-Variable capturedCertificate -Scope Script -ErrorAction SilentlyContinue }
-        if ($null -eq $captured) { throw 'TLS peer certificate was not captured.' }
+        $client.Connect($Uri.DnsSafeHost,$port)
+        $callback = { param($sender,$certificate,$chain,$errors) $script:capturedCertificate=[Security.Cryptography.X509Certificates.X509Certificate2]::new($certificate); return $errors -eq [Net.Security.SslPolicyErrors]::None }
+        $stream=[Net.Security.SslStream]::new($client.GetStream(),$false,$callback)
+        try { $stream.AuthenticateAsClient($Uri.DnsSafeHost); $captured=$script:capturedCertificate } finally { $stream.Dispose(); Remove-Variable capturedCertificate -Scope Script -ErrorAction SilentlyContinue }
         return ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($captured.PublicKey.ExportSubjectPublicKeyInfo()))).ToLowerInvariant()
-    } finally { if ($null -ne $captured) { $captured.Dispose() }; $client.Dispose() }
+    } finally { if($null-ne $captured){$captured.Dispose()};$client.Dispose() }
+}
+function Wait-ForPin([Uri]$Uri,[string]$Expected,[string]$Phase) { $deadline=[DateTime]::UtcNow.AddSeconds($PhaseTimeoutSeconds); do { try { if((Get-ObservedTlsSpki $Uri)-ceq $Expected){return} } catch{}; Start-Sleep 2 } while([DateTime]::UtcNow-lt $deadline); throw "TLS $Phase phase did not present the expected pin." }
+
+function Invoke-ExactSmoke([string]$Executable,[Security.SecureString]$Card) {
+    $bstr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($Card)
+    try {
+        $plain=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr); $start=[Diagnostics.ProcessStartInfo]::new($Executable); $start.UseShellExecute=$false; $start.RedirectStandardInput=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true; $start.ArgumentList.Add('activate');$start.ArgumentList.Add('--card-stdin')
+        $process=[Diagnostics.Process]::Start($start); $process.StandardInput.WriteLine($plain); $process.StandardInput.Close(); $output=$process.StandardOutput.ReadToEnd().Trim(); $process.WaitForExit()
+        if($process.ExitCode-ne 0-or $output-cne 'ok'){throw 'Exact signed smoke client did not authorize through the observed TLS phase.'}
+    } finally { if($null-ne $plain){$plain=$null};[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
-function Wait-ForPin([Uri]$Uri, [string]$Expected, [string]$Phase) {
-    $deadline = [DateTime]::UtcNow.AddSeconds($PhaseTimeoutSeconds)
-    do {
-        try { if ((Get-ObservedTlsSpki $Uri) -ceq $Expected) { return } } catch { }
-        Start-Sleep -Seconds 2
-    } while ([DateTime]::UtcNow -lt $deadline)
-    throw "TLS $Phase phase did not present the expected SPKI pin."
-}
+$uri=[Uri]$Endpoint
+if($uri.AbsoluteUri-cne 'https://ota.fanfh.cn/' -or $ServerHost-ne $uri.DnsSafeHost){throw 'Rotation endpoint and installed host must be the exact production origin.'}
+$a=Read-VerifiedClientRoot $ClientRootA; $bc=Read-VerifiedClientRoot $ClientRootBC
+if($a.nextTlsSpki-cne $bc.currentTlsSpki-or @(@($a.currentTlsSpki,$a.nextTlsSpki,$bc.nextTlsSpki)|Sort-Object -Unique).Count-ne 3-or $a.signingSpkiDerBase64-cne $bc.signingSpkiDerBase64-or $a.signingKeyId-cne $bc.signingKeyId){throw 'A/B and B/C signed manifests do not form one trust chain.'}
 
-$uri = [Uri]$Endpoint
-if ($uri.Scheme -cne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) { throw 'Endpoint must be credential-free HTTPS.' }
-$a = Read-Manifest $ManifestAPath; $bc = Read-Manifest $ManifestBCPath
-if ($a.nextTlsSpki -cne $bc.currentTlsSpki -or @(@($a.currentTlsSpki,$a.nextTlsSpki,$bc.nextTlsSpki) | Sort-Object -Unique).Count -ne 3) { throw 'A-to-B and B-to-C manifests are not a valid three-pin chain.' }
-if ($a.signingKeyId -cne $InstalledResponseSigningKeyId -or $bc.signingKeyId -cne $InstalledResponseSigningKeyId -or
-    $a.signingSpkiDerBase64 -cne $InstalledResponseSigningSpkiDerBase64 -or $bc.signingSpkiDerBase64 -cne $InstalledResponseSigningSpkiDerBase64) { throw 'Installed response-signing identity differs from the exact clients.' }
-$key = Import-CanonicalP256 $InstalledResponseSigningSpkiDerBase64
-try {
-    $challenge = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($ChallengePath)); $signature = [Convert]::FromBase64String($ChallengeSignatureBase64)
-    if ($challenge.Length -lt 32 -or -not $key.VerifyData($challenge, $signature, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::Rfc3279DerSequence)) { throw 'Response-signing challenge verification failed.' }
-    $spkiHash = ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($key.ExportSubjectPublicKeyInfo()))).ToLowerInvariant()
-} finally { $key.Dispose() }
+$challenge=[Text.Encoding]::UTF8.GetBytes(([ordered]@{nonce=[Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant();endpoint=$uri.AbsoluteUri;sourceCommit=$ExpectedSourceCommit;issuedUtc=[DateTime]::UtcNow.ToString('O')}|ConvertTo-Json -Compress))
+$remote='set -eu; umask 077; t=$(mktemp); trap ''rm -f "$t"'' EXIT; base64 -d >"$t"; cat /etc/superpan-license/response-signing.key-id; base64 -w0 /etc/superpan-license/response-signing.spki.der; printf "\n"; openssl dgst -sha256 -sign /etc/superpan-license/response-signing.pem "$t" | base64 -w0; printf "\n"'
+$remoteLines=@([Convert]::ToBase64String($challenge)|& ssh -- ("root@"+$ServerHost) $remote)
+if($LASTEXITCODE-ne 0-or $remoteLines.Count-ne 3-or $remoteLines[0]-cne $a.signingKeyId-or $remoteLines[1]-cne $a.signingSpkiDerBase64){throw 'Installed response-signing identity does not match the exact clients.'}
+$der=[Convert]::FromBase64String($remoteLines[1]);$key=[Security.Cryptography.ECDsa]::Create()
+try{$read=0;$key.ImportSubjectPublicKeyInfo($der,[ref]$read);if($read-ne $der.Length-or $key.KeySize-ne 256-or[Convert]::ToBase64String($key.ExportSubjectPublicKeyInfo())-cne $remoteLines[1]-or-not $key.VerifyData($challenge,[Convert]::FromBase64String($remoteLines[2]),[Security.Cryptography.HashAlgorithmName]::SHA256,[Security.Cryptography.DSASignatureFormat]::Rfc3279DerSequence)){throw 'Fresh installed response-signing challenge failed.'};$spkiHash=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der))).ToLowerInvariant()}finally{$key.Dispose()}
 
-Wait-ForPin $uri $a.currentTlsSpki 'A'
-Write-Host 'A verified. Switch the authorized local/staging endpoint to B; this process will wait and verify it.'
-Wait-ForPin $uri $a.nextTlsSpki 'B'
-Write-Host 'B verified. Roll the authorized local/staging endpoint back to A; this process will wait and verify it.'
-Wait-ForPin $uri $a.currentTlsSpki 'rollback-A'
+$card=Read-Host 'Enter the deployment-smoke card (kept only in secure memory and sent only to the signed smoke client stdin)' -AsSecureString
+$smoke=Join-Path (Join-Path ([IO.Path]::GetFullPath($ClientRootA)) 'smoke-nonshipping') 'SuperPan.Licensing.ProductionSmoke.NonShipping.exe'
+Wait-ForPin $uri $a.currentTlsSpki 'A'; Invoke-ExactSmoke $smoke $card
+Write-Host 'A verified. Switch the authorized endpoint to B.';Wait-ForPin $uri $a.nextTlsSpki 'B';Invoke-ExactSmoke $smoke $card
+Write-Host 'B verified. Roll the authorized endpoint back to A.';Wait-ForPin $uri $a.currentTlsSpki 'rollback-A';Invoke-ExactSmoke $smoke $card
 
-$record = [ordered]@{ rehearsal='A-to-B-to-A'; nextManifest='B-to-C'; endpointHost=$uri.DnsSafeHost; pinA=$a.currentTlsSpki; pinB=$a.nextTlsSpki; pinC=$bc.nextTlsSpki; responseSigningKeyId=$InstalledResponseSigningKeyId; responseSigningSpkiSha256=$spkiHash; challengeSha256=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($challenge))).ToLowerInvariant(); privateMaterial='private material was never read or recorded'; completedUtc=[DateTime]::UtcNow.ToString('O') }
-$json = $record | ConvertTo-Json
-if ($json -match 'PRIVATE KEY|card=|password|secret') { throw 'Evidence redaction failed.' }
-$evidenceFull = [IO.Path]::GetFullPath($EvidencePath); [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($evidenceFull)) | Out-Null
-[IO.File]::WriteAllText($evidenceFull, $json + "`n", [Text.UTF8Encoding]::new($false))
+$probe=Join-Path (Join-Path ([IO.Path]::GetFullPath($ClientRootA)) 'boundary-probe-nonshipping') 'SuperPan.Licensing.BOUNDARY-PROBE-NONSHIPPING.exe'
+& $probe --utc-now $ProbeUtcNow.ToUniversalTime().ToString('O') --store-root ([IO.Path]::GetFullPath($ProbeStoreRoot));if($LASTEXITCODE-ne 0){throw 'Exact signed boundary probe did not authorize the cached lease.'}
+$record=[ordered]@{rehearsal='A-to-B-to-A';nextManifest='B-to-C';sourceCommit=$ExpectedSourceCommit;endpointHost=$uri.DnsSafeHost;pinA=$a.currentTlsSpki;pinB=$a.nextTlsSpki;pinC=$bc.nextTlsSpki;responseSigningKeyId=$a.signingKeyId;responseSigningSpkiSha256=$spkiHash;challengeSha256=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($challenge))).ToLowerInvariant();privateMaterial='private material was never read or recorded';completedUtc=[DateTime]::UtcNow.ToString('O')}
+$json=$record|ConvertTo-Json;if($json-match'PRIVATE KEY|card=|password|secret'){throw'Evidence redaction failed.'};$full=[IO.Path]::GetFullPath($EvidencePath);[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($full))|Out-Null;[IO.File]::WriteAllText($full,$json+"`n",[Text.UTF8Encoding]::new($false))

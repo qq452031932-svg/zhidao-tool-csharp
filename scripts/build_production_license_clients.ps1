@@ -9,7 +9,7 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{40}$')][string]$SigningCertificateThumbprint,
     [Parameter(Mandatory)][ValidatePattern('^https://[^\s;,]+$')][string]$TimestampUrl,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [string]$ManagedBrowserHelperPackageDirectory
+    [Parameter(Mandatory)][string]$ManagedBrowserHelperPackageDirectory
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -38,6 +38,11 @@ try {
 } catch { throw 'LicenseSigningPublicKey must be canonical ECDSA P-256 SPKI DER base64.' } finally { if ($null -ne $ec) { $ec.Dispose() } }
 
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$helperPackage = [IO.Path]::GetFullPath($ManagedBrowserHelperPackageDirectory)
+Assert-LocalDrivePath $helperPackage
+Assert-NoReparsePointAncestors $helperPackage
+if ($ManagedBrowserHelperPackageDirectory -match '[;,%"'']' -or -not (Test-Path -LiteralPath (Join-Path $helperPackage 'helper-manifest.json') -PathType Leaf) -or
+    ((Get-Item -LiteralPath $helperPackage).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Managed-browser helper package path is invalid or injection-prone.' }
 $head = (& git -C $repo rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $head -cne $SourceCommit) { throw 'SourceCommit must equal the checked-out HEAD.' }
 $dirty = @(& git -C $repo status --porcelain=v1 --untracked-files=all)
@@ -62,13 +67,21 @@ if (Test-Path -LiteralPath $output) { throw 'OutputDirectory must not already ex
 $stage = "$output.partial-$([Guid]::NewGuid().ToString('N'))"
 [IO.Directory]::CreateDirectory($stage) | Out-Null
 try {
+    $buildRepo = Join-Path $stage 'source'
+    $archive = Join-Path $stage 'source.tar'
+    [IO.Directory]::CreateDirectory($buildRepo) | Out-Null
+    & git -C $repo archive --format=tar --output=$archive $SourceCommit
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to export the exact source commit.' }
+    & tar -xf $archive -C $buildRepo
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to extract the exact source commit.' }
+    Remove-Item -LiteralPath $archive -Force
     $common = @('-c','Release','-p:RestoreLockedMode=true','-p:LicenseSigningKeyId='+$LicenseSigningKeyId,'-p:LicenseSigningPublicKey='+$LicenseSigningPublicKey,'-p:LicenseCurrentSpkiPin='+$CurrentTlsSpkiPin,'-p:LicenseNextSpkiPin='+$NextTlsSpkiPin)
     $superpan = Join-Path $stage 'superpan'; $smoke = Join-Path $stage 'smoke-nonshipping'; $probe = Join-Path $stage 'boundary-probe-nonshipping'
-    $appArgs = @('publish',(Join-Path $repo 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'),'-o',$superpan) + $common + @('-p:LicenseServiceUrl='+$origin,'-p:LicenseProductId='+$superPanProduct)
-    if ($ManagedBrowserHelperPackageDirectory) { $appArgs += '-p:ManagedBrowserHelperPackageDirectory='+[IO.Path]::GetFullPath($ManagedBrowserHelperPackageDirectory) }
+    $appArgs = @('publish',(Join-Path $buildRepo 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'),'-o',$superpan) + $common + @('-p:LicenseServiceUrl='+$origin,'-p:LicenseProductId='+$superPanProduct,'-p:ManagedBrowserHelperPackageDirectory='+$helperPackage)
     & dotnet @appArgs; if ($LASTEXITCODE -ne 0) { throw 'SuperPan production publish failed.' }
-    & dotnet publish (Join-Path $repo 'tools\license_production_smoke\SuperPan.Licensing.ProductionSmoke.csproj') -o $smoke @common; if ($LASTEXITCODE -ne 0) { throw 'Smoke publish failed.' }
-    & dotnet publish (Join-Path $repo 'tools\license_production_boundary_probe\SuperPan.Licensing.ProductionBoundaryProbe.csproj') -o $probe @common; if ($LASTEXITCODE -ne 0) { throw 'Boundary probe publish failed.' }
+    & dotnet publish (Join-Path $buildRepo 'tools\license_production_smoke\SuperPan.Licensing.ProductionSmoke.csproj') -o $smoke @common; if ($LASTEXITCODE -ne 0) { throw 'Smoke publish failed.' }
+    & dotnet publish (Join-Path $buildRepo 'tools\license_production_boundary_probe\SuperPan.Licensing.ProductionBoundaryProbe.csproj') -o $probe @common; if ($LASTEXITCODE -ne 0) { throw 'Boundary probe publish failed.' }
+    Remove-Item -LiteralPath $buildRepo -Recurse -Force
 
     $artifacts = @((Join-Path $superpan 'BaiduBatchTransfer.App.exe'),(Join-Path $smoke 'SuperPan.Licensing.ProductionSmoke.NonShipping.exe'),(Join-Path $probe 'SuperPan.Licensing.BOUNDARY-PROBE-NONSHIPPING.exe'))
     $signtool = (Get-Command signtool.exe -ErrorAction Stop).Source
@@ -83,7 +96,14 @@ try {
         if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -cne $thumbprint -or $null -eq $signature.TimeStamperCertificate) { throw 'Authenticode signer or timestamp identity mismatch.' }
         $manifest += [ordered]@{ role = Split-Path (Split-Path $artifact -Parent) -Leaf; file = Split-Path $artifact -Leaf; sha256 = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant(); signerThumbprint = $thumbprint }
     }
-    $manifestJson = [ordered]@{ sourceCommit=$SourceCommit; origin=$origin; superPanProduct=$superPanProduct; smokeProduct=$smokeProduct; signingKeyId=$LicenseSigningKeyId; signingSpkiDerBase64=$LicenseSigningPublicKey; signingSpkiSha256=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der))).ToLowerInvariant(); currentTlsSpki=$CurrentTlsSpkiPin; nextTlsSpki=$NextTlsSpkiPin; artifacts=$manifest } | ConvertTo-Json -Depth 5
-    [IO.File]::WriteAllText((Join-Path $stage 'production-license-clients.json'), $manifestJson + "`n", [Text.UTF8Encoding]::new($false))
+    $files = foreach ($role in @('superpan','smoke-nonshipping','boundary-probe-nonshipping')) { Get-ChildItem -LiteralPath (Join-Path $stage $role) -File -Recurse | ForEach-Object { [ordered]@{ path=($role + '/' + [IO.Path]::GetRelativePath((Join-Path $stage $role), $_.FullName).Replace('\','/')); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } } }
+    $manifestJson = [ordered]@{ sourceCommit=$SourceCommit; origin=$origin; superPanProduct=$superPanProduct; smokeProduct=$smokeProduct; signingKeyId=$LicenseSigningKeyId; signingSpkiDerBase64=$LicenseSigningPublicKey; signingSpkiSha256=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der))).ToLowerInvariant(); currentTlsSpki=$CurrentTlsSpkiPin; nextTlsSpki=$NextTlsSpkiPin; artifacts=$manifest; files=@($files) } | ConvertTo-Json -Depth 5
+    $manifestPath = Join-Path $stage 'production-license-clients.json'
+    [IO.File]::WriteAllText($manifestPath, $manifestJson + "`n", [Text.UTF8Encoding]::new($false))
+    $cms = [Security.Cryptography.Pkcs.SignedCms]::new([Security.Cryptography.Pkcs.ContentInfo]::new([IO.File]::ReadAllBytes($manifestPath)), $true)
+    $cmsSigner = [Security.Cryptography.Pkcs.CmsSigner]::new($certificate); $cmsSigner.IncludeOption = [Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
+    $cms.ComputeSignature($cmsSigner); [IO.File]::WriteAllBytes($manifestPath + '.p7s', $cms.Encode())
+    $checkHead = (& git -C $repo rev-parse HEAD).Trim(); $checkDirty = @(& git -C $repo status --porcelain=v1 --untracked-files=all)
+    if ($LASTEXITCODE -ne 0 -or $checkHead -cne $SourceCommit -or $checkDirty.Count -ne 0) { throw 'Source changed during the exact snapshot build; publication aborted.' }
     [IO.Directory]::Move($stage, $output)
 } catch { if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }; throw }

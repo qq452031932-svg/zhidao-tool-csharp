@@ -25,6 +25,10 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("never an OTA stable feed", script, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("GetDirectoryName($output)", script, StringComparison.Ordinal);
         Assert.Contains("Assert-NoReparsePointAncestors", script, StringComparison.Ordinal);
+        Assert.Contains("ManagedBrowserHelperPackageDirectory -match", script, StringComparison.Ordinal);
+        Assert.Contains("git -C $repo archive", script, StringComparison.Ordinal);
+        Assert.Contains("SignedCms", script, StringComparison.Ordinal);
+        Assert.Contains("Source changed during", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -44,6 +48,11 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("VerifyData", script, StringComparison.Ordinal);
         Assert.Contains("signingSpkiDerBase64", script, StringComparison.Ordinal);
         Assert.Contains("currentTlsSpki", script, StringComparison.Ordinal);
+        Assert.Contains("Read-VerifiedClientRoot", script, StringComparison.Ordinal);
+        Assert.Contains("Get-AuthenticodeSignature", script, StringComparison.Ordinal);
+        Assert.Contains("RandomNumberGenerator", script, StringComparison.Ordinal);
+        Assert.Contains("root@", script, StringComparison.Ordinal);
+        Assert.Contains("Invoke-ExactSmoke", script, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>

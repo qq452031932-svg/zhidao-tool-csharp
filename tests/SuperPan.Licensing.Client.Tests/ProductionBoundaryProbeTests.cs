@@ -21,6 +21,10 @@ public sealed class ProductionBoundaryProbeTests
         Assert.DoesNotContain("--endpoint", program, StringComparison.Ordinal);
         Assert.DoesNotContain("--product", program, StringComparison.Ordinal);
         Assert.Contains("ProductionLicenseTrust.targets", project, StringComparison.Ordinal);
+        Assert.Contains("SpecialFolder.LocalApplicationData", program, StringComparison.Ordinal);
+        Assert.Contains(".superpan-boundary-probe-root", program, StringComparison.Ordinal);
+        Assert.Contains("FileAttributes.ReparsePoint", program, StringComparison.Ordinal);
+        Assert.Contains("rootInfo.Parent?.FullName", program, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>
