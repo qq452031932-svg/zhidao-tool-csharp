@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -23,6 +24,46 @@ func TestLoadAcceptsStrictLocalConfiguration(t *testing.T) {
 	}
 	if loaded.ListenAddress != cfg.ListenAddress || loaded.PublicAPIBasePath != "/license-api/v1" {
 		t.Fatalf("loaded config = %#v", loaded)
+	}
+}
+
+func TestParseAndLoadShareStrictJSONBehavior(t *testing.T) {
+	cfg := validConfig(t)
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse rejected valid config: %v", err)
+	}
+	if !reflect.DeepEqual(parsed, cfg) {
+		t.Fatalf("Parse result = %#v, want %#v", parsed, cfg)
+	}
+	mutations := []struct {
+		name string
+		body []byte
+	}{
+		{"unknown", append(bytes.TrimSuffix(encoded, []byte("}")), []byte(`,"unexpected":true}`)...)},
+		{"duplicate", bytes.Replace(encoded, []byte(`"listen_address":`), []byte(`"listen_address":"127.0.0.1:18092","listen_address":`), 1)},
+		{"trailing", append(append([]byte(nil), encoded...), []byte(` {}`)...)},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			if _, err := Parse(mutation.body); err == nil {
+				t.Fatal("Parse accepted invalid JSON structure")
+			}
+			if runtime.GOOS == "linux" {
+				return
+			}
+			path := filepath.Join(t.TempDir(), mutation.name+".json")
+			if err := os.WriteFile(path, mutation.body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("Load accepted JSON structure rejected by Parse")
+			}
+		})
 	}
 }
 
@@ -130,6 +171,17 @@ func TestValidateAcceptsDistinctExplicitLoadTestSecret(t *testing.T) {
 	cfg.LoadTestSecretPath = filepath.Join(filepath.Dir(cfg.EncryptionKeyPath), "load-test.key")
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate rejected explicit load mode: %v", err)
+	}
+}
+
+func TestValidateRejectsWindowsMixedSeparatorPOSIXPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path canonicalization")
+	}
+	cfg := validConfig(t)
+	cfg.InternalSecretPath = `/etc/superpan-license/foo\..\admin.secret`
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted a POSIX-looking path with Windows traversal separators")
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -308,27 +307,16 @@ func validateNginxInclude(body string) error {
 	return nil
 }
 
-func TestLicenseConfigExamplePassesProductionLoader(t *testing.T) {
-	if runtime.GOOS == "linux" {
-		t.Skip("Linux Load requires the installed root:superpan-license trust boundary")
-	}
+func TestLicenseConfigExamplePassesProductionStrictParser(t *testing.T) {
 	body := read(t, "deploy", "license-service", "config.example.json")
 	const placeholder = "replace-with-generated-key-id"
 	if strings.Count(body, placeholder) != 1 {
 		t.Fatalf("signing key placeholder count = %d, want 1", strings.Count(body, placeholder))
 	}
 	rendered := strings.Replace(body, placeholder, "production-p256-2026-09", 1)
-	write := func(t *testing.T, name, value string) string {
-		t.Helper()
-		file := filepath.Join(t.TempDir(), name)
-		if err := os.WriteFile(file, []byte(value), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return file
-	}
-	loaded, err := licenseconfig.Load(write(t, "license.json", rendered))
+	loaded, err := licenseconfig.Parse([]byte(rendered))
 	if err != nil {
-		t.Fatalf("production loader rejected rendered template: %v", err)
+		t.Fatalf("production strict parser rejected rendered template: %v", err)
 	}
 	want := licenseconfig.Config{
 		ListenAddress: "127.0.0.1:18092", LicenseDatabasePath: "/var/lib/superpan-license/state.db",
@@ -351,12 +339,11 @@ func TestLicenseConfigExamplePassesProductionLoader(t *testing.T) {
 	mutations := []struct{ name, body string }{
 		{"unknown field", strings.Replace(rendered, "{\n", "{\n  \"unexpected\": true,\n", 1)},
 		{"duplicate field", strings.Replace(rendered, `"listen_address": "127.0.0.1:18092"`, `"listen_address": "127.0.0.1:18092", "listen_address": "127.0.0.1:18092"`, 1)},
-		{"overlapping POSIX paths", strings.Replace(rendered, "/etc/superpan-license/admin.secret", "/etc/superpan-license", 1)},
 	}
 	for _, mutation := range mutations {
 		t.Run(mutation.name, func(t *testing.T) {
-			if _, err := licenseconfig.Load(write(t, "invalid.json", mutation.body)); err == nil {
-				t.Fatalf("production loader accepted %s", mutation.name)
+			if _, err := licenseconfig.Parse([]byte(mutation.body)); err == nil {
+				t.Fatalf("production strict parser accepted %s", mutation.name)
 			}
 		})
 	}

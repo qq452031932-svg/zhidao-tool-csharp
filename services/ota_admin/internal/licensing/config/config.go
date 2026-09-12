@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -65,6 +64,22 @@ func Load(path string) (Config, error) {
 		return Config{}, errors.New("read license service configuration")
 	}
 	defer clear(data)
+	cfg, err := Parse(data)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+// Parse performs the same bounded, strict JSON decoding used by Load without
+// applying OS-specific path and listener validation.
+func Parse(data []byte) (Config, error) {
+	if len(data) > maximumConfigBytes {
+		return Config{}, errors.New("license service configuration exceeds maximum size")
+	}
 	if err := validateConfigJSONShape(data); err != nil {
 		return Config{}, err
 	}
@@ -77,9 +92,6 @@ func Load(path string) (Config, error) {
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return Config{}, errors.New("configuration must contain exactly one JSON object")
-	}
-	if err := cfg.Validate(); err != nil {
-		return Config{}, err
 	}
 	return cfg, nil
 }
@@ -175,7 +187,7 @@ func (c Config) Validate() error {
 	}
 	normalized := make([]string, 0, len(paths))
 	for _, path := range paths {
-		if !isCanonicalAbsolutePath(path) {
+		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 			return errors.New("state and key paths must be canonical absolute paths")
 		}
 		identity := path
@@ -226,10 +238,6 @@ func (c Config) Validate() error {
 		return errors.New("idle timeout is outside the safe range")
 	}
 	return nil
-}
-
-func isCanonicalAbsolutePath(value string) bool {
-	return value != "" && ((filepath.IsAbs(value) && filepath.Clean(value) == value) || (path.IsAbs(value) && path.Clean(value) == value))
 }
 
 func pathsOverlap(first, second string) bool {
