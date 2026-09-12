@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -46,19 +47,105 @@ func (b fakeBinder) Bind(string, FileIdentity) (SourceBinding, error) {
 	return fakeBinding{identity: b.identity}, nil
 }
 
-type quietProbe struct{}
+type fakeGuardLease struct {
+	events                  *[]string
+	validateErr, restoreErr error
+}
 
-func (quietProbe) Prove(context.Context) error { return nil }
+func (g *fakeGuardLease) Validate() error {
+	*g.events = append(*g.events, "validate")
+	return g.validateErr
+}
+func (g *fakeGuardLease) Restore() error {
+	*g.events = append(*g.events, "restore")
+	return g.restoreErr
+}
+
+type fakeDirectoryGuard struct {
+	events                              *[]string
+	acquireErr, validateErr, restoreErr error
+}
+
+func (g fakeDirectoryGuard) Acquire(string, SourceKind) (DirectoryGuardLease, error) {
+	*g.events = append(*g.events, "acquire")
+	if g.acquireErr != nil {
+		return nil, g.acquireErr
+	}
+	return &fakeGuardLease{events: g.events, validateErr: g.validateErr, restoreErr: g.restoreErr}, nil
+}
 
 func testOptions(t *testing.T, source, destination string) SnapshotOptions {
 	t.Helper()
+	events := []string{}
 	return SnapshotOptions{ServiceName: requiredService, Source: source, Destination: destination,
 		ServiceProbe: fakeServiceProbe{state: ServiceStopped}, TrustProbe: permissiveTrust{},
-		SourceBinder: fakeBinder{identity: FileIdentity{Device: 1, Inode: 1}}, QuiescenceProbe: quietProbe{},
+		SourceBinder: fakeBinder{identity: FileIdentity{Device: 1, Inode: 1}}, DirectoryGuard: fakeDirectoryGuard{events: &events},
 		DatabaseOpener: func(path string) (*sql.DB, FileIdentity, error) {
 			db, err := sql.Open("sqlite", buildSQLiteDSN(path, false))
 			return db, FileIdentity{Device: 1, Inode: 1}, err
 		}}
+}
+
+func TestDirectoryGuardAcquiredBeforeSQLiteAndRestored(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "state.db")
+	dst := filepath.Join(root, "snapshot.db")
+	createTestDB(t, src)
+	events := []string{}
+	o := testOptions(t, src, dst)
+	o.PathClassifier = func(string, string) (SourceKind, error) { return SourceLive, nil }
+	o.DirectoryGuard = fakeDirectoryGuard{events: &events}
+	o.DatabaseOpener = func(path string) (*sql.DB, FileIdentity, error) {
+		events = append(events, "open")
+		db, err := sql.Open("sqlite", buildSQLiteDSN(path, false))
+		return db, FileIdentity{1, 1}, err
+	}
+	if _, err := Snapshot(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	if events[0] != "acquire" || events[len(events)-1] != "restore" || slices.Index(events, "open") < slices.Index(events, "acquire") {
+		t.Fatalf("unexpected guard lifecycle: %v", events)
+	}
+}
+
+func TestDirectoryGuardAcquireFailurePreventsSQLiteOpen(t *testing.T) {
+	events := []string{}
+	opened := false
+	o := testOptions(t, "source.db", "destination.db")
+	o.PathClassifier = func(string, string) (SourceKind, error) { return SourceLive, nil }
+	o.DirectoryGuard = fakeDirectoryGuard{events: &events, acquireErr: errors.New("seize failed")}
+	o.DatabaseOpener = func(string) (*sql.DB, FileIdentity, error) { opened = true; return nil, FileIdentity{}, nil }
+	if _, err := Snapshot(context.Background(), o); err == nil || opened {
+		t.Fatalf("guard failure did not stop open: err=%v opened=%v", err, opened)
+	}
+}
+
+func TestDirectoryGuardRestoreFailureOverridesSuccessfulSnapshot(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "state.db")
+	dst := filepath.Join(root, "snapshot.db")
+	createTestDB(t, src)
+	events := []string{}
+	o := testOptions(t, src, dst)
+	o.PathClassifier = func(string, string) (SourceKind, error) { return SourceLive, nil }
+	o.DirectoryGuard = fakeDirectoryGuard{events: &events, restoreErr: errors.New("manual repair required")}
+	if _, err := Snapshot(context.Background(), o); err == nil || !strings.Contains(err.Error(), "manual repair") {
+		t.Fatalf("restore failure did not override success: %v", err)
+	}
+}
+
+func TestDirectoryGuardIdentityChangeFailsAndRestores(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "state.db")
+	dst := filepath.Join(root, "snapshot.db")
+	createTestDB(t, src)
+	events := []string{}
+	o := testOptions(t, src, dst)
+	o.PathClassifier = func(string, string) (SourceKind, error) { return SourceLive, nil }
+	o.DirectoryGuard = fakeDirectoryGuard{events: &events, validateErr: errors.New("directory identity changed")}
+	if _, err := Snapshot(context.Background(), o); err == nil || events[len(events)-1] != "restore" {
+		t.Fatalf("identity change was not failed/restored: err=%v events=%v", err, events)
+	}
 }
 
 func TestSnapshotRejectsSQLiteTargetIdentityMismatch(t *testing.T) {

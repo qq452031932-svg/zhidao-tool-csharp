@@ -3,14 +3,12 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 )
 
@@ -45,51 +43,162 @@ func (platformSourceBinder) Bind(path string, expected FileIdentity) (SourceBind
 	return &platformSourceBinding{file: file, identity: actual}, nil
 }
 
-type platformQuiescenceProbe struct{}
+type platformDirectoryGuard struct{}
+type platformDirectoryGuardLease struct {
+	file     *os.File
+	path     string
+	identity FileIdentity
+	uid, gid uint32
+	mode     uint32
+	live     bool
+}
 
-func (platformQuiescenceProbe) Prove(context.Context) error {
-	// The service account is dedicated and cannot be assumed by an unprivileged
-	// process. Once every Linux UID slot is absent from /proc, only the trusted
-	// root boundary can create a new process able to rename its 0700-owned DB.
-	uid, _, err := serviceIDs()
-	if err != nil {
-		return err
+func (platformDirectoryGuard) Acquire(source string, kind SourceKind) (DirectoryGuardLease, error) {
+	parent := filepath.Dir(source)
+	if kind == SourceLive {
+		if parent != filepath.Dir(liveDatabasePath) {
+			return nil, errors.New("live source parent is not exact")
+		}
+		if err := validateRootAncestors(parent); err != nil {
+			return nil, err
+		}
 	}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		if _, err := strconv.Atoi(entry.Name()); err != nil {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
+	expectedUID, expectedGID := uint32(0), uint32(0)
+	var err error
+	if kind == SourceLive {
+		expectedUID, expectedGID, err = serviceIDs()
 		if err != nil {
-			return fmt.Errorf("read process %s status: %w", entry.Name(), err)
+			return nil, err
 		}
-		for _, line := range strings.Split(string(body), "\n") {
-			if !strings.HasPrefix(line, "Uid:") {
-				continue
-			}
-			fields := strings.Fields(strings.TrimPrefix(line, "Uid:"))
-			if len(fields) != 4 {
-				return fmt.Errorf("process %s has malformed Uid status", entry.Name())
-			}
-			for _, field := range fields {
-				value, parseErr := strconv.ParseUint(field, 10, 32)
-				if parseErr != nil {
-					return parseErr
-				}
-				if uint32(value) == uid {
-					return fmt.Errorf("process %s still uses dedicated service UID", entry.Name())
-				}
-			}
+	}
+	return acquirePlatformDirectoryGuard(parent, kind == SourceLive, expectedUID, expectedGID)
+}
+
+func acquirePlatformDirectoryGuard(parent string, live bool, expectedUID, expectedGID uint32) (DirectoryGuardLease, error) {
+	fd, err := syscall.Open(parent, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), parent)
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if stat.Uid != expectedUID || stat.Gid != expectedGID || uint32(stat.Mode)&07777 != 0700 {
+		file.Close()
+		return nil, errors.New("source directory has untrusted original metadata")
+	}
+	lease := &platformDirectoryGuardLease{file: file, path: parent, identity: FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, uid: stat.Uid, gid: stat.Gid, mode: uint32(stat.Mode) & 07777, live: live}
+	if !lease.live {
+		if err := lease.Validate(); err != nil {
+			file.Close()
+			return nil, err
+		}
+		return lease, nil
+	}
+	// 0700 is established before ownership changes, so this controlled mutation
+	// never widens access. Once root owns the same inode, stale service-UID
+	// directory descriptors cannot create or rename entries under Linux DAC.
+	if err := syscall.Fchmod(fd, 0700); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if err := syscall.Fchown(fd, 0, 0); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if err := syscall.Fchmod(fd, 0700); err != nil {
+		_ = lease.seizeRoot()
+		file.Close()
+		return nil, err
+	}
+	if err := file.Sync(); err != nil {
+		_ = lease.seizeRoot()
+		file.Close()
+		return nil, err
+	}
+	if err := lease.Validate(); err != nil {
+		_ = lease.seizeRoot()
+		file.Close()
+		return nil, err
+	}
+	return lease, nil
+}
+
+func (g *platformDirectoryGuardLease) Validate() error {
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(int(g.file.Fd()), &stat); err != nil {
+		return err
+	}
+	if (FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}) != g.identity {
+		return errors.New("guard descriptor identity changed")
+	}
+	expectedUID, expectedGID := g.uid, g.gid
+	if g.live {
+		expectedUID, expectedGID = 0, 0
+	}
+	if stat.Uid != expectedUID || stat.Gid != expectedGID || uint32(stat.Mode)&07777 != 0700 {
+		return errors.New("guard metadata changed")
+	}
+	info, err := os.Lstat(g.path)
+	if err != nil {
+		return err
+	}
+	pathStat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || info.Mode()&os.ModeSymlink != 0 || (FileIdentity{Device: uint64(pathStat.Dev), Inode: pathStat.Ino}) != g.identity {
+		return errors.New("guard path identity changed")
+	}
+	return nil
+}
+
+func (g *platformDirectoryGuardLease) Restore() error {
+	defer g.file.Close()
+	if !g.live {
+		return g.Validate()
+	}
+	fd := int(g.file.Fd())
+	if err := syscall.Fchmod(fd, 0700); err != nil {
+		return fmt.Errorf("prepare restore: %w", err)
+	}
+	if err := g.file.Sync(); err != nil {
+		return fmt.Errorf("sync guarded metadata: %w", err)
+	}
+	if err := syscall.Fchown(fd, int(g.uid), int(g.gid)); err != nil {
+		_ = g.seizeRoot()
+		return fmt.Errorf("restore owner: %w", err)
+	}
+	if err := syscall.Fchmod(fd, g.mode); err != nil {
+		_ = g.seizeRoot()
+		return fmt.Errorf("restore mode: %w", err)
+	}
+	if err := g.file.Sync(); err != nil {
+		_ = g.seizeRoot()
+		return fmt.Errorf("sync restored metadata: %w", err)
+	}
+	return nil
+}
+
+func (g *platformDirectoryGuardLease) seizeRoot() error {
+	fd := int(g.file.Fd())
+	if err := syscall.Fchown(fd, 0, 0); err != nil {
+		return err
+	}
+	if err := syscall.Fchmod(fd, 0700); err != nil {
+		return err
+	}
+	return g.file.Sync()
+}
+
+func validateRootAncestors(parent string) error {
+	for _, ancestor := range []string{"/", "/var", "/var/lib"} {
+		info, err := os.Lstat(ancestor)
+		if err != nil {
+			return err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || stat.Uid != 0 || stat.Gid != 0 || info.Mode().Perm()&0022 != 0 {
+			return fmt.Errorf("untrusted live ancestor: %s", ancestor)
 		}
 	}
 	return nil
@@ -123,7 +232,7 @@ func (platformTrustProbe) ValidateSource(path string, kind SourceKind) (FileIden
 		if err := validateBackupChain(filepath.Dir(path)); err != nil {
 			return FileIdentity{}, fmt.Errorf("source parent: %w", err)
 		}
-	} else if _, err := validateNode(filepath.Dir(path), true, uid, gid, 0700); err != nil {
+	} else if _, err := validateNode(filepath.Dir(path), true, 0, 0, 0700); err != nil {
 		return FileIdentity{}, fmt.Errorf("source parent: %w", err)
 	}
 	return validateNode(path, false, uid, gid, 0600)

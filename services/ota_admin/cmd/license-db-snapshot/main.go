@@ -49,7 +49,13 @@ type SourceBinding interface {
 type SourceBinder interface {
 	Bind(string, FileIdentity) (SourceBinding, error)
 }
-type QuiescenceProbe interface{ Prove(context.Context) error }
+type DirectoryGuardLease interface {
+	Validate() error
+	Restore() error
+}
+type DirectoryGuard interface {
+	Acquire(string, SourceKind) (DirectoryGuardLease, error)
+}
 type DatabaseOpener func(string) (*sql.DB, FileIdentity, error)
 
 type ServiceStateProbe interface {
@@ -63,16 +69,16 @@ type TrustProbe interface {
 }
 
 type SnapshotOptions struct {
-	ServiceName     string
-	Source          string
-	Destination     string
-	ServiceProbe    ServiceStateProbe
-	TrustProbe      TrustProbe
-	PathClassifier  func(string, string) (SourceKind, error)
-	Checkpoint      func(context.Context, *sql.Conn) (busy, logFrames, checkpointed int, err error)
-	SourceBinder    SourceBinder
-	QuiescenceProbe QuiescenceProbe
-	DatabaseOpener  DatabaseOpener
+	ServiceName    string
+	Source         string
+	Destination    string
+	ServiceProbe   ServiceStateProbe
+	TrustProbe     TrustProbe
+	PathClassifier func(string, string) (SourceKind, error)
+	Checkpoint     func(context.Context, *sql.Conn) (busy, logFrames, checkpointed int, err error)
+	SourceBinder   SourceBinder
+	DirectoryGuard DirectoryGuard
+	DatabaseOpener DatabaseOpener
 }
 
 type Summary struct {
@@ -134,16 +140,13 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if binder == nil {
 		binder = platformSourceBinder{}
 	}
-	quiescence := options.QuiescenceProbe
-	if quiescence == nil {
-		quiescence = platformQuiescenceProbe{}
+	directoryGuard := options.DirectoryGuard
+	if directoryGuard == nil {
+		directoryGuard = platformDirectoryGuard{}
 	}
 	databaseOpener := options.DatabaseOpener
 	if databaseOpener == nil {
 		databaseOpener = openVerifiedDatabase
-	}
-	if err = quiescence.Prove(ctx); err != nil {
-		return summary, fmt.Errorf("service UID quiescence: %w", err)
 	}
 	classifier := options.PathClassifier
 	if classifier == nil {
@@ -152,6 +155,23 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	kind, err := classifier(options.Source, options.Destination)
 	if err != nil {
 		return summary, err
+	}
+	guardLease, err := directoryGuard.Acquire(options.Source, kind)
+	if err != nil {
+		return summary, fmt.Errorf("acquire source directory guard: %w", err)
+	}
+	published := false
+	defer func() {
+		if restoreErr := guardLease.Restore(); restoreErr != nil {
+			summary = Summary{}
+			err = fmt.Errorf("source directory restore failed; keep service stopped and repair ownership manually: %w", restoreErr)
+			if published {
+				_ = os.Remove(options.Destination)
+			}
+		}
+	}()
+	if err = guardLease.Validate(); err != nil {
+		return summary, fmt.Errorf("source directory guard: %w", err)
 	}
 	sourceIdentity, err := options.TrustProbe.ValidateSource(options.Source, kind)
 	if err != nil {
@@ -164,6 +184,9 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	defer binding.Close()
 	if binding.Identity() != sourceIdentity {
 		return summary, errors.New("bound source identity mismatch")
+	}
+	if err = guardLease.Validate(); err != nil {
+		return summary, fmt.Errorf("source directory guard: %w", err)
 	}
 	parent := filepath.Dir(options.Destination)
 	parentIdentity, err := options.TrustProbe.ValidateBackupDirectory(parent)
@@ -188,8 +211,8 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if sqliteIdentity != binding.Identity() {
 		return summary, errors.New("SQLite target identity does not match verified source")
 	}
-	if err = quiescence.Prove(ctx); err != nil {
-		return summary, fmt.Errorf("service UID quiescence: %w", err)
+	if err = guardLease.Validate(); err != nil {
+		return summary, fmt.Errorf("source directory guard: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 	conn, err := db.Conn(ctx)
@@ -212,8 +235,8 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if err = compareBackupDirectory(options.TrustProbe, parent, parentIdentity); err != nil {
 		return summary, err
 	}
-	if err = quiescence.Prove(ctx); err != nil {
-		return summary, fmt.Errorf("service UID quiescence: %w", err)
+	if err = guardLease.Validate(); err != nil {
+		return summary, fmt.Errorf("source directory guard: %w", err)
 	}
 	var busy, logFrames, checkpointed int
 	checkpoint := options.Checkpoint
@@ -238,7 +261,6 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if err != nil {
 		return summary, err
 	}
-	published := false
 	defer func() {
 		_ = os.Remove(temporary)
 		if err != nil && published {
@@ -257,8 +279,8 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if err = compareSource(options.TrustProbe, options.Source, kind, sourceIdentity); err != nil {
 		return summary, err
 	}
-	if err = quiescence.Prove(ctx); err != nil {
-		return summary, fmt.Errorf("service UID quiescence: %w", err)
+	if err = guardLease.Validate(); err != nil {
+		return summary, fmt.Errorf("source directory guard: %w", err)
 	}
 	if summary, err = verify(ctx, temporary); err != nil {
 		return Summary{}, err
@@ -269,8 +291,8 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if err = compareBackupDirectory(options.TrustProbe, parent, parentIdentity); err != nil {
 		return Summary{}, err
 	}
-	if err = quiescence.Prove(ctx); err != nil {
-		return Summary{}, fmt.Errorf("service UID quiescence: %w", err)
+	if err = guardLease.Validate(); err != nil {
+		return Summary{}, fmt.Errorf("source directory guard: %w", err)
 	}
 	if err = os.Link(temporary, options.Destination); err != nil {
 		return Summary{}, fmt.Errorf("publish without replacement: %w", err)
@@ -519,7 +541,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "service, source and destination are required")
 		os.Exit(2)
 	}
-	s, err := Snapshot(context.Background(), SnapshotOptions{ServiceName: *service, Source: *source, Destination: *destination, ServiceProbe: systemdProbe{}, TrustProbe: platformTrustProbe{}, SourceBinder: platformSourceBinder{}, QuiescenceProbe: platformQuiescenceProbe{}})
+	s, err := Snapshot(context.Background(), SnapshotOptions{ServiceName: *service, Source: *source, Destination: *destination, ServiceProbe: systemdProbe{}, TrustProbe: platformTrustProbe{}, SourceBinder: platformSourceBinder{}, DirectoryGuard: platformDirectoryGuard{}})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

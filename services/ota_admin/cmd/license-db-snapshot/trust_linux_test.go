@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -66,5 +67,42 @@ func TestValidateNodeRejectsPOSIXACL(t *testing.T) {
 	}
 	if _, err := validateNode(file, false, 0, 0, 0600); err == nil {
 		t.Fatal("POSIX ACL accepted")
+	}
+}
+
+func TestDirectoryGuardSeizesAndRestoresOwnership(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("fchown guard fixture requires root")
+	}
+	directory := filepath.Join(t.TempDir(), "live")
+	if err := os.Mkdir(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const fixtureUID, fixtureGID = 65534, 65534
+	if err := os.Chown(directory, fixtureUID, fixtureGID); err != nil {
+		t.Skipf("fixture chown unavailable: %v", err)
+	}
+	lease, err := acquirePlatformDirectoryGuard(directory, true, fixtureUID, fixtureGID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	if stat.Uid != 0 || stat.Gid != 0 || info.Mode().Perm() != 0700 {
+		t.Fatalf("guard did not seize directory: uid=%d gid=%d mode=%04o", stat.Uid, stat.Gid, info.Mode().Perm())
+	}
+	if err := lease.Restore(); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat = info.Sys().(*syscall.Stat_t)
+	if stat.Uid != fixtureUID || stat.Gid != fixtureGID || info.Mode().Perm() != 0700 {
+		t.Fatalf("guard did not restore directory: uid=%d gid=%d mode=%04o", stat.Uid, stat.Gid, info.Mode().Perm())
 	}
 }

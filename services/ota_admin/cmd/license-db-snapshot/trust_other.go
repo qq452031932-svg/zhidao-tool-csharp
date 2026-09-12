@@ -2,10 +2,7 @@
 
 package main
 
-import (
-	"context"
-	"errors"
-)
+import "errors"
 
 type platformTrustProbe struct{}
 type platformSourceBinder struct{}
@@ -14,10 +11,10 @@ func (platformSourceBinder) Bind(string, FileIdentity) (SourceBinding, error) {
 	return nil, errors.New("verified source binding is supported only on Linux")
 }
 
-type platformQuiescenceProbe struct{}
+type platformDirectoryGuard struct{}
 
-func (platformQuiescenceProbe) Prove(context.Context) error {
-	return errors.New("service UID quiescence is supported only on Linux")
+func (platformDirectoryGuard) Acquire(string, SourceKind) (DirectoryGuardLease, error) {
+	return nil, errors.New("source directory guard is supported only on Linux")
 }
 func platformPathIdentity(string) (FileIdentity, error) {
 	return FileIdentity{}, errors.New("path identity is supported only on Linux")
