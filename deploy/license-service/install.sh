@@ -17,6 +17,8 @@ OTA_UNIT_SOURCE=""
 OTA_UNIT_SHA256=""
 PREFLIGHT_ONLY=false
 declare -A SEEN_ARGS=()
+declare -A PREFLIGHT_UNIT_ENABLED=()
+declare -A PREFLIGHT_UNIT_WANTS=()
 SOURCE_COMMIT_TARGET="/opt/superpan-license/source-commit.txt"
 OTA_INSTALLER="$(cd "$(dirname "${BASH_SOURCE[0]}")/../ota-admin" && pwd)/install.sh"
 LICENSE_USER="superpan-license"
@@ -387,6 +389,32 @@ validate_existing_acl_before_mutation
 validate_existing_config_before_mutation
 validate_persistent_state_before_mutation
 
+unit_wants_link() {
+    case "$1" in
+        superpan-license.service) printf '%s\n' /etc/systemd/system/multi-user.target.wants/superpan-license.service ;;
+        superpan-ota-admin.service) printf '%s\n' /etc/systemd/system/multi-user.target.wants/superpan-ota-admin.service ;;
+        *) die "unexpected unit state target" ;;
+    esac
+}
+capture_recoverable_unit_state() {
+    local unit="$1" enabled link expected wants=absent
+    enabled="$(systemctl is-enabled "$unit" 2>/dev/null || :)"; [ -n "$enabled" ] || enabled=not-found
+    case "$enabled" in enabled|disabled|not-found) ;; *) die "unit enablement state cannot be restored exactly: $unit=$enabled" ;; esac
+    link="$(unit_wants_link "$unit")"; expected="/etc/systemd/system/$unit"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        [ -L "$link" ] && [ "$(readlink -f -- "$link")" = "$expected" ] || die "unsafe preexisting wants link for $unit"
+        wants=present
+    fi
+    case "$enabled:$wants" in enabled:present|disabled:absent|not-found:absent) ;; *) die "unit enablement and wants link disagree: $unit" ;; esac
+    PREFLIGHT_UNIT_ENABLED["$unit"]="$enabled"
+    PREFLIGHT_UNIT_WANTS["$unit"]="$wants"
+}
+assert_recoverable_unit_state_before_mutation() {
+    capture_recoverable_unit_state superpan-license.service
+    capture_recoverable_unit_state superpan-ota-admin.service
+}
+assert_recoverable_unit_state_before_mutation
+
 UPGRADE_MODE=false
 if [ -e "$DEST/superpan-license" ] || [ -e "$DATA/state.db" ]; then
     [ -f "$DEST/superpan-license" ] && [ ! -L "$DEST/superpan-license" ] && [ -f "$DATA/state.db" ] && [ ! -L "$DATA/state.db" ] ||
@@ -467,18 +495,15 @@ BACKUP_DIR="$TRANSACTION_BACKUP"
 record_unit_state() {
     local unit="$1" enabled active link expected wants=absent
     enabled="$(systemctl is-enabled "$unit" 2>/dev/null || :)"; [ -n "$enabled" ] || enabled=not-found
+    [ "$enabled" = "${PREFLIGHT_UNIT_ENABLED[$unit]}" ] || die "unit enablement changed after preflight"
     active=inactive; systemctl is-active --quiet "$unit" && active=active
-    case "$unit" in
-        superpan-license.service) link=/etc/systemd/system/multi-user.target.wants/superpan-license.service ;;
-        superpan-ota-admin.service) link=/etc/systemd/system/multi-user.target.wants/superpan-ota-admin.service ;;
-        *) die "unexpected unit state target" ;;
-    esac
+    link="$(unit_wants_link "$unit")"
     expected="/etc/systemd/system/$unit"
     if [ -e "$link" ] || [ -L "$link" ]; then
         [ -L "$link" ] && [ "$(readlink -f -- "$link")" = "$expected" ] || die "unsafe preexisting wants link for $unit"
         wants=present
     fi
-    [ "$enabled" != not-found ] || [ "$wants" = absent ] || die "not-found unit has a preexisting wants link"
+    [ "$wants" = "${PREFLIGHT_UNIT_WANTS[$unit]}" ] || die "unit wants link changed after preflight"
     printf '%s\t%s\t%s\t%s\n' "$unit" "$enabled" "$active" "$wants" >>"$BACKUP_DIR/unit-state.tsv"
 }
 backup_target() {

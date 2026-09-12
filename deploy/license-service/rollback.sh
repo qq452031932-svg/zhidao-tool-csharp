@@ -91,38 +91,49 @@ restore_inventory
 # Rollback never writes or removes /var/lib/superpan-license, encryption.key,
 # lookup.key, admin.secret, or response-signing key material.
 systemctl daemon-reload
-remove_transaction_wants_link() {
-    local unit="$1" link expected resolved
+restore_wants_link() {
+    local unit="$1" wants="$2" link expected resolved
     case "$unit" in
         superpan-license.service) link=/etc/systemd/system/multi-user.target.wants/superpan-license.service ;;
         superpan-ota-admin.service) link=/etc/systemd/system/multi-user.target.wants/superpan-ota-admin.service ;;
         *) die "unexpected wants-link cleanup unit" ;;
     esac
     expected="/etc/systemd/system/$unit"
-    if [ -e "$link" ] || [ -L "$link" ]; then
-        [ -L "$link" ] || die "transaction wants path is not a symlink"
-        resolved="$(readlink -f -- "$link")" || die "transaction wants link cannot be resolved"
-        [ "$resolved" = "$expected" ] || die "transaction wants link points outside its fixed unit"
-        rm -f -- "$link"
-    fi
+    case "$wants" in
+        present)
+            if [ -e "$link" ] || [ -L "$link" ]; then
+                [ -L "$link" ] || die "transaction wants path is not a symlink"
+                resolved="$(readlink -f -- "$link")" || die "transaction wants link cannot be resolved"
+                [ "$resolved" = "$expected" ] || die "transaction wants link points outside its fixed unit"
+            else
+                [ -f "$expected" ] && [ ! -L "$expected" ] || die "cannot restore wants link without restored unit"
+                ln -s -- "$expected" "$link"
+            fi
+            ;;
+        absent)
+            if [ -e "$link" ] || [ -L "$link" ]; then
+                [ -L "$link" ] || die "transaction wants path is not a symlink"
+                resolved="$(readlink -f -- "$link")" || die "transaction wants link cannot be resolved"
+                [ "$resolved" = "$expected" ] || die "transaction wants link points outside its fixed unit"
+                rm -f -- "$link"
+            fi
+            ;;
+        *) die "invalid prior wants-link state" ;;
+    esac
 }
 restore_unit_state() {
     local unit enabled active wants observed
     while IFS=$'\t' read -r unit enabled active wants; do
         case "$enabled" in
             enabled) systemctl enable "$unit" >/dev/null ;;
-            enabled-runtime) systemctl enable --runtime "$unit" >/dev/null ;;
             disabled) systemctl disable "$unit" >/dev/null ;;
-            masked) systemctl mask "$unit" >/dev/null ;;
-            masked-runtime) systemctl mask --runtime "$unit" >/dev/null ;;
-            static|indirect|generated|transient|alias|linked|linked-runtime) ;;
             not-found)
                 systemctl disable "$unit" >/dev/null 2>&1 || :
                 [ "$wants" = absent ] || die "not-found unit unexpectedly had a prior wants link"
-                remove_transaction_wants_link "$unit"
                 ;;
             *) die "unsupported prior enablement state for $unit" ;;
         esac
+        restore_wants_link "$unit" "$wants"
         observed="$(systemctl is-enabled "$unit" 2>/dev/null || :)"; [ -n "$observed" ] || observed=not-found
         if [ "$enabled" = not-found ]; then
             [ "$observed" = not-found ] || die "prior not-found unit state was not restored"

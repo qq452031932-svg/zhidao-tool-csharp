@@ -28,22 +28,24 @@ The public Nginx include must remain absent during installation. The service is 
 
 ## Authorized Linux staging matrix
 
-On the approved disposable snapshot, place fixture lifecycle commands
-`fixture-v219-reset` and `fixture-v219-seed-wal` on `PATH`, then run the single
-matrix entry point:
+On the approved disposable snapshot, provide a reviewed root-owned fixture driver
+with `reset SCENARIO` and `seed-wal` commands, then run the single matrix entry
+point:
 
 ```bash
 sudo bash deploy/license-service/test-install-v219.sh \
   --bundle /root/reviewed-license-bundle \
-  --fixture-vhost centos7-v219-disposable
+  --fixture-vhost /root/fixtures/centos7-v219-driver
 ```
 
-`--fixture-vhost` is an opaque disposable-fixture identifier passed only to the
-fixture lifecycle wrappers; it is not a public route or configuration path. The
-reset wrapper restores the named disposable fixture before each independent
-scenario, and the WAL seed wrapper prepares an old-version active service with a
-coherent WAL database for the upgrade scenario. The harness derives all explicit
-hash and template arguments from the reviewed bundle and deploy tree.
+`--fixture-vhost` is a canonical absolute path to that executable fixture driver,
+not a public route or configuration path. The harness requires it and every
+ancestor to be root-owned and non-writable by group/other, and requires the file
+to be regular, non-symlinked, single-linked, and executable. Its `reset` operation
+restores the disposable fixture before each independent scenario; `seed-wal`
+prepares an old-version active service with a coherent WAL database. The harness
+derives all explicit hash and template arguments from the reviewed bundle and
+deploy tree and does not discover ambient lifecycle commands from `PATH`.
 
 The entry point automatically runs first install, WAL upgrade, explicit rollback,
 restart, all 17 failpoints, and normal retries after `secret-publish`,

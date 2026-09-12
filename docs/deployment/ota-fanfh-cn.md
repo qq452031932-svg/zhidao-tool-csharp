@@ -78,6 +78,12 @@ daemon-reload 后，显式 disable，并只对两个固定的 `multi-user.target
 symlink 目标后清理由本事务创建的链接；最后重新查询 `is-enabled`，必须恢复到记录的
 `not-found`（原先为 `disabled` 时则必须仍为 `disabled`）。
 
+为保证 enablement 可精确恢复，安装器在任何 mutation 前只接受 `enabled`、`disabled`
+或 `not-found`，并同时验证两个固定 wants link 与该状态一致。`static`、`indirect`、
+`generated`、`transient`、`alias`、`linked*`、runtime-only、masked 等状态均 fail closed。
+rollback 对记录的 wants `present/absent` 统一执行固定路径和目标验证，需要时创建或删除
+链接，再复核 `is-enabled` 与记录完全一致。
+
 1. 在现有 `ota.fanfh.cn` HTTPS `server {}` 内只加入一次下列 include 行。先备份该 vhost，除此之外不复制或改写其他站点配置。片段本身也对非 HTTPS 请求 fail closed，但仍必须只放在 HTTPS block。
 
    ```nginx

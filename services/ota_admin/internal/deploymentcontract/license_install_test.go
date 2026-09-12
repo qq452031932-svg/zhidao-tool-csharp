@@ -930,7 +930,7 @@ func TestPersistentKeysWithoutDatabaseIsRetryableFirstInstall(t *testing.T) {
 func TestRollbackRemovesTransactionCreatedWantsLinksForNotFoundUnits(t *testing.T) {
 	rollback := read(t, "deploy", "license-service", "rollback.sh")
 	requireFragments(t, rollback,
-		`remove_transaction_wants_link`,
+		`restore_wants_link`,
 		`/etc/systemd/system/multi-user.target.wants/superpan-license.service`,
 		`/etc/systemd/system/multi-user.target.wants/superpan-ota-admin.service`,
 		`readlink -f -- "$link"`, `systemctl disable "$unit"`,
@@ -960,4 +960,44 @@ func TestV219HarnessHasExecutableFullMatrixEntryPoint(t *testing.T) {
 		`assert_persistent_pairing`, `assert_single_backup`,
 	)
 	if strings.Contains(harness, "eval ") { t.Fatal("staging harness must not use eval") }
+}
+
+func TestV219HarnessIsSelfContainedAndChecksCompleteState(t *testing.T) {
+	harness := read(t, "deploy", "license-service", "test-install-v219.sh")
+	requireFragments(t, harness,
+		`validate_trusted_fixture`, `readlink -f -- "$FIXTURE_VHOST"`,
+		`[ -f "$FIXTURE_VHOST" ]`, `stat -c '%h:%U:%G' "$FIXTURE_VHOST"`,
+		`reset_fixture()`, `seed_wal_upgrade()`, `"$FIXTURE_VHOST" reset`, `"$FIXTURE_VHOST" seed-wal`,
+		`assert_persistent_acl`, `root:superpan-license-admin:710`,
+		`root:superpan-license:640`, `root:superpan-license-admin:640`, `root:root:644`,
+		`superpan-license:superpan-license:700`, `superpan-license:superpan-license:600`,
+		`root:root:700`, `assert_failpoint_state`,
+		`unexpected listener endpoint for MainPID`,
+	)
+	for _, forbidden := range []string{"command -v fixture-v219-reset", "command -v fixture-v219-seed-wal", "fixture-v219-reset ", "fixture-v219-seed-wal "} {
+		if strings.Contains(harness, forbidden) { t.Errorf("harness depends on nonexistent ambient helper %q", forbidden) }
+	}
+	requireBefore(t, harness, `assert_single_backup "$before"`, `assert_failpoint_state "$prior"`)
+}
+
+func TestInstallerRejectsUnrecoverableEnablementBeforeMutation(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	rollback := read(t, "deploy", "license-service", "rollback.sh")
+	requireFragments(t, install,
+		`declare -A PREFLIGHT_UNIT_ENABLED=()`, `assert_recoverable_unit_state_before_mutation`,
+		`enabled|disabled|not-found`, `unit enablement state cannot be restored exactly`,
+		`PREFLIGHT_UNIT_ENABLED["$unit"]`,
+	)
+	requireBefore(t, install, `assert_recoverable_unit_state_before_mutation`, `trap transaction_exit EXIT`)
+	requireBefore(t, install, `assert_recoverable_unit_state_before_mutation`, `TRANSACTION_MUTATED=true`)
+	for _, unsupported := range []string{"static", "indirect", "generated", "transient", "alias", "linked", "linked-runtime", "enabled-runtime", "masked"} {
+		if strings.Contains(rollback, unsupported+"|") || strings.Contains(rollback, "|"+unsupported) {
+			t.Errorf("rollback still accepts unsupported enablement %q", unsupported)
+		}
+	}
+	requireFragments(t, rollback,
+		`restore_wants_link`, `case "$wants" in`, `present)`, `absent)`,
+		`ln -s -- "$expected" "$link"`, `rm -f -- "$link"`,
+		`prior unit enablement state was not restored`,
+	)
 }
