@@ -36,6 +36,7 @@ public sealed class JobResultsViewModel : ObservableObject
     private Guid progressBatchJobId;
     private bool refreshFailureActive;
     private readonly HashSet<Guid> loadedOperationIds = [];
+    private readonly HashSet<Guid> selectedFailedOperationIds = [];
     private readonly HashSet<Guid> autoPromptedExistingShareBatches = [];
     private readonly HashSet<Guid> finalizedLifecycleBatches = [];
 
@@ -68,6 +69,8 @@ public sealed class JobResultsViewModel : ObservableObject
             CopyGeneratedShareAsync,
             row => CanCopyGeneratedShareRow(row ?? SelectedItem));
         CancelSaveCommand = new RelayCommand(CancelSave, () => IsSaving);
+        SelectFailedCommand = new AsyncRelayCommand(SelectFailedAsync, () => CanSelectFailed);
+        ClearSelectionCommand = new AsyncRelayCommand(ClearSelectionAsync, () => CanClearSelection);
     }
 
     public ObservableCollection<JobResultRow> Items { get; } = [];
@@ -80,6 +83,8 @@ public sealed class JobResultsViewModel : ObservableObject
     public long CompleteSuccessCount { get => completeSuccessCount; private set => SetProperty(ref completeSuccessCount, value); }
     public long TerminalProblemCount { get => terminalProblemCount; private set => SetProperty(ref terminalProblemCount, value); }
     public long ExportedRows { get => exportedRows; private set => SetProperty(ref exportedRows, value); }
+    public IReadOnlyCollection<Guid> SelectedFailedOperationIds => selectedFailedOperationIds;
+    public int SelectedFailedCount => selectedFailedOperationIds.Count;
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
     public string TransferCapabilityMessage => capabilities.TransferStatusMessage;
     public string ShareCapabilityMessage => capabilities.ShareStatusMessage;
@@ -127,6 +132,8 @@ public sealed class JobResultsViewModel : ObservableObject
         !finalizedLifecycleBatches.Contains(batchJobId);
     public bool CanResolveExistingShares => batchJobId != Guid.Empty && !IsBusy && !IsSaving &&
         capabilities.CanUseShareActions && existingShareInteraction is not null;
+    public bool CanSelectFailed => batchJobId != Guid.Empty && !IsBusy && !IsSaving;
+    public bool CanClearSelection => selectedFailedOperationIds.Count > 0 && !IsBusy && !IsSaving;
     public IAsyncRelayCommand LoadNextPageCommand { get; }
     public IAsyncRelayCommand RefreshCommand { get; }
     public IAsyncRelayCommand RetryShareOnlyCommand { get; }
@@ -138,6 +145,8 @@ public sealed class JobResultsViewModel : ObservableObject
     public IAsyncRelayCommand SaveAsCommand { get; }
     public IAsyncRelayCommand CopyGeneratedShareCommand { get; }
     public IRelayCommand CancelSaveCommand { get; }
+    public IAsyncRelayCommand SelectFailedCommand { get; }
+    public IAsyncRelayCommand ClearSelectionCommand { get; }
 
     public Task InitializeAsync(Guid requestedBatchJobId, CancellationToken cancellationToken = default) =>
         InitializeCoreAsync(requestedBatchJobId, propagateFailure: false, cancellationToken);
@@ -162,10 +171,13 @@ public sealed class JobResultsViewModel : ObservableObject
         saveCancellation = null;
         previousSave?.Cancel();
         IsSaving = false;
+        var previousBatchJobId = batchJobId;
         batchJobId = requestedBatchJobId;
         OnPropertyChanged(nameof(BatchJobId));
         Items.Clear();
         loadedOperationIds.Clear();
+        if (previousBatchJobId != requestedBatchJobId)
+            SetFailedSelection([]);
         nextCursor = null;
         SelectedItem = null;
         IsBusy = true;
@@ -222,6 +234,46 @@ public sealed class JobResultsViewModel : ObservableObject
         {
             if (capturedGeneration == generation) IsBusy = false;
         }
+    }
+
+    private async Task SelectFailedAsync(CancellationToken cancellationToken)
+    {
+        if (!CanSelectFailed) return;
+        var capturedBatch = batchJobId;
+        var capturedGeneration = generation;
+        IsBusy = true;
+        try
+        {
+            while (capturedGeneration == generation && capturedBatch == batchJobId)
+            {
+                foreach (var row in Items.Where(IsFailedLike))
+                    selectedFailedOperationIds.Add(row.TransferOperationId);
+                if (nextCursor is null) break;
+                var page = await workflow.LoadPageAsync(capturedBatch, nextCursor, PageSize, cancellationToken).ConfigureAwait(true);
+                if (capturedGeneration != generation || capturedBatch != batchJobId) return;
+                ApplyPage(page, replace: false);
+            }
+            OnSelectionChanged();
+            StatusMessage = selectedFailedOperationIds.Count == 0
+                ? "当前没有失败记录。"
+                : $"已选中 {selectedFailedOperationIds.Count:N0} 条失败记录。";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (capturedGeneration == generation) StatusMessage = "选中失败记录已取消。";
+        }
+        finally
+        {
+            if (capturedGeneration == generation) IsBusy = false;
+        }
+    }
+
+    private Task ClearSelectionAsync(CancellationToken cancellationToken)
+    {
+        if (!CanClearSelection) return Task.CompletedTask;
+        SetFailedSelection([]);
+        StatusMessage = "已清除失败记录选择。";
+        return Task.CompletedTask;
     }
 
     public Task RefreshAsync(CancellationToken cancellationToken = default) =>
@@ -697,6 +749,38 @@ public sealed class JobResultsViewModel : ObservableObject
 
     private void CancelSave() => saveCancellation?.Cancel();
 
+    private static bool IsFailedLike(JobResultRow row)
+    {
+        var statuses = new[] { row.TransferStatus, row.ShareStatus }
+            .Where(status => !string.IsNullOrWhiteSpace(status)).ToArray();
+        if (statuses.Length > 0)
+            return statuses.Any(status => !IsSuccessStatus(status));
+        var displayStatuses = new[] { row.TransferStatusText, row.ShareStatusText }
+            .Where(status => !string.IsNullOrWhiteSpace(status)).ToArray();
+        return displayStatuses.Length == 0 || displayStatuses.Any(status => !IsSuccessStatus(status));
+    }
+
+    private static bool IsSuccessStatus(string? status) =>
+        !string.IsNullOrWhiteSpace(status) &&
+        (status.Contains("success", StringComparison.OrdinalIgnoreCase) ||
+        status.Contains("succeed", StringComparison.OrdinalIgnoreCase) ||
+        status.Contains("completed", StringComparison.OrdinalIgnoreCase) ||
+        status.Contains("成功", StringComparison.Ordinal));
+
+    private void SetFailedSelection(IEnumerable<Guid> operationIds)
+    {
+        selectedFailedOperationIds.Clear();
+        foreach (var id in operationIds.Where(id => id != Guid.Empty)) selectedFailedOperationIds.Add(id);
+        OnSelectionChanged();
+    }
+
+    private void OnSelectionChanged()
+    {
+        OnPropertyChanged(nameof(SelectedFailedOperationIds));
+        OnPropertyChanged(nameof(SelectedFailedCount));
+        NotifyCommandState();
+    }
+
     private bool CanCopyGeneratedShareRow(JobResultRow? row) =>
         !IsBusy && !IsSaving && clipboard is not null &&
         row is { GeneratedShareUrl: { Length: > 0 }, GeneratedExtractionCode: { Length: > 0 } };
@@ -713,6 +797,8 @@ public sealed class JobResultsViewModel : ObservableObject
         OnPropertyChanged(nameof(CanCopyGeneratedShare));
         OnPropertyChanged(nameof(CanRefresh));
         OnPropertyChanged(nameof(CanResolveExistingShares));
+        OnPropertyChanged(nameof(CanSelectFailed));
+        OnPropertyChanged(nameof(CanClearSelection));
         LoadNextPageCommand.NotifyCanExecuteChanged();
         RefreshCommand.NotifyCanExecuteChanged();
         RetryShareOnlyCommand.NotifyCanExecuteChanged();
@@ -724,6 +810,8 @@ public sealed class JobResultsViewModel : ObservableObject
         SaveAsCommand.NotifyCanExecuteChanged();
         CopyGeneratedShareCommand.NotifyCanExecuteChanged();
         CancelSaveCommand.NotifyCanExecuteChanged();
+        SelectFailedCommand.NotifyCanExecuteChanged();
+        ClearSelectionCommand.NotifyCanExecuteChanged();
     }
 
     private readonly record struct ProgressSnapshot(long Total, long Success, long Failed);
