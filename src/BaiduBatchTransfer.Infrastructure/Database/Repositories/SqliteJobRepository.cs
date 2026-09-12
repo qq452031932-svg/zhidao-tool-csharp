@@ -389,7 +389,10 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository, 
             "CASE WHEN s.Id IS NOT NULL AND (s.SubmitStartedAt IS NULL OR s.SubmissionAcceptance='DefinitelyNotAccepted') THEN 1 ELSE 0 END," +
             "s.Generation,s.UpdatedAt,o.AttemptCount," +
             $"CASE WHEN {safeRetryPredicate} THEN 1 ELSE 0 END," +
-            "current_result.ShareUrl,current_result.ExtractionCode,r.StagedImportRowId " +
+            "current_result.ShareUrl,current_result.ExtractionCode,r.StagedImportRowId," +
+            "COALESCE((SELECT attempt.InputShareUrl FROM WebAutomationAttempts attempt WHERE attempt.OperationId=o.Id AND attempt.AccountId=o.AssignedAccountId AND attempt.OwnerKind='Transfer' ORDER BY attempt.Generation DESC LIMIT 1),r.ShareUrl)," +
+            "(SELECT attempt.InputExtractionCode FROM WebAutomationAttempts attempt WHERE attempt.OperationId=o.Id AND attempt.AccountId=o.AssignedAccountId AND attempt.OwnerKind='Transfer' ORDER BY attempt.Generation DESC LIMIT 1)," +
+            "current_result.ShareUrl,current_result.ExtractionCode " +
             $"FROM TransferOperations o INDEXED BY {pageIndex} JOIN ResourceItems r ON r.Id=o.ResourceItemId " +
             "JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId " +
             "JOIN AccountAllocations allocation ON allocation.BatchJobId=o.BatchJobId AND allocation.AccountId=o.AssignedAccountId " +
@@ -430,7 +433,11 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository, 
                 reader.GetInt32(27),
                 reader.GetInt64(28) != 0,
                 reader.IsDBNull(29) ? null : reader.GetString(29),
-                reader.IsDBNull(30) ? null : reader.GetString(30), ReadNullableId(reader, 31)));
+                reader.IsDBNull(30) ? null : reader.GetString(30), ReadNullableId(reader, 31),
+                reader.IsDBNull(32) ? null : reader.GetString(32),
+                reader.IsDBNull(33) ? null : reader.GetString(33),
+                reader.IsDBNull(34) ? null : reader.GetString(34),
+                reader.IsDBNull(35) ? null : reader.GetString(35)));
         }
         if (items.Zip(items.Skip(1), static (left, right) => left.AllocationOrdinal == right.AllocationOrdinal).Any(equal => equal))
             throw new InvalidDataException("The operation result keyset contains duplicate allocation ordinals.");

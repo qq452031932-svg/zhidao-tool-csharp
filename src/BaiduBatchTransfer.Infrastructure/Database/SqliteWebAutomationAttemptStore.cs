@@ -45,9 +45,11 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             INSERT INTO WebAutomationAttempts(
               OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
               BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt,
-              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId,InputShareUrl,InputExtractionCode)
             VALUES($operation,$account,$generation,$owner,$state,NULL,NULL,NULL,0,NULL,0,0,$created,$updated,
-              $engine,$browserFamily,$profile,$installation,$session);
+              $engine,$browserFamily,$profile,$installation,$session,
+              (SELECT r.ShareUrl FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.Id=$operation LIMIT 1),
+              (SELECT r.ExtractionCode FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.Id=$operation LIMIT 1));
             """;
         AddIdentity(command, attempt.OperationId, attempt.AccountId, attempt.Generation);
         command.Parameters.AddWithValue("$owner", attempt.OwnerKind.ToString());
