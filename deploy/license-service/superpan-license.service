@@ -2,10 +2,35 @@
 Description=SuperPan license service
 After=network.target
 
+# Machine-readable installation contract. The transactional installer enforces
+# every entry for both newly-created and pre-existing targets before activation.
+# contract-acl /etc/superpan-license root superpan-license-admin 0710 directory
+# contract-acl /etc/superpan-license/config.json root superpan-license 0640 private
+# contract-acl /etc/superpan-license/encryption.key root superpan-license 0640 private
+# contract-acl /etc/superpan-license/lookup.key root superpan-license 0640 private
+# contract-acl /etc/superpan-license/response-signing.key root superpan-license 0640 private
+# contract-acl /etc/superpan-license/admin.secret root superpan-license-admin 0640 shared
+# contract-acl /etc/superpan-license/response-signing.key-id root root 0644 public
+# contract-acl /etc/superpan-license/response-signing.spki.der root root 0644 public
+# contract-acl /etc/superpan-license/response-signing.spki.base64 root root 0644 public
+# contract-acl /etc/superpan-license/response-signing.spki.sha256 root root 0644 public
+# contract-acl /var/lib/superpan-license superpan-license superpan-license 0700 directory
+# contract-acl /var/lib/superpan-license/state.db superpan-license superpan-license 0600 database
+# contract-acl /var/lib/superpan-license/state.db-wal superpan-license superpan-license 0600 database
+# contract-acl /var/lib/superpan-license/state.db-shm superpan-license superpan-license 0600 database
+# contract-acl /var/backups/superpan-license root root 0700 directory
+# contract-acl /var/backups/superpan-license/<snapshot> root root 0700 snapshot
+# contract-existing lstat owner group mode nlink=1 regular non-symlink bounded-size format trusted-parents
+# contract-atomic targets=config-public-identity creator=root destination-group 0600 same-directory O_EXCL fsync verify-descriptor-owner-group-mode-format rename-no-follow final-mode
+# contract-signing key-id-file=/etc/superpan-license/response-signing.key-id reject-placeholder=true curve=P-256 format=canonical-SPKI-DER base64=true sha256=lowercase prove-private-match=true
+# contract-render source=/etc/superpan-license/response-signing.key-id target=/etc/superpan-license/config.json field=signing_key_id atomic=true
+# contract-desktop-input response-signing.spki.base64 response-signing.key-id forbid-PEM-private=true
+
 [Service]
 Type=simple
 User=superpan-license
 Group=superpan-license
+SupplementaryGroups=superpan-license-admin
 UMask=0077
 WorkingDirectory=/var/lib/superpan-license
 # The service configuration binds the listener to this loopback endpoint.
@@ -20,6 +45,7 @@ PrivateDevices=true
 ProtectSystem=full
 ProtectHome=true
 InaccessibleDirectories=/var/www
+ReadOnlyDirectories=/etc/superpan-license
 ReadWriteDirectories=/var/lib/superpan-license
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

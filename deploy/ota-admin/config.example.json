@@ -2,6 +2,8 @@
   "database_path": "/var/lib/superpan-ota-admin/state.db",
   "listen_address": "127.0.0.1:18091",
   "public_origin": "https://ota.fanfh.cn",
+  "license_admin_base_url": "http://127.0.0.1:18092",
+  "license_admin_secret_path": "/etc/superpan-license/admin.secret",
   "staging_root": "/var/lib/superpan-ota-admin/staging",
   "release_root": "/var/lib/otaadmin/releases",
   "publisher_certificate_path": "/etc/superpan-ota-admin/publisher.cer",
