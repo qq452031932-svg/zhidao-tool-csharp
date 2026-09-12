@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0-windows</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <AssemblyName>SuperPan.Licensing.BOUNDARY-PROBE-NONSHIPPING</AssemblyName>
+    <Product>BOUNDARY-PROBE-NONSHIPPING</Product><ProductionOrigin>https://ota.fanfh.cn</ProductionOrigin><ProductId>8270e8d7-1791-487d-ad76-0da7a0cbed12</ProductId>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SuperPan.Licensing.Client\SuperPan.Licensing.Client.csproj" />
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute"><_Parameter1>LicenseOrigin</_Parameter1><_Parameter2>$(ProductionOrigin)</_Parameter2></AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute"><_Parameter1>LicenseProductId</_Parameter1><_Parameter2>$(ProductId)</_Parameter2></AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute"><_Parameter1>LicenseSigningKeyId</_Parameter1><_Parameter2>$(LicenseSigningKeyId)</_Parameter2></AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute"><_Parameter1>LicenseSigningPublicKey</_Parameter1><_Parameter2>$(LicenseSigningPublicKey)</_Parameter2></AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute"><_Parameter1>LicenseCurrentSpkiPin</_Parameter1><_Parameter2>$(LicenseCurrentSpkiPin)</_Parameter2></AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute"><_Parameter1>LicenseNextSpkiPin</_Parameter1><_Parameter2>$(LicenseNextSpkiPin)</_Parameter2></AssemblyAttribute>
+  </ItemGroup>
+  <Target Name="ValidateProductionTrust" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(Configuration)' != 'Release'" Text="Boundary probe is Release-only." />
+    <Error Condition="'$(ProductionOrigin)' != 'https://ota.fanfh.cn' or '$(ProductId)' != '8270e8d7-1791-487d-ad76-0da7a0cbed12'" Text="Production identity is immutable." />
+    <Error Condition="'$(LicenseSigningKeyId)' == '' or '$(LicenseSigningPublicKey)' == '' or '$(LicenseCurrentSpkiPin)' == '' or '$(LicenseNextSpkiPin)' == ''" Text="Installed production public trust is required." />
+  </Target>
+</Project>

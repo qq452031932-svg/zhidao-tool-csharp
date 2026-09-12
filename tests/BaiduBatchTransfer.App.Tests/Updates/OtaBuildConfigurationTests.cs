@@ -47,6 +47,15 @@ public sealed class OtaBuildConfigurationTests
     }
 
     [Fact]
+    public async Task ReleaseBuildRejectsAnyOriginExceptExactProductionOrigin()
+    {
+        var result = await RunLicenseGateAsync("Release", WithProductionProperty("LicenseServiceUrl", "https://license.example.test"));
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("license", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task ReleaseBuildRejectsAcceptanceStampEvenWithValidLoopbackAcceptanceProperties()
     {
         var result = await RunLicenseGateAsync("Release",
@@ -447,7 +456,7 @@ public sealed class OtaBuildConfigurationTests
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         return
         [
-            "LicenseServiceUrl=https://license.example.test",
+            "LicenseServiceUrl=https://ota.fanfh.cn",
             $"LicenseSigningPublicKey={Convert.ToBase64String(key.ExportSubjectPublicKeyInfo())}",
             $"LicenseCurrentSpkiPin={CurrentPin}",
             $"LicenseNextSpkiPin={NextPin}",

@@ -66,6 +66,7 @@ public sealed class ValidateLicenseProductionTrust : Task
         {
             var validUrl = Uri.TryCreate(ServiceUrl, UriKind.Absolute, out var endpoint)
                 && string.Equals(endpoint.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(endpoint.AbsoluteUri, "https://ota.fanfh.cn/", StringComparison.Ordinal)
                 && !string.IsNullOrWhiteSpace(endpoint.Host)
                 && string.IsNullOrEmpty(endpoint.UserInfo)
                 && string.IsNullOrEmpty(endpoint.Query)
