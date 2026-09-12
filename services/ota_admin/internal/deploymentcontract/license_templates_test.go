@@ -2,10 +2,10 @@ package deploymentcontract
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -68,23 +68,6 @@ func uncommentedLines(body string) []string {
 	return result
 }
 
-func requireExactLine(t *testing.T, body, line string) {
-	t.Helper()
-	if hasExactLine(body, line) {
-		return
-	}
-	t.Errorf("template missing exact directive %q", line)
-}
-
-func hasExactLine(body, line string) bool {
-	for _, got := range uncommentedLines(body) {
-		if got == line {
-			return true
-		}
-	}
-	return false
-}
-
 func sectionValues(body, section, key string) []string {
 	wantedSection := "[" + section + "]"
 	inSection := false
@@ -100,6 +83,189 @@ func sectionValues(body, section, key string) []string {
 		}
 	}
 	return result
+}
+
+func serviceDirectives(body string) (map[string][]string, error) {
+	values := make(map[string][]string)
+	inService := false
+	for _, line := range uncommentedLines(body) {
+		if strings.HasPrefix(line, ".include") {
+			return nil, fmt.Errorf("systemd .include is forbidden in the deployment template")
+		}
+		if strings.HasPrefix(line, "[") {
+			inService = line == "[Service]"
+			continue
+		}
+		if !inService {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("malformed [Service] directive %q", line)
+		}
+		values[key] = append(values[key], value)
+	}
+	return values, nil
+}
+
+func validateLicenseServiceUnit(body string) error {
+	wants := map[string]string{
+		"Type": "simple", "User": "superpan-license", "Group": "superpan-license",
+		"SupplementaryGroups": "superpan-license-admin", "UMask": "0077",
+		"WorkingDirectory": "/var/lib/superpan-license",
+		"ExecStart":        "/opt/superpan-license/superpan-license serve --config /etc/superpan-license/config.json",
+		"Restart":          "on-failure", "RestartSec": "5s", "TimeoutStopSec": "30s",
+		"NoNewPrivileges": "true", "PrivateTmp": "true", "PrivateDevices": "true",
+		"ProtectSystem": "full", "ProtectHome": "true", "InaccessibleDirectories": "/var/www",
+		"ReadOnlyDirectories": "/", "ReadWriteDirectories": "/var/lib/superpan-license",
+		"CapabilityBoundingSet": "", "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
+		"LimitNOFILE": "4096",
+	}
+	got, err := serviceDirectives(body)
+	if err != nil {
+		return err
+	}
+	if len(got) != len(wants) {
+		return fmt.Errorf("[Service] directive key count = %d, want %d", len(got), len(wants))
+	}
+	for key, want := range wants {
+		values := got[key]
+		if len(values) != 1 || values[0] != want {
+			return fmt.Errorf("%s assignments = %q, want only %q", key, values, want)
+		}
+	}
+	return nil
+}
+
+func validateOTAServiceUnit(body string) error {
+	wants := map[string][]string{
+		"Type": {"simple"}, "User": {"superpan-ota-admin"}, "Group": {"superpan-ota-admin"},
+		"SupplementaryGroups": {"superpan-license-admin"}, "UMask": {"0077"},
+		"WorkingDirectory": {"/var/lib/superpan-ota-admin"},
+		"ExecStart":        {"/opt/superpan-ota-admin/ota-admin serve --config /etc/superpan-ota-admin/config.json"},
+		"Restart":          {"on-failure"}, "RestartSec": {"5s"}, "TimeoutStopSec": {"30s"}, "KillSignal": {"SIGTERM"},
+		"NoNewPrivileges": {"true"}, "PrivateTmp": {"true"}, "PrivateDevices": {"true"},
+		"ProtectSystem": {"full"}, "ProtectHome": {"true"}, "InaccessibleDirectories": {"/www/wwwroot"},
+		"ReadWriteDirectories":  {"/var/lib/superpan-ota-admin", "/var/lib/otaadmin/releases"},
+		"CapabilityBoundingSet": {""}, "RestrictAddressFamilies": {"AF_UNIX AF_INET AF_INET6"},
+		"LimitNOFILE": {"4096"},
+	}
+	got, err := serviceDirectives(body)
+	if err != nil {
+		return err
+	}
+	if len(got) != len(wants) {
+		return fmt.Errorf("OTA [Service] directive key count = %d, want %d", len(got), len(wants))
+	}
+	for key, want := range wants {
+		values := got[key]
+		if len(values) != len(want) {
+			return fmt.Errorf("OTA %s assignments = %q, want %q", key, values, want)
+		}
+		for i := range want {
+			if values[i] != want[i] {
+				return fmt.Errorf("OTA %s assignments = %q, want %q", key, values, want)
+			}
+		}
+	}
+	return nil
+}
+
+type nginxLocation struct {
+	match string
+	body  []string
+}
+
+func parseNginxLocations(body string) ([]nginxLocation, error) {
+	lines := uncommentedLines(body)
+	var locations []nginxLocation
+	for i := 0; i < len(lines); {
+		line := lines[i]
+		if !strings.HasPrefix(line, "location ") || !strings.HasSuffix(line, "{") {
+			return nil, fmt.Errorf("directive outside an exact location: %q", line)
+		}
+		match := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "location "), "{"))
+		location := nginxLocation{match: match}
+		depth := 1
+		i++
+		for ; i < len(lines) && depth > 0; i++ {
+			line = lines[i]
+			depth += strings.Count(line, "{") - strings.Count(line, "}")
+			if depth < 0 || strings.Count(line, "{") > 0 {
+				return nil, fmt.Errorf("nested or unbalanced Nginx block at %q", line)
+			}
+			if depth == 0 {
+				if line != "}" {
+					return nil, fmt.Errorf("location closing brace must stand alone: %q", line)
+				}
+				i++
+				break
+			}
+			location.body = append(location.body, line)
+		}
+		if depth != 0 {
+			return nil, fmt.Errorf("unclosed Nginx location %q", match)
+		}
+		locations = append(locations, location)
+	}
+	return locations, nil
+}
+
+func nginxDirectiveKey(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) >= 2 && fields[0] == "proxy_set_header" {
+		return fields[0] + " " + fields[1]
+	}
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func validateNginxInclude(body string) error {
+	locations, err := parseNginxLocations(body)
+	if err != nil {
+		return err
+	}
+	wantMatches := []string{"= /license-api/v1/activate", "= /license-api/v1/validate"}
+	if len(locations) != len(wantMatches) {
+		return fmt.Errorf("location count = %d, want %d", len(locations), len(wantMatches))
+	}
+	wantLines := []string{
+		"proxy_pass http://127.0.0.1:18092;", "proxy_http_version 1.1;",
+		"proxy_set_header Host ota.fanfh.cn;", "proxy_set_header X-Forwarded-Proto https;",
+		"proxy_set_header X-Real-IP $remote_addr;", "proxy_set_header X-Forwarded-For $remote_addr;",
+		"proxy_set_header X-SuperPan-Load-Test \"\";", "proxy_cache off;",
+		"proxy_request_buffering on;", "client_max_body_size 64k;", "proxy_connect_timeout 5s;",
+		"proxy_read_timeout 20s;", "proxy_send_timeout 20s;",
+	}
+	wants := make(map[string]string, len(wantLines))
+	for _, line := range wantLines {
+		wants[nginxDirectiveKey(line)] = line
+	}
+	for i, location := range locations {
+		if location.match != wantMatches[i] {
+			return fmt.Errorf("location %d = %q, want %q", i, location.match, wantMatches[i])
+		}
+		got := make(map[string][]string)
+		for _, line := range location.body {
+			key := nginxDirectiveKey(line)
+			if _, ok := wants[key]; !ok {
+				return fmt.Errorf("location %q has unreviewed directive %q", location.match, line)
+			}
+			got[key] = append(got[key], line)
+		}
+		if len(got) != len(wants) {
+			return fmt.Errorf("location %q directive key count = %d, want %d", location.match, len(got), len(wants))
+		}
+		for key, want := range wants {
+			values := got[key]
+			if len(values) != 1 || values[0] != want {
+				return fmt.Errorf("location %q %s assignments = %q, want only %q", location.match, key, values, want)
+			}
+		}
+	}
+	return nil
 }
 
 func TestLicenseAndOTAConfigsUseIsolatedLoopbackContracts(t *testing.T) {
@@ -147,52 +313,43 @@ func TestLicenseAndOTAConfigsUseIsolatedLoopbackContracts(t *testing.T) {
 func TestServiceUnitsUseOnlyDedicatedSharedCredentialGroup(t *testing.T) {
 	license := read(t, "deploy", "license-service", "superpan-license.service")
 	ota := read(t, "deploy", "ota-admin", "superpan-ota-admin.service")
-	for _, tc := range []struct{ name, body, user, primary, forbiddenPrimary string }{
-		{"license", license, "superpan-license", "superpan-license", "superpan-ota-admin"},
-		{"OTA", ota, "superpan-ota-admin", "superpan-ota-admin", "superpan-license"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for key, want := range map[string]string{"User": tc.user, "Group": tc.primary, "SupplementaryGroups": "superpan-license-admin"} {
-				values := sectionValues(tc.body, "Service", key)
-				if len(values) != 1 || values[0] != want {
-					t.Errorf("%s assignments = %q, want only %q", key, values, want)
-				}
-			}
-		})
+	if err := validateLicenseServiceUnit(license); err != nil {
+		t.Error(err)
 	}
-	for _, want := range []string{"WorkingDirectory=/var/lib/superpan-license", "NoNewPrivileges=true", "CapabilityBoundingSet=", "ProtectSystem=full", "ReadOnlyDirectories=/etc/superpan-license", "ReadWriteDirectories=/var/lib/superpan-license"} {
-		requireExactLine(t, license, want)
+	if err := validateOTAServiceUnit(ota); err != nil {
+		t.Error(err)
 	}
 	for _, forbidden := range []string{"/var/lib/otaadmin", "/var/lib/superpan-ota-admin", "/www/wwwroot", "User=root", "Group=root"} {
 		if strings.Contains(license, forbidden) {
 			t.Errorf("license unit contains forbidden identity/path %q", forbidden)
 		}
 	}
-	if strings.Count(license, "ReadWriteDirectories=") != 1 {
-		t.Errorf("license service must have exactly one writable directory declaration")
-	}
-	allowed := map[string]bool{
-		"Type": true, "User": true, "Group": true, "SupplementaryGroups": true,
-		"UMask": true, "WorkingDirectory": true, "ExecStart": true, "Restart": true,
-		"RestartSec": true, "TimeoutStopSec": true, "NoNewPrivileges": true,
-		"PrivateTmp": true, "PrivateDevices": true, "ProtectSystem": true,
-		"ProtectHome": true, "InaccessibleDirectories": true, "ReadOnlyDirectories": true, "ReadWriteDirectories": true,
-		"CapabilityBoundingSet": true, "RestrictAddressFamilies": true, "LimitNOFILE": true,
-	}
-	inService := false
-	for _, line := range uncommentedLines(license) {
-		if line == "[Service]" {
-			inService = true
-			continue
-		}
-		if strings.HasPrefix(line, "[") {
-			inService = false
-		}
-		if inService {
-			key, _, ok := strings.Cut(line, "=")
-			if !ok || !allowed[key] {
-				t.Errorf("license service directive is not in the reviewed v219 allow-list: %q", line)
+
+	for _, mutation := range []struct{ name, directive string }{
+		{"conflicting ProtectSystem", "ProtectSystem=false"},
+		{"nonempty capabilities", "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"},
+		{"second primary group", "Group=superpan-ota-admin"},
+		{"extra supplementary group", "SupplementaryGroups=superpan-license-admin superpan-ota-admin"},
+		{"extra writable directory", "ReadWriteDirectories=/tmp"},
+	} {
+		t.Run("rejects "+mutation.name, func(t *testing.T) {
+			if !strings.Contains(license, "\n[Install]") {
+				t.Fatal("normalized unit is missing [Install] insertion point")
 			}
+			mutated := strings.Replace(license, "\n[Install]", "\n"+mutation.directive+"\n\n[Install]", 1)
+			if err := validateLicenseServiceUnit(mutated); err == nil {
+				t.Fatalf("accepted mutation %q", mutation.directive)
+			}
+		})
+	}
+	t.Run("rejects systemd include", func(t *testing.T) {
+		if err := validateLicenseServiceUnit(license + "\n.include /etc/systemd/system/license-overrides.conf\n"); err == nil {
+			t.Fatal("accepted systemd .include override")
+		}
+	})
+	for _, name := range []string{"User", "Group", "SupplementaryGroups", "NoNewPrivileges", "PrivateTmp", "PrivateDevices", "ProtectSystem", "ProtectHome", "InaccessibleDirectories", "ReadOnlyDirectories", "ReadWriteDirectories", "CapabilityBoundingSet", "RestrictAddressFamilies"} {
+		if len(sectionValues(license, "Service", name)) != 1 {
+			t.Errorf("license %s must occur exactly once in [Service]", name)
 		}
 	}
 }
@@ -257,44 +414,22 @@ func TestLicenseACLAndSigningIdentityContractIsMachineReadable(t *testing.T) {
 
 func TestNginxIncludeExposesExactlyTwoHardenedPublicEndpoints(t *testing.T) {
 	nginx := read(t, "deploy", "license-service", "ota.fanfh.cn.license-api.nginx.conf")
-	var active []string
-	for _, line := range strings.Split(nginx, "\n") {
-		if trimmed := strings.TrimSpace(line); trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-			active = append(active, trimmed)
-		}
+	if err := validateNginxInclude(nginx); err != nil {
+		t.Fatal(err)
 	}
-	activeBody := strings.Join(active, "\n")
-	locationRE := regexp.MustCompile(`(?m)^location\s+([^\s{]+(?:\s+[^\s{]+)?)\s*\{`)
-	matches := locationRE.FindAllStringSubmatch(activeBody, -1)
-	if len(matches) != 2 {
-		t.Fatalf("location count = %d, want 2", len(matches))
+	mutations := []struct{ name, body string }{
+		{"directive outside blocks", strings.Replace(nginx, "    proxy_cache off;\n", "", 1) + "\nproxy_cache off;\n"},
+		{"conflicting cache", strings.Replace(nginx, "    proxy_cache off;", "    proxy_cache off;\n    proxy_cache on;", 1)},
+		{"second Host", strings.Replace(nginx, "    proxy_set_header Host ota.fanfh.cn;", "    proxy_set_header Host ota.fanfh.cn;\n    proxy_set_header Host attacker.invalid;", 1)},
+		{"larger body", strings.Replace(nginx, "    client_max_body_size 64k;", "    client_max_body_size 64k;\n    client_max_body_size 1m;", 1)},
+		{"alternate timeout", strings.Replace(nginx, "    proxy_read_timeout 20s;", "    proxy_read_timeout 20s;\n    proxy_read_timeout 120s;", 1)},
+		{"indented extra location", nginx + "\n    location ~ /license-api/ {\n        proxy_pass http://127.0.0.1:18092;\n    }\n"},
 	}
-	wantLocations := []string{"= /license-api/v1/activate", "= /license-api/v1/validate"}
-	for i, match := range matches {
-		if match[1] != wantLocations[i] {
-			t.Errorf("location %d = %q, want %q", i, match[1], wantLocations[i])
-		}
-	}
-	blocks := strings.Split(activeBody, "location = ")[1:]
-	for i, block := range blocks {
-		for _, directive := range []string{
-			"proxy_pass http://127.0.0.1:18092;", "proxy_set_header Host ota.fanfh.cn;",
-			"proxy_set_header X-Forwarded-Proto https;", "proxy_set_header X-Real-IP $remote_addr;",
-			"proxy_set_header X-Forwarded-For $remote_addr;", "proxy_set_header X-SuperPan-Load-Test \"\";",
-			"proxy_cache off;", "proxy_request_buffering on;", "client_max_body_size 64k;",
-			"proxy_connect_timeout 5s;", "proxy_read_timeout 20s;", "proxy_send_timeout 20s;",
-		} {
-			if strings.Count(block, directive) != 1 {
-				t.Errorf("location %d must contain exactly one %q", i, directive)
+	for _, mutation := range mutations {
+		t.Run("rejects "+mutation.name, func(t *testing.T) {
+			if err := validateNginxInclude(mutation.body); err == nil {
+				t.Fatalf("accepted Nginx mutation %q", mutation.name)
 			}
-		}
-	}
-	for _, forbidden := range []string{
-		"server {", "location /", "/internal/", "/health", "/ota", "/admin", "/.well-known/acme-challenge", "root ",
-		"proxy_cache_path", "proxy_cache_valid", "$proxy_add_x_forwarded_for", "$http_x_forwarded_for",
-	} {
-		if strings.Contains(activeBody, forbidden) {
-			t.Errorf("nginx include contains forbidden route/directive %q", forbidden)
-		}
+		})
 	}
 }
