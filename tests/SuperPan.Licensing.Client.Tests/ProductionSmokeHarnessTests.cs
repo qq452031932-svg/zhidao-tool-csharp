@@ -21,6 +21,7 @@ public sealed class ProductionSmokeHarnessTests
         Assert.DoesNotContain("--machine", program, StringComparison.Ordinal);
         Assert.DoesNotContain("--config", program, StringComparison.Ordinal);
         Assert.DoesNotContain("--endpoint", program, StringComparison.Ordinal);
+        Assert.Contains("ProductionLicenseTrust.targets", project, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>

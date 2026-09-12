@@ -20,6 +20,7 @@ public sealed class ProductionBoundaryProbeTests
         Assert.DoesNotContain("--config", program, StringComparison.Ordinal);
         Assert.DoesNotContain("--endpoint", program, StringComparison.Ordinal);
         Assert.DoesNotContain("--product", program, StringComparison.Ordinal);
+        Assert.Contains("ProductionLicenseTrust.targets", project, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>

@@ -56,6 +56,24 @@ public sealed class OtaBuildConfigurationTests
     }
 
     [Fact]
+    public async Task ReleaseBuildRejectsProductIdentityOverride()
+    {
+        var result = await RunLicenseGateAsync("Release", WithProductionProperty("LicenseProductId", "6ebd0ccf-f462-47db-958e-cfd426451c88"));
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("license", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ReleaseBuildRejectsPlaceholderSigningKeyId()
+    {
+        var result = await RunLicenseGateAsync("Release", WithProductionProperty("LicenseSigningKeyId", "placeholder"));
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("license", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task ReleaseBuildRejectsAcceptanceStampEvenWithValidLoopbackAcceptanceProperties()
     {
         var result = await RunLicenseGateAsync("Release",

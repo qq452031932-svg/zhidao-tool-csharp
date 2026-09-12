@@ -21,6 +21,8 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.DoesNotContain("$CertificatePath", script, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("$Password", script, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("$SigningKeyFile", script, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("license-production-clients-", script, StringComparison.Ordinal);
+        Assert.Contains("never an OTA stable feed", script, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -34,6 +36,12 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("response-signing", script, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("private material", script, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("[string]$Card", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("scriptblock", script, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("SslStream", script, StringComparison.Ordinal);
+        Assert.Contains("ImportSubjectPublicKeyInfo", script, StringComparison.Ordinal);
+        Assert.Contains("VerifyData", script, StringComparison.Ordinal);
+        Assert.Contains("signingSpkiDerBase64", script, StringComparison.Ordinal);
+        Assert.Contains("currentTlsSpki", script, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>

@@ -17,3 +17,5 @@ Authorized evidence checklist:
 - confirmation that no legacy licensing client population exists at initial launch
 
 Never record card values, request bodies, SQLite/DPAPI contents, passwords, cookies, private PEM/PFX bytes, or private-key paths.
+
+Run both scripts under PowerShell 7.2 or newer. The rotation command consumes the two exact redacted build manifests (A/B and B/C), the installed public signing identity, and a non-secret challenge plus server signature. It first verifies the ECDSA P-256 challenge, then observes the endpoint certificate directly through a chain-validated `SslStream` while the authorized operator switches A to B and rolls back to A. It writes evidence only after all three observed pins and the B/C manifest chain agree.

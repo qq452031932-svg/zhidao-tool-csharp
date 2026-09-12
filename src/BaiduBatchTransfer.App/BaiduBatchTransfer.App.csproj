@@ -1,5 +1,5 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk"
-         TreatAsLocalProperty="_ExpectedProductVersion;_ExpectedInformationalVersion;_ExpectedFileVersion;_VersionPrefixIsValid;_ExpectedProductMajor;_ExpectedAssemblyVersion;_UpdateFeedUrlIsValid;_AcceptanceFeedIsAbsolute;LicenseProductId;LicenseRuntimeMode">
+         TreatAsLocalProperty="_ExpectedProductVersion;_ExpectedInformationalVersion;_ExpectedFileVersion;_VersionPrefixIsValid;_ExpectedProductMajor;_ExpectedAssemblyVersion;_UpdateFeedUrlIsValid;_AcceptanceFeedIsAbsolute;LicenseRuntimeMode">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -147,6 +147,8 @@ public sealed class ValidateLicenseProductionTrust : Task
     </Task>
   </UsingTask>
 
+  <Import Project="..\..\eng\license\ProductionLicenseTrust.targets" />
+
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
@@ -284,6 +286,14 @@ public sealed class ValidateLicenseProductionTrust : Task
                                     SigningPublicKey="$(LicenseSigningPublicKey)"
                                     CurrentSpkiPin="$(LicenseCurrentSpkiPin)"
                                     NextSpkiPin="$(LicenseNextSpkiPin)" />
+    <ValidateExactProductionLicenseTrust Condition="'$(LicenseRuntimeMode)' == 'Production'"
+                                           ServiceUrl="$(LicenseServiceUrl)"
+                                           ProductId="$(LicenseProductId)"
+                                           ExpectedProductId="8270e8d7-1791-487d-ad76-0da7a0cbed12"
+                                           SigningKeyId="$(LicenseSigningKeyId)"
+                                           SigningPublicKey="$(LicenseSigningPublicKey)"
+                                           CurrentSpkiPin="$(LicenseCurrentSpkiPin)"
+                                           NextSpkiPin="$(LicenseNextSpkiPin)" />
     <Error Condition="'$(LicenseRuntimeMode)' == 'Acceptance' and '$(_LicenseAcceptanceConfigIsAbsolute)' != 'True'"
            Text="License acceptance builds require an absolute local configuration path." />
     <Error Condition="'$(LicenseRuntimeMode)' == 'Acceptance' and '$(_LicenseServiceUrlIsAcceptanceLoopback)' != 'True'"

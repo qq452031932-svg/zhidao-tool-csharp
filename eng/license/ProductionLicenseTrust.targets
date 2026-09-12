@@ -1,0 +1,64 @@
+<Project>
+  <UsingTask TaskName="ValidateExactProductionLicenseTrust"
+             TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <Task>
+      <Code Type="Class" Language="cs"><![CDATA[
+using System;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
+using Microsoft.Build.Framework;
+using Microsoft.Build.Utilities;
+
+public sealed class ValidateExactProductionLicenseTrust : Task
+{
+    [Required] public string ServiceUrl { get; set; } = "";
+    [Required] public string ProductId { get; set; } = "";
+    [Required] public string ExpectedProductId { get; set; } = "";
+    [Required] public string SigningKeyId { get; set; } = "";
+    [Required] public string SigningPublicKey { get; set; } = "";
+    [Required] public string CurrentSpkiPin { get; set; } = "";
+    [Required] public string NextSpkiPin { get; set; } = "";
+
+    public override bool Execute()
+    {
+        try
+        {
+            if (!string.Equals(ServiceUrl, "https://ota.fanfh.cn", StringComparison.Ordinal) ||
+                !string.Equals(ProductId, ExpectedProductId, StringComparison.Ordinal) ||
+                !Regex.IsMatch(SigningKeyId, "^[A-Za-z0-9._-]{1,128}$") ||
+                Regex.IsMatch(SigningKeyId, "placeholder|changeme|example", RegexOptions.IgnoreCase) ||
+                !IsPin(CurrentSpkiPin) || !IsPin(NextSpkiPin) ||
+                string.Equals(CurrentSpkiPin, NextSpkiPin, StringComparison.Ordinal))
+                return Fail();
+            var der = Convert.FromBase64String(SigningPublicKey);
+            var prefix = new byte[] { 0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00,0x04 };
+            if (der.Length != 91 || !der.Take(prefix.Length).SequenceEqual(prefix) ||
+                !Convert.ToBase64String(der).Equals(SigningPublicKey, StringComparison.Ordinal) || !TryImportPoint(der, prefix.Length))
+                return Fail();
+            return true;
+        }
+        catch { return Fail(); }
+    }
+
+    private bool Fail() { Log.LogError("Exact production license identity and public trust are required."); return false; }
+    private static bool IsPin(string value) => value is { Length: 64 } && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
+    private static bool TryImportPoint(byte[] spki, int offset)
+    {
+        var blob = new byte[72]; blob[0]=0x45; blob[1]=0x43; blob[2]=0x53; blob[3]=0x31; blob[4]=0x20;
+        Buffer.BlockCopy(spki, offset, blob, 8, 64);
+        IntPtr algorithm=IntPtr.Zero, key=IntPtr.Zero;
+        try { return BCryptOpenAlgorithmProvider(out algorithm,"ECDSA_P256",null,0)==0 && BCryptImportKeyPair(algorithm,IntPtr.Zero,"ECCPUBLICBLOB",out key,blob,blob.Length,0)==0; }
+        finally { if(key!=IntPtr.Zero) BCryptDestroyKey(key); if(algorithm!=IntPtr.Zero) BCryptCloseAlgorithmProvider(algorithm,0); }
+    }
+    [DllImport("bcrypt.dll",CharSet=CharSet.Unicode)] private static extern int BCryptOpenAlgorithmProvider(out IntPtr algorithm,string id,string implementation,int flags);
+    [DllImport("bcrypt.dll",CharSet=CharSet.Unicode)] private static extern int BCryptImportKeyPair(IntPtr algorithm,IntPtr importKey,string blobType,out IntPtr key,byte[] input,int length,int flags);
+    [DllImport("bcrypt.dll")] private static extern int BCryptDestroyKey(IntPtr key);
+    [DllImport("bcrypt.dll")] private static extern int BCryptCloseAlgorithmProvider(IntPtr algorithm,int flags);
+}
+      ]]></Code>
+    </Task>
+  </UsingTask>
+</Project>

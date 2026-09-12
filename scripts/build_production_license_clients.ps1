@@ -1,3 +1,4 @@
+#requires -Version 7.2
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
@@ -16,6 +17,7 @@ $origin = 'https://ota.fanfh.cn'
 $superPanProduct = '8270e8d7-1791-487d-ad76-0da7a0cbed12'
 $smokeProduct = '6ebd0ccf-f462-47db-958e-cfd426451c88'
 if ($CurrentTlsSpkiPin -ceq $NextTlsSpkiPin) { throw 'Current and next TLS SPKI pins must be distinct.' }
+if ($LicenseSigningKeyId -match 'placeholder|changeme|example') { throw 'Installed response-signing key ID is required.' }
 if ($LicenseSigningPublicKey -match 'PRIVATE KEY|BEGIN |placeholder|changeme|example') { throw 'Only canonical public SPKI DER base64 is accepted.' }
 $ec = $null
 try {
@@ -41,6 +43,9 @@ $timestamp = [Uri]$TimestampUrl
 if ($timestamp.Scheme -cne 'https' -or $timestamp.UserInfo -or $timestamp.Query -or $timestamp.Fragment) { throw 'TimestampUrl must be a credential-free HTTPS origin/path.' }
 
 $output = [IO.Path]::GetFullPath($OutputDirectory)
+$artifactRoot = [IO.Path]::GetFullPath((Join-Path $repo '.artifacts'))
+if (-not $output.StartsWith($artifactRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+    -not [IO.Path]::GetFileName($output).StartsWith('license-production-clients-', [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputDirectory must be a dedicated .artifacts/license-production-clients-* directory, never an OTA stable feed.' }
 if (Test-Path -LiteralPath $output) { throw 'OutputDirectory must not already exist.' }
 $stage = "$output.partial-$([Guid]::NewGuid().ToString('N'))"
 [IO.Directory]::CreateDirectory($stage) | Out-Null
@@ -59,13 +64,14 @@ try {
     foreach ($artifact in $artifacts) {
         & $signtool sign /sha1 $thumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $artifact | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Authenticode signing failed.' }
-        & $signtool verify /pa /all /v $artifact | Out-Null
+        $verification = @(& $signtool verify /pa /all /v $artifact 2>&1)
         if ($LASTEXITCODE -ne 0) { throw 'Authenticode SHA256/timestamp policy verification failed.' }
+        if (($verification -join "`n") -notmatch '(?i)sha256') { throw 'Authenticode verification did not prove SHA256 policy.' }
         $signature = Get-AuthenticodeSignature -LiteralPath $artifact
         if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -cne $thumbprint -or $null -eq $signature.TimeStamperCertificate) { throw 'Authenticode signer or timestamp identity mismatch.' }
         $manifest += [ordered]@{ role = Split-Path (Split-Path $artifact -Parent) -Leaf; file = Split-Path $artifact -Leaf; sha256 = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant(); signerThumbprint = $thumbprint }
     }
-    $manifestJson = [ordered]@{ sourceCommit=$SourceCommit; origin=$origin; superPanProduct=$superPanProduct; smokeProduct=$smokeProduct; signingKeyId=$LicenseSigningKeyId; signingSpkiSha256=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der))).ToLowerInvariant(); currentTlsSpki=$CurrentTlsSpkiPin; nextTlsSpki=$NextTlsSpkiPin; artifacts=$manifest } | ConvertTo-Json -Depth 5
+    $manifestJson = [ordered]@{ sourceCommit=$SourceCommit; origin=$origin; superPanProduct=$superPanProduct; smokeProduct=$smokeProduct; signingKeyId=$LicenseSigningKeyId; signingSpkiDerBase64=$LicenseSigningPublicKey; signingSpkiSha256=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der))).ToLowerInvariant(); currentTlsSpki=$CurrentTlsSpkiPin; nextTlsSpki=$NextTlsSpkiPin; artifacts=$manifest } | ConvertTo-Json -Depth 5
     [IO.File]::WriteAllText((Join-Path $stage 'production-license-clients.json'), $manifestJson + "`n", [Text.UTF8Encoding]::new($false))
     [IO.Directory]::Move($stage, $output)
 } catch { if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }; throw }

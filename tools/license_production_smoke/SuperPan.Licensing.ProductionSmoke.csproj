@@ -21,10 +21,12 @@
     <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute"><_Parameter1>LicenseNextSpkiPin</_Parameter1><_Parameter2>$(LicenseNextSpkiPin)</_Parameter2></AssemblyAttribute>
     <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute"><_Parameter1>NonShipping</_Parameter1><_Parameter2>$(NonShipping)</_Parameter2></AssemblyAttribute>
   </ItemGroup>
+  <Import Project="..\..\eng\license\ProductionLicenseTrust.targets" />
   <Target Name="ValidateProductionTrust" BeforeTargets="PrepareForBuild">
     <Error Condition="'$(Configuration)' != 'Release'" Text="Production smoke client is Release-only." />
     <Error Condition="'$(ProductionOrigin)' != 'https://ota.fanfh.cn'" Text="Production origin is immutable." />
     <Error Condition="'$(ProductId)' != '6ebd0ccf-f462-47db-958e-cfd426451c88'" Text="Smoke product ID is immutable." />
     <Error Condition="'$(LicenseSigningKeyId)' == '' or '$(LicenseSigningPublicKey)' == '' or '$(LicenseCurrentSpkiPin)' == '' or '$(LicenseNextSpkiPin)' == ''" Text="Installed production public trust is required." />
+    <ValidateExactProductionLicenseTrust ServiceUrl="$(ProductionOrigin)" ProductId="$(ProductId)" ExpectedProductId="6ebd0ccf-f462-47db-958e-cfd426451c88" SigningKeyId="$(LicenseSigningKeyId)" SigningPublicKey="$(LicenseSigningPublicKey)" CurrentSpkiPin="$(LicenseCurrentSpkiPin)" NextSpkiPin="$(LicenseNextSpkiPin)" />
   </Target>
 </Project>
