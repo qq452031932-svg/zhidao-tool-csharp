@@ -255,6 +255,16 @@ INCLUDE_COUNT="$(awk -v wanted="$INCLUDE_LINE" '{ line=$0; sub(/^[[:space:]]+/, 
 [ "$INCLUDE_COUNT" -eq 1 ] ||
     die "existing OTA HTTPS server block must include ${NGINX_SNIPPET_TARGET} exactly once before installation"
 
+assert_ota_exact_identity_before_mutation() {
+    local actual expected
+    if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then return; fi
+    [ "$(id -gn "$SERVICE_USER")" = "$SERVICE_GROUP" ] || die "existing service user has the wrong primary group"
+    actual="$(id -Gn "$SERVICE_USER" | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd, -)"
+    expected="$(printf '%s\n%s\n' "$SERVICE_GROUP" "$SHARED_LICENSE_GROUP" | LC_ALL=C sort -u | paste -sd, -)"
+    [ "$actual" = "$expected" ] || die "existing OTA service user has ambient groups"
+}
+assert_ota_exact_identity_before_mutation
+
 validate_release_directory() {
     local path="$1"
     local label="$2"
@@ -277,6 +287,7 @@ if [ -e "${RELEASE_ROOT}/generations" ] || [ -L "${RELEASE_ROOT}/generations" ];
 fi
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+# OTA_INSTALL_MUTATION_BOUNDARY: identity and authenticated inputs are valid.
 validate_backup_root() {
     if [ -e "$BACKUP_ROOT" ] || [ -L "$BACKUP_ROOT" ]; then
         [ -d "$BACKUP_ROOT" ] && [ ! -L "$BACKUP_ROOT" ] || die "fixed backup root is not a real directory"
@@ -390,12 +401,6 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
     SERVICE_WAS_ACTIVE=true
 fi
 
-if id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    [ "$(id -gn "$SERVICE_USER")" = "$SERVICE_GROUP" ] || die "existing service user has the wrong primary group"
-    OTA_ACTUAL_GROUPS="$(id -Gn "$SERVICE_USER" | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd, -)"
-    OTA_EXPECTED_GROUPS="$(printf '%s\n%s\n' "$SERVICE_GROUP" "$SHARED_LICENSE_GROUP" | LC_ALL=C sort -u | paste -sd, -)"
-    [ "$OTA_ACTUAL_GROUPS" = "$OTA_EXPECTED_GROUPS" ] || die "existing OTA service user has ambient groups"
-fi
 if ! getent group superpan-ota-admin >/dev/null; then
     groupadd --system "$SERVICE_GROUP"
 fi

@@ -212,6 +212,11 @@ if [ "$PREFLIGHT_ONLY" = true ]; then
     exit 0
 fi
 
+# Batch 3 deliberately exposes no mutating normal entrypoint.  Batch 4 must
+# perform the authenticated same-commit OTA replacement before this installer
+# can truthfully report end-to-end success.
+die "complete installation disabled: batch4 OTA transaction is not implemented"
+
 DEST=/opt/superpan-license
 ETC=/etc/superpan-license
 DATA=/var/lib/superpan-license
@@ -226,6 +231,9 @@ SIGNING_SPKI_BASE64="$ETC/response-signing.spki.base64"
 SIGNING_SPKI_SHA256="$ETC/response-signing.spki.sha256"
 PERSISTENT_PATHS=("$ENCRYPTION_KEY" "$LOOKUP_KEY" "$ADMIN_SECRET" "$SIGNING_KEY" "$SIGNING_KEY_ID" "$SIGNING_SPKI_DER" "$SIGNING_SPKI_BASE64" "$SIGNING_SPKI_SHA256")
 PERSISTENT_STATE_MODE=""
+PERSISTENT_TEMP_PATHS=()
+PERSISTENT_PUBLISHED_PATHS=()
+PERSISTENT_TRANSACTION_ARMED=false
 
 exact_groups() {
     local user="$1" primary="$2" actual expected
@@ -272,23 +280,29 @@ validate_file() {
             openssl ec -in "$path" -check -noout >/dev/null 2>&1 || die "invalid EC private key"
             ;;
         der) openssl pkey -pubin -inform DER -in "$path" -noout >/dev/null 2>&1 || die "invalid SPKI DER" ;;
+        config) ;;
         database) ;;
         *) die "unknown validation format" ;;
     esac
 }
 
-validate_signing_identity() {
+validate_signing_identity_set() {
+    local private_key="$1" spki_der="$2" spki_base64="$3" spki_sha256="$4" key_id="$5"
     local actual_hash expected_id
-    openssl ec -in "$SIGNING_KEY" -noout -text 2>/dev/null | grep -Eq 'ASN1 OID: prime256v1|NIST CURVE: P-256' ||
+    openssl ec -in "$private_key" -noout -text 2>/dev/null | grep -Eq 'ASN1 OID: prime256v1|NIST CURVE: P-256' ||
         die "signing key must use P-256"
-    openssl ec -in "$SIGNING_KEY" -pubout -outform DER 2>/dev/null | cmp -s - "$SIGNING_SPKI_DER" ||
+    openssl ec -in "$private_key" -pubout -outform DER 2>/dev/null | cmp -s - "$spki_der" ||
         die "signing private/public key mismatch"
-    base64 -w 0 "$SIGNING_SPKI_DER" | cmp -s - <(tr -d '\n' <"$SIGNING_SPKI_BASE64") ||
+    base64 -w 0 "$spki_der" | cmp -s - <(tr -d '\n' <"$spki_base64") ||
         die "SPKI base64 does not match DER"
-    actual_hash="$(sha256sum -- "$SIGNING_SPKI_DER" | awk '{print $1}')"
-    [ "$(cat "$SIGNING_SPKI_SHA256")" = "$actual_hash" ] || die "SPKI hash does not match DER"
+    actual_hash="$(sha256sum -- "$spki_der" | awk '{print $1}')"
+    [ "$(cat "$spki_sha256")" = "$actual_hash" ] || die "SPKI hash does not match DER"
     expected_id="license-signing-${actual_hash:0:32}"
-    [ "$(cat "$SIGNING_KEY_ID")" = "$expected_id" ] || die "signing key ID does not match SPKI identity"
+    [ "$(cat "$key_id")" = "$expected_id" ] || die "signing key ID does not match SPKI identity"
+}
+
+validate_signing_identity() {
+    validate_signing_identity_set "$SIGNING_KEY" "$SIGNING_SPKI_DER" "$SIGNING_SPKI_BASE64" "$SIGNING_SPKI_SHA256" "$SIGNING_KEY_ID"
 }
 
 validate_database_acl() {
@@ -337,12 +351,23 @@ validate_persistent_state_before_mutation() {
     validate_file "$SIGNING_SPKI_BASE64" root root 644 125 base64
     validate_file "$SIGNING_SPKI_SHA256" root root 644 65 sha256
     ! cmp -s "$ENCRYPTION_KEY" "$LOOKUP_KEY" || die "encryption and lookup keys must differ"
+    ! cmp -s "$ENCRYPTION_KEY" "$ADMIN_SECRET" || die "encryption and admin keys must differ"
+    ! cmp -s "$LOOKUP_KEY" "$ADMIN_SECRET" || die "lookup and admin keys must differ"
     validate_signing_identity
     PERSISTENT_STATE_MODE="existing"
 }
 
+validate_existing_config_before_mutation() {
+    local config="$ETC/config.json"
+    if [ -e "$config" ] || [ -L "$config" ]; then
+        validate_file "$config" root "$LICENSE_GROUP" 640 variable config
+        "$BUNDLE/superpan-license" check-config --config "$config" >/dev/null || die "existing production license config is invalid"
+    fi
+}
+
 assert_exact_identity_before_mutation
 validate_existing_acl_before_mutation
+validate_existing_config_before_mutation
 validate_persistent_state_before_mutation
 
 if ! getent group "$LICENSE_GROUP" >/dev/null; then groupadd --system superpan-license; fi
@@ -377,48 +402,132 @@ atomic_install_file() {
     mv -T -- "$temp" "$target"
 }
 
-create_generated_file() {
-    local target="$1" owner="$2" group="$3" mode="$4" generator="$5" temp
-    temp="$(mktemp "${target}.tmp.XXXXXX")" || die "cannot create secret temporary file"
-    [ "$(dirname "$temp")" = "$ETC" ] && [ ! -L "$temp" ] && [ "$(stat -c '%h' "$temp")" = 1 ] || die "unsafe secret temporary file"
-    case "$generator" in
-        raw32) head -c 32 /dev/urandom >"$temp" ;;
-        p256) openssl ecparam -name prime256v1 -genkey -noout >"$temp" ;;
-        *) die "unknown secret generator" ;;
+sync_directory() {
+    local directory="$1"
+    sync -f "$directory" 2>/dev/null || sync
+}
+
+cleanup_persistent_transaction() {
+    local status=$? path
+    if [ "$PERSISTENT_TRANSACTION_ARMED" = true ]; then
+        set +e
+        for path in "${PERSISTENT_TEMP_PATHS[@]}"; do rm -f -- "$path"; done
+        for path in "${PERSISTENT_PUBLISHED_PATHS[@]}"; do rm -f -- "$path"; done
+        sync_directory "$ETC"
+    fi
+    return "$status"
+}
+
+validate_open_file() {
+    local fd="$1" owner="$2" group="$3" mode="$4" size="$5" format="$6" path="/proc/self/fd/$1"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$path")" = "$owner:$group:$mode:1" ] || die "open persistent file metadata mismatch"
+    [ "$(stat -Lc '%s' "$path")" = "$size" ] || die "open persistent file size mismatch"
+    case "$format" in
+        raw32) [ "$(wc -c <"$path")" -eq 32 ] || die "invalid open raw secret" ;;
+        key-id) [[ "$(cat "$path")" =~ ^license-signing-[0-9a-f]{32}$ ]] && [ "$(wc -l <"$path")" -eq 1 ] || die "invalid open key ID" ;;
+        sha256) [[ "$(cat "$path")" =~ ^[0-9a-f]{64}$ ]] && [ "$(wc -l <"$path")" -eq 1 ] || die "invalid open hash" ;;
+        base64) [[ "$(cat "$path")" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ "$(wc -l <"$path")" -eq 1 ] || die "invalid open base64" ;;
+        ec-private) openssl ec -in "$path" -check -noout >/dev/null 2>&1 || die "invalid open EC key" ;;
+        der) openssl pkey -pubin -inform DER -in "$path" -noout >/dev/null 2>&1 || die "invalid open DER" ;;
+        *) die "unknown open persistent format" ;;
     esac
-    chown "$owner:$group" "$temp"
-    chmod "$mode" "$temp"
-    sync "$temp" 2>/dev/null || sync
-    mv -T -- "$temp" "$target"
+}
+
+create_exclusive_temp() {
+    local target="$1" owner="$2" group="$3" mode="$4" format="$5" size="$6" generator="$7"
+    local attempt temp fd fd_identity path_identity
+    for attempt in 1 2 3 4 5 6 7 8; do
+        temp="${target}.tmp.$$.${RANDOM}.${attempt}"
+        set -o noclobber
+        if exec {fd}>"$temp"; then
+            set +o noclobber
+            break
+        fi
+        set +o noclobber
+        temp=""
+    done
+    [ -n "$temp" ] || die "cannot create exclusive persistent temporary file"
+    PERSISTENT_TEMP_PATHS+=("$temp")
+    case "$generator" in
+        raw32) head -c 32 /dev/urandom >&"$fd" ;;
+        p256) openssl ecparam -name prime256v1 -genkey -noout >&"$fd" ;;
+        *) die "unknown persistent generator" ;;
+    esac
+    chmod "$mode" "/proc/self/fd/$fd"
+    chown "$owner:$group" "/proc/self/fd/$fd"
+    fd_identity="$(stat -Lc '%d:%i:%h' "/proc/self/fd/$fd")"
+    path_identity="$(stat -Lc '%d:%i:%h' "$temp")"
+    [ "$fd_identity" = "$path_identity" ] && [ "${fd_identity##*:}" = 1 ] || die "persistent temporary inode changed"
+    validate_open_file "$fd" "$owner" "$group" "$mode" "$size" "$format"
+    sync -f "/proc/self/fd/$fd" 2>/dev/null || sync
+    exec {fd}>&-
+    CREATED_TEMP="$temp"
+}
+
+stage_derived_file() {
+    local target="$1" owner="$2" group="$3" mode="$4" size="$5" format="$6" source="$7"
+    local temp fd fd_identity path_identity attempt
+    for attempt in 1 2 3 4 5 6 7 8; do
+        temp="${target}.tmp.$$.${RANDOM}.${attempt}"
+        set -o noclobber
+        if exec {fd}>"$temp"; then set +o noclobber; break; fi
+        set +o noclobber
+        temp=""
+    done
+    [ -n "$temp" ] || die "cannot create exclusive derived temporary file"
+    PERSISTENT_TEMP_PATHS+=("$temp")
+    case "$format" in
+        der) openssl ec -in "$source" -pubout -outform DER >&"$fd" 2>/dev/null ;;
+        base64) base64 -w 0 "$source" >&"$fd"; printf '\n' >&"$fd" ;;
+        sha256) printf '%s\n' "$(sha256sum -- "$source" | awk '{print $1}')" >&"$fd" ;;
+        key-id) printf 'license-signing-%s\n' "$(sha256sum -- "$source" | awk '{print substr($1,1,32)}')" >&"$fd" ;;
+        *) die "unknown derived persistent format" ;;
+    esac
+    chmod "$mode" "/proc/self/fd/$fd"
+    chown "$owner:$group" "/proc/self/fd/$fd"
+    fd_identity="$(stat -Lc '%d:%i:%h' "/proc/self/fd/$fd")"
+    path_identity="$(stat -Lc '%d:%i:%h' "$temp")"
+    [ "$fd_identity" = "$path_identity" ] && [ "${fd_identity##*:}" = 1 ] || die "derived temporary inode changed"
+    validate_open_file "$fd" "$owner" "$group" "$mode" "$size" "$format"
+    sync -f "/proc/self/fd/$fd" 2>/dev/null || sync
+    exec {fd}>&-
+    CREATED_TEMP="$temp"
+}
+
+publish_persistent_transaction() {
+    local index target temp
+    for index in "${!PERSISTENT_PATHS[@]}"; do
+        target="${PERSISTENT_PATHS[$index]}"
+        temp="${PERSISTENT_TEMP_PATHS[$index]}"
+        [ ! -e "$target" ] && [ ! -L "$target" ] || die "persistent target appeared during transaction"
+        mv -T -- "$temp" "$target"
+        PERSISTENT_PUBLISHED_PATHS+=("$target")
+    done
+    sync_directory "$ETC"
+    PERSISTENT_TRANSACTION_ARMED=false
 }
 
 create_persistent_state() {
-    local hash id temp
+    local encryption_temp lookup_temp admin_temp signing_temp der_temp base64_temp hash_temp id_temp
     [ "$PERSISTENT_STATE_MODE" = "absent" ] || return
-    create_generated_file "$ENCRYPTION_KEY" root "$LICENSE_GROUP" 640 raw32
-    create_generated_file "$LOOKUP_KEY" root "$LICENSE_GROUP" 640 raw32
-    ! cmp -s "$ENCRYPTION_KEY" "$LOOKUP_KEY" || die "independent random keys unexpectedly matched"
-    create_generated_file "$ADMIN_SECRET" root "$SHARED_GROUP" 640 raw32
-    create_generated_file "$SIGNING_KEY" root "$LICENSE_GROUP" 640 p256
-    temp="$(mktemp "$ETC/response-signing.spki.der.tmp.XXXXXX")"
-    openssl ec -in "$SIGNING_KEY" -pubout -outform DER >"$temp" 2>/dev/null
-    atomic_install_file "$temp" "$SIGNING_SPKI_DER" root root 644
-    rm -f -- "$temp"
-    temp="$(mktemp "$ETC/response-signing.spki.base64.tmp.XXXXXX")"
-    base64 -w 0 "$SIGNING_SPKI_DER" >"$temp"
-    printf '\n' >>"$temp"
-    atomic_install_file "$temp" "$SIGNING_SPKI_BASE64" root root 644
-    rm -f -- "$temp"
-    hash="$(sha256sum -- "$SIGNING_SPKI_DER" | awk '{print $1}')"
-    temp="$(mktemp "$ETC/response-signing.spki.sha256.tmp.XXXXXX")"
-    printf '%s\n' "$hash" >"$temp"
-    atomic_install_file "$temp" "$SIGNING_SPKI_SHA256" root root 644
-    rm -f -- "$temp"
-    id="license-signing-${hash:0:32}"
-    temp="$(mktemp "$ETC/response-signing.key-id.tmp.XXXXXX")"
-    printf '%s\n' "$id" >"$temp"
-    atomic_install_file "$temp" "$SIGNING_KEY_ID" root root 644
-    rm -f -- "$temp"
+    PERSISTENT_TRANSACTION_ARMED=true
+    trap cleanup_persistent_transaction EXIT
+    create_exclusive_temp "$ENCRYPTION_KEY" root "$LICENSE_GROUP" 640 raw32 32 raw32; encryption_temp="$CREATED_TEMP"
+    create_exclusive_temp "$LOOKUP_KEY" root "$LICENSE_GROUP" 640 raw32 32 raw32; lookup_temp="$CREATED_TEMP"
+    create_exclusive_temp "$ADMIN_SECRET" root "$SHARED_GROUP" 640 raw32 32 raw32; admin_temp="$CREATED_TEMP"
+    create_exclusive_temp "$SIGNING_KEY" root "$LICENSE_GROUP" 640 ec-private 227 p256; signing_temp="$CREATED_TEMP"
+    stage_derived_file "$SIGNING_SPKI_DER" root root 644 91 der "$signing_temp"; der_temp="$CREATED_TEMP"
+    stage_derived_file "$SIGNING_SPKI_BASE64" root root 644 125 base64 "$der_temp"; base64_temp="$CREATED_TEMP"
+    stage_derived_file "$SIGNING_SPKI_SHA256" root root 644 65 sha256 "$der_temp"; hash_temp="$CREATED_TEMP"
+    stage_derived_file "$SIGNING_KEY_ID" root root 644 49 key-id "$der_temp"; id_temp="$CREATED_TEMP"
+    PERSISTENT_TEMP_PATHS=("$encryption_temp" "$lookup_temp" "$admin_temp" "$signing_temp" "$id_temp" "$der_temp" "$base64_temp" "$hash_temp")
+    ! cmp -s "$encryption_temp" "$lookup_temp" || die "independent random keys unexpectedly matched"
+    ! cmp -s "$ENCRYPTION_KEY" "$ADMIN_SECRET" || die "encryption and admin keys must differ"
+    ! cmp -s "$LOOKUP_KEY" "$ADMIN_SECRET" || die "lookup and admin keys must differ"
+    ! cmp -s "$encryption_temp" "$admin_temp" || die "independent encryption/admin keys unexpectedly matched"
+    ! cmp -s "$lookup_temp" "$admin_temp" || die "independent lookup/admin keys unexpectedly matched"
+    validate_signing_identity_set "$signing_temp" "$der_temp" "$base64_temp" "$hash_temp" "$id_temp"
+    publish_persistent_transaction
 }
 
 create_persistent_state
@@ -450,6 +559,9 @@ validate_rendered_license_config() {
 
 render_license_config
 
+"$DEST/superpan-license" check-config --config "$ETC/config.json" >/dev/null
+"$BUNDLE/ota-admin" check-config --config "$OTA_CONFIG_SOURCE" >/dev/null
+
 record_persistent_identity() {
     local record="$BACKUP_DIR/key-set-identity.txt" db_record="$BACKUP_DIR/database-snapshot-identity.txt"
     {
@@ -474,4 +586,4 @@ install -m 0644 -o root -g root "$BUNDLE/source-commit.txt" "$SOURCE_COMMIT_TARG
 systemctl daemon-reload
 systemctl enable --now superpan-license.service
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18092/internal/health >/dev/null
-echo "license service installed on 127.0.0.1:18092"
+echo "license phase installed; OTA transaction not yet executed"

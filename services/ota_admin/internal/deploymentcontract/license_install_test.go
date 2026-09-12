@@ -725,13 +725,19 @@ func TestLicenseInstallSecretLifecycle(t *testing.T) {
 		`validate_persistent_state_before_mutation`, `create_persistent_state`,
 		`head -c 32 /dev/urandom`, `cmp -s "$ENCRYPTION_KEY" "$LOOKUP_KEY"`,
 		`openssl ecparam -name prime256v1 -genkey -noout`,
-		`openssl ec -in "$SIGNING_KEY" -pubout -outform DER`,
-		`sha256sum -- "$SIGNING_SPKI_DER"`,
+		`openssl ec -in "$private_key" -pubout -outform DER`,
+		`sha256sum -- "$spki_der"`,
 		`PERSISTENT_STATE_MODE="existing"`, `PERSISTENT_STATE_MODE="absent"`,
 		`validate_file "$SIGNING_KEY" root "$LICENSE_GROUP" 640 227 ec-private`,
 		`validate_file "$SIGNING_KEY_ID" root root 644 49 key-id`,
 		`validate_file "$SIGNING_SPKI_DER" root root 644 91 der`,
 		`validate_file "$SIGNING_SPKI_BASE64" root root 644 125 base64`,
+		`PERSISTENT_TEMP_PATHS=()`, `PERSISTENT_PUBLISHED_PATHS=()`,
+		`trap cleanup_persistent_transaction EXIT`, `publish_persistent_transaction`,
+		`cleanup_persistent_transaction`, `sync_directory "$ETC"`,
+		`exec {fd}>"$temp"`, `stat -Lc '%d:%i:%h' "/proc/self/fd/$fd"`,
+		`! cmp -s "$ENCRYPTION_KEY" "$ADMIN_SECRET"`,
+		`! cmp -s "$LOOKUP_KEY" "$ADMIN_SECRET"`,
 	)
 	for _, forbidden := range []string{"cp -a -- \"$ENCRYPTION_KEY\"", "cp -a -- \"$SIGNING_KEY\""} {
 		if strings.Contains(install, forbidden) {
@@ -765,7 +771,10 @@ func TestLicenseInstallConfig(t *testing.T) {
 		`validate_ota_shared_secret_config`,
 		`"license_admin_secret_path"[[:space:]]*:[[:space:]]*"/etc/superpan-license/admin.secret"`,
 		`record_persistent_identity`, `database-snapshot-identity.txt`,
+		`"$DEST/superpan-license" check-config --config`,
+		`batch4 OTA transaction is not implemented`,
 	)
+	requireBefore(t, install, `batch4 OTA transaction is not implemented`, `assert_exact_identity_before_mutation`)
 	requireFragments(t, ota,
 		`SHARED_LICENSE_GROUP="superpan-license-admin"`,
 		`LICENSE_ADMIN_SECRET="/etc/superpan-license/admin.secret"`,
@@ -779,4 +788,22 @@ func TestLicenseInstallConfig(t *testing.T) {
 			t.Errorf("rollback must not restore persistent secret %s", secret)
 		}
 	}
+}
+
+func TestLicenseInstallRollbackTrustBoundary(t *testing.T) {
+	rollback := read(t, "deploy", "license-service", "rollback.sh")
+	requireFragments(t, rollback,
+		`FIXED_BACKUP_ROOT="/var/backups/superpan-license"`,
+		`BACKUP_ROOT must be /var/backups/superpan-license/<id>`,
+		`validate_trusted_path "$BACKUP_ROOT"`, `manifest.sha256`,
+		`EXPECTED_MANIFEST_NAMES`, `sha256sum -c`,
+		`install -m 0640 -o root -g superpan-license`,
+	)
+}
+
+func TestLicenseInstallOTAIdentityBeforeMutation(t *testing.T) {
+	ota := read(t, "deploy", "ota-admin", "install.sh")
+	requireFragments(t, ota, `assert_ota_exact_identity_before_mutation`, `OTA_INSTALL_MUTATION_BOUNDARY`)
+	requireBefore(t, ota, `assert_ota_exact_identity_before_mutation`, `validate_backup_root`)
+	requireBefore(t, ota, `assert_ota_exact_identity_before_mutation`, `BACKUP_DIR="$(mktemp -d`)
 }

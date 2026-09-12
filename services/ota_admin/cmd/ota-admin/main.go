@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -28,6 +29,8 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	switch arguments[0] {
+	case "check-config":
+		return runCheckConfig(arguments[1:], stdout, stderr)
 	case "compat-probe":
 		return runCompatProbe(arguments[1:], stdout, stderr)
 	case "init-admin":
@@ -38,6 +41,51 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		writeUsage(stderr)
 		return 2
 	}
+}
+
+func runCheckConfig(arguments []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("check-config", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "", "root-owned service configuration file")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if *configPath == "" || flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: ota-admin check-config --config PATH")
+		return 2
+	}
+	var cfg config.Config
+	var err error
+	if runtime.GOOS == "windows" {
+		var file *os.File
+		file, err = os.Open(*configPath)
+		if err == nil {
+			defer file.Close()
+			cfg, err = config.Parse(file)
+		}
+	} else {
+		cfg, err = config.Load(*configPath)
+	}
+	exactErr := validateExactProductionOTAConfig(cfg)
+	if err != nil || exactErr != nil || (runtime.GOOS != "windows" && cfg.ValidateServe() != nil) {
+		fmt.Fprintln(stderr, "ota-admin: invalid production configuration")
+		return 1
+	}
+	fmt.Fprintln(stdout, "ota-admin: production configuration valid")
+	return 0
+}
+
+func validateExactProductionOTAConfig(cfg config.Config) error {
+	wantLimits := config.Default().Limits
+	if cfg.DatabasePath != "/var/lib/superpan-ota-admin/state.db" || cfg.ListenAddress != "127.0.0.1:18091" ||
+		cfg.PublicOrigin != "https://ota.fanfh.cn" || cfg.LicenseAdminBaseURL != "http://127.0.0.1:18092" ||
+		cfg.LicenseAdminSecretPath != "/etc/superpan-license/admin.secret" || cfg.StagingRoot != "/var/lib/superpan-ota-admin/staging" ||
+		cfg.ReleaseRoot != "/var/lib/otaadmin/releases" || cfg.PublisherCertificatePath != "/etc/superpan-ota-admin/publisher.cer" ||
+		cfg.PublisherSPKISHA256 != "f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff" ||
+		cfg.SourceHMACKeyPath != "/etc/superpan-ota-admin/source-hmac.key" || cfg.Limits != wantLimits {
+		return errors.New("OTA production configuration differs")
+	}
+	return nil
 }
 
 func runCompatProbe(arguments []string, stdout, stderr io.Writer) int {
@@ -140,5 +188,5 @@ func initializeAdmin(database *store.Store, output io.Writer, random io.Reader, 
 }
 
 func writeUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: ota-admin <compat-probe|init-admin|serve> [options]")
+	fmt.Fprintln(writer, "usage: ota-admin <check-config|compat-probe|init-admin|serve> [options]")
 }

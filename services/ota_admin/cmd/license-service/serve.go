@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -33,11 +34,12 @@ type systemClock struct{}
 func (systemClock) Now() time.Time { return time.Now().UTC() }
 
 func run(arguments []string, stdout, stderr io.Writer) int {
-	if len(arguments) == 0 || arguments[0] != "serve" {
+	if len(arguments) == 0 || (arguments[0] != "serve" && arguments[0] != "check-config") {
 		writeUsage(stderr)
 		return 2
 	}
-	flags := flag.NewFlagSet("license-service serve", flag.ContinueOnError)
+	command := arguments[0]
+	flags := flag.NewFlagSet("license-service "+command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "local license service configuration file")
 	if err := flags.Parse(arguments[1:]); err != nil {
@@ -47,10 +49,28 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		writeUsage(stderr)
 		return 2
 	}
-	cfg, err := licenseconfig.Load(*configPath)
+	var cfg licenseconfig.Config
+	var err error
+	if command == "check-config" && runtime.GOOS == "windows" {
+		var body []byte
+		body, err = os.ReadFile(*configPath)
+		if err == nil {
+			cfg, err = licenseconfig.Parse(body)
+		}
+	} else {
+		cfg, err = licenseconfig.Load(*configPath)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, "license-service: invalid configuration")
 		return 1
+	}
+	if command == "check-config" {
+		if err := validateProductionConfig(cfg); err != nil {
+			fmt.Fprintln(stderr, "license-service: invalid production configuration")
+			return 1
+		}
+		fmt.Fprintln(stdout, "license-service: production configuration valid")
+		return 0
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -59,6 +79,21 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func validateProductionConfig(cfg licenseconfig.Config) error {
+	if cfg.ListenAddress != "127.0.0.1:18092" || cfg.LicenseDatabasePath != "/var/lib/superpan-license/state.db" ||
+		cfg.EncryptionKeyPath != "/etc/superpan-license/encryption.key" || len(cfg.PreviousEncryptionKeyPaths) != 0 ||
+		cfg.LookupHMACKeyPath != "/etc/superpan-license/lookup.key" || cfg.SigningPrivateKeyPath != "/etc/superpan-license/response-signing.key" ||
+		cfg.InternalSecretPath != "/etc/superpan-license/admin.secret" || cfg.LoadTestEnabled || cfg.LoadTestSecretPath != "" ||
+		cfg.PublicAPIBasePath != "/license-api/v1" {
+		return errors.New("production identity, listener, or paths differ")
+	}
+	want := licenseconfig.Limits{MaxBodyBytes: 65536, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600, MaxReplayNonces: 4096, MaxAdminIdempotencyEntries: 1024, MaxAdminIdempotencyBytes: 10485760, ActivationRequests: 30, ValidationRequests: 60, AdminRequests: 120, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 5, ReadTimeoutSeconds: 15, WriteTimeoutSeconds: 15, IdleTimeoutSeconds: 60, ShutdownTimeoutSeconds: 30}
+	if cfg.Limits != want {
+		return errors.New("production limits differ")
+	}
+	return nil
 }
 
 func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writer) error {
@@ -217,5 +252,5 @@ func clearPreviousEncryptionKeys(keys [][]byte) {
 }
 
 func writeUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: license-service serve --config PATH")
+	fmt.Fprintln(writer, "usage: license-service (serve|check-config) --config PATH")
 }

@@ -20,6 +20,32 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/store"
 )
 
+func TestRunCheckConfigValidatesProductionWithoutOpeningState(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "..", "deploy", "ota-admin", "config.example.json")
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse(file)
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateExactProductionOTAConfig(cfg); err != nil {
+		t.Fatalf("fixture is not exact production config: %v: %+v", err, cfg)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"check-config", "--config", path}, &stdout, &stderr); code != 0 {
+		t.Fatalf("check-config code=%d stderr=%q", code, stderr.String())
+	}
+	if stdout.String() != "ota-admin: production configuration valid\n" {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+	if _, err := os.Stat("/var/lib/superpan-ota-admin/state.db"); err == nil {
+		t.Fatal("check-config opened production state")
+	}
+}
+
 func TestDecodeSourceHMACKeyRequiresOneLowercaseHexKey(t *testing.T) {
 	t.Parallel()
 	text := strings.Repeat("01", 32) + "\n"
