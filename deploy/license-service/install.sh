@@ -148,19 +148,24 @@ BUNDLE_SOURCE_COMMIT="$(cat "$BUNDLE/source-commit.txt")"
 [ "$BUNDLE_SOURCE_COMMIT" = "$SOURCE_COMMIT" ] || die "source-commit.txt does not match --source-commit"
 printf '%s\n' "$SOURCE_COMMIT" | cmp -s - "$BUNDLE/source-commit.txt" || die "source-commit.txt is not canonical"
 
+# LICENSE_INSTALL_PREFLIGHT_COMPLETE: every input byte and source record is authenticated.
+if [ "$PREFLIGHT_ONLY" = true ]; then
+    echo "license installation preflight complete for source commit $SOURCE_COMMIT"
+    exit 0
+fi
+
 [ -f "$OTA_INSTALLER" ] && [ ! -L "$OTA_INSTALLER" ] || die "OTA installer is missing or unsafe"
+[ "$(readlink -f -- "$OTA_INSTALLER")" = "$OTA_INSTALLER" ] || die "OTA installer path is not canonical"
+[ "$(stat -c '%U:%G' "$OTA_INSTALLER")" = "root:root" ] || die "OTA installer must be owned by root:root"
+[ "$(stat -c '%h' "$OTA_INSTALLER")" = "1" ] || die "OTA installer must have exactly one link"
+OTA_INSTALLER_MODE="$(stat -c '%a' "$OTA_INSTALLER")"
+(( (8#$OTA_INSTALLER_MODE & 8#022) == 0 )) || die "OTA installer must not be group/world writable"
 bash "$OTA_INSTALLER" --loopback-license-transaction \
     --preflight-only \
     --binary "$BUNDLE/ota-admin" --binary-sha256 "$OTA_BINARY_SHA256" \
     --config "$OTA_CONFIG_SOURCE" --config-sha256 "$OTA_CONFIG_SHA256" \
     --unit "$OTA_UNIT_SOURCE" --unit-sha256 "$OTA_UNIT_SHA256" \
     --source-commit "$SOURCE_COMMIT"
-
-# LICENSE_INSTALL_PREFLIGHT_COMPLETE: every input byte and source record is authenticated.
-if [ "$PREFLIGHT_ONLY" = true ]; then
-    echo "license installation preflight complete for source commit $SOURCE_COMMIT"
-    exit 0
-fi
 
 DEST=/opt/superpan-license
 ETC=/etc/superpan-license

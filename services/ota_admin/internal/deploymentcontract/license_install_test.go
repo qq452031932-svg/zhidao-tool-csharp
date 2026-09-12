@@ -68,11 +68,17 @@ func TestLicenseInstallPreflight(t *testing.T) {
 		`[ "$BUNDLE_MODE" = "700" ]`, "-type l", "-links +1", "-perm /022",
 		"--preflight-only", "LICENSE_INSTALL_PREFLIGHT_COMPLETE",
 		"bash \"$OTA_INSTALLER\" --loopback-license-transaction \\\n    --preflight-only",
+		`OTA_INSTALLER="$(cd "$(dirname "${BASH_SOURCE[0]}")/../ota-admin" && pwd)/install.sh"`,
+		`[ "$(readlink -f -- "$OTA_INSTALLER")" = "$OTA_INSTALLER" ]`,
+		`[ "$(stat -c '%U:%G' "$OTA_INSTALLER")" = "root:root" ]`,
+		`[ "$(stat -c '%h' "$OTA_INSTALLER")" = "1" ]`,
+		"OTA_INSTALLER_MODE=", "OTA installer must not be group/world writable",
 	)
 	if strings.Count(install, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE") != 1 {
 		t.Fatal("license installer must have exactly one preflight-complete mutation boundary")
 	}
 	boundaryAt := strings.Index(install, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE")
+	otaPreflightAt := strings.Index(install, `bash "$OTA_INSTALLER"`)
 	for _, command := range []string{
 		"mkdir", "groupadd", "useradd", "usermod", "install", "cp", "mv",
 		"rm", "chown", "chmod", "touch", "tee", "systemctl",
@@ -82,9 +88,21 @@ func TestLicenseInstallPreflight(t *testing.T) {
 			if location[0] < boundaryAt {
 				t.Errorf("mutation command %q appears before preflight completion", command)
 			}
+			if location[0] < otaPreflightAt {
+				t.Errorf("mutation command %q appears before OTA preflight", command)
+			}
 		}
 	}
-	requireBefore(t, install, `bash "$OTA_INSTALLER"`, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE")
+	requireBefore(t, install, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE", `if [ "$PREFLIGHT_ONLY" = true ]; then`)
+	requireBefore(t, install, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE", `bash "$OTA_INSTALLER"`)
+	requireBefore(t, install, `if [ "$PREFLIGHT_ONLY" = true ]; then`, `bash "$OTA_INSTALLER"`)
+	requireBefore(t, install, `bash "$OTA_INSTALLER"`, "groupadd --system superpan-license")
+	childScripts := regexp.MustCompile(`(?m)^[[:space:]]*(bash|sh)[[:space:]]+`)
+	for _, location := range childScripts.FindAllStringIndex(install, -1) {
+		if location[0] < boundaryAt {
+			t.Error("external child script invocation appears before preflight completion")
+		}
+	}
 	for _, forbidden := range []string{"ota.fanfh.cn.license-api.nginx.conf", "nginx -t", "nginx -s reload", "ACTIVE_VHOST", "active-vhost"} {
 		if strings.Contains(install, forbidden) {
 			t.Errorf("license transaction must not contain public-route operation %q", forbidden)
