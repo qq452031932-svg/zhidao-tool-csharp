@@ -28,6 +28,17 @@ public sealed class ReplacementWorkbookFileNameBuilder
         return basis + suffix;
     }
 
+    public string BuildSplit(string accountDisplayName, string resultKind, DateTimeOffset timestamp)
+    {
+        if (string.IsNullOrWhiteSpace(accountDisplayName)) throw new ArgumentException("Account name is required.", nameof(accountDisplayName));
+        if (resultKind is not ("成功" or "失败")) throw new ArgumentException("Result kind must be 成功 or 失败.", nameof(resultKind));
+        var basis = SanitizeBasis(accountDisplayName.Trim());
+        var suffix = $"_{resultKind}_{timestamp:yyyyMMddHHmmss}.xlsx";
+        var max = MaximumFileNameLength - suffix.Length;
+        if (basis.Length > max) basis = basis[..Math.Max(1, max)];
+        return basis + suffix;
+    }
+
     private static string SanitizeBasis(string basis)
     {
         var invalid = Path.GetInvalidFileNameChars().ToHashSet();

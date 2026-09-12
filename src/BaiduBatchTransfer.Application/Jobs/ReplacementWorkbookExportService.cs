@@ -85,6 +85,69 @@ public sealed class ReplacementWorkbookExportService(
         return fileNameBuilder.Build(definition.SourceFileName, timeProvider.GetUtcNow());
     }
 
+    public async Task<IReadOnlyList<SplitReplacementWorkbookReceipt>> ExportSplitToDirectoryAsync(
+        ReplacementWorkbookExportRequest request,
+        string destinationDirectory,
+        IReplacementWorkbookFilePublisher publisher,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationDirectory);
+        ArgumentNullException.ThrowIfNull(publisher);
+        var definition = await repository.GetDefinitionAsync(request.BatchJobId, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The batch result projection is unavailable.");
+        var timestamp = timeProvider.GetUtcNow();
+        var receipts = new List<SplitReplacementWorkbookReceipt>();
+        foreach (var account in definition.Accounts.OrderBy(a => a.OutputOrdinal))
+        {
+            foreach (var kind in new[] { "成功", "失败" })
+            {
+                var rows = StreamSplitRowsAsync(request, definition.OriginalColumns.OrderBy(c => c.ColumnOrdinal).ToArray(), account, kind, cancellationToken);
+                var materialized = new List<ReplacementWorkbookRow>();
+                await foreach (var row in rows.WithCancellation(cancellationToken)) materialized.Add(row);
+                if (materialized.Count == 0) continue;
+                var layout = new ReplacementWorkbookLayout(definition.OriginalColumns.OrderBy(c => c.ColumnOrdinal).Select(c => c.Header).Concat(["转存结果", "分享链接", "提取码", "失败原因"]));
+                var receipt = await publisher.PublishAsync(destinationDirectory, fileNameBuilder.BuildSplit(account.DisplayName, kind, timestamp), layout, ToAsync(materialized), cancellationToken).ConfigureAwait(false);
+                receipts.Add(new(account.DisplayName, kind, receipt));
+            }
+        }
+        return receipts;
+    }
+
+    private async IAsyncEnumerable<ReplacementWorkbookRow> StreamSplitRowsAsync(ReplacementWorkbookExportRequest request, IReadOnlyList<BatchResultOriginalColumn> columns, BatchResultProjectionAccount account, string kind, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        long cursor = 0;
+        while (true)
+        {
+            var page = await repository.GetProjectionPageAsync(request.BatchJobId, cursor, request.PageSize, cancellationToken).ConfigureAwait(false);
+            if (page.Resources.Count == 0) yield break;
+            var map = page.AccountResults.Where(x => x.AccountId == account.AccountId).ToDictionary(x => x.ResourceItemId);
+            foreach (var resource in page.Resources)
+            {
+                if (!map.TryGetValue(resource.ResourceItemId, out var outcome)) continue;
+                var success = outcome.TransferStatus == "Succeeded" && outcome.ShareStatus is ShareOperationStatus.Succeeded or ShareOperationStatus.ReusedExisting;
+                if ((kind == "成功") != success) continue;
+                var values = resource.OriginalValues.ToDictionary(v => v.ColumnOrdinal, v => v.Text ?? string.Empty);
+                var cells = columns.Select(c => values.GetValueOrDefault(c.ColumnOrdinal, string.Empty)).ToList();
+                if (success)
+                {
+                    for (var i = 0; i < columns.Count; i++)
+                    {
+                        if (columns[i].Header.Contains("链接", StringComparison.OrdinalIgnoreCase)) cells[i] = outcome.ShareUrl ?? cells[i];
+                        if (columns[i].Header.Contains("提取码", StringComparison.OrdinalIgnoreCase)) cells[i] = outcome.ExtractionCode ?? string.Empty;
+                    }
+                }
+                cells.Add(success ? "成功" : "失败"); cells.Add(success ? outcome.ShareUrl ?? string.Empty : resource.OriginalShareUrl); cells.Add(success ? outcome.ExtractionCode ?? string.Empty : string.Empty); cells.Add(success ? string.Empty : outcome.StableErrorCode ?? outcome.TransferStatus);
+                yield return new ReplacementWorkbookRow(resource.CandidateSequence, cells);
+            }
+            if (page.NextCandidateSequence is not { } next) yield break;
+            cursor = next;
+        }
+    }
+
+    private static async IAsyncEnumerable<ReplacementWorkbookRow> ToAsync(IEnumerable<ReplacementWorkbookRow> rows)
+    { foreach (var row in rows) yield return row; await Task.CompletedTask; }
+
     public async Task<ReplacementWorkbookLayout> GetExpectedLayoutAsync(
         Guid batchJobId,
         CancellationToken cancellationToken = default)
