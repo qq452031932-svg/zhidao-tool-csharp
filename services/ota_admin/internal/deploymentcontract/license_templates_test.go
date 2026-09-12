@@ -326,7 +326,7 @@ func TestLicenseConfigExamplePassesProductionStrictParser(t *testing.T) {
 		SigningKeyID: "production-p256-2026-09", PublicAPIBasePath: "/license-api/v1",
 		Limits: licenseconfig.Limits{
 			MaxBodyBytes: 65536, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300,
-			NonceLifetimeSeconds: 600, MaxReplayNonces: 4096, MaxAdminIdempotencyEntries: 1024,
+			NonceLifetimeSeconds: 600, MaxReplayNonces: 131072, MaxAdminIdempotencyEntries: 1024,
 			MaxAdminIdempotencyBytes: 10485760, ActivationRequests: 30, ValidationRequests: 60,
 			AdminRequests: 120, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 5,
 			ReadTimeoutSeconds: 15, WriteTimeoutSeconds: 15, IdleTimeoutSeconds: 60,

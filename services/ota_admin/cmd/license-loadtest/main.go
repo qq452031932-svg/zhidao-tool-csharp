@@ -67,7 +67,6 @@ const (
 	kindValidate requestKind = iota
 	kindActivate
 	kindReject
-	nonceSlotsPerPhase = 2048
 )
 
 func classify(index int64) requestKind {
@@ -370,7 +369,7 @@ func deterministicNonce(seed, index int64) string {
 }
 
 func phaseNonce(seed int64, rate int, index int64) string {
-	return deterministicNonce(seed+int64(rate)*1_000_000_000, index%nonceSlotsPerPhase)
+	return deterministicNonce(seed+int64(rate)*1_000_000_000, index)
 }
 func percentile(values []float64, p float64) float64 {
 	if len(values) == 0 {

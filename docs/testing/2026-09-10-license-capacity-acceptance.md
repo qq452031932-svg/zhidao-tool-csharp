@@ -8,9 +8,9 @@ This is a redacted evidence template. Execute only against a disposable instance
 - 50 requests/second for 600 seconds, followed by 100 requests/second for 600 seconds
 - 70% valid validation, 10% idempotent activation, 20% deliberate business rejection
 - Health checked continuously during both phases
-- The authenticated loopback-only load mode uses two disjoint deterministic 2,048-nonce
-  pools and does not consume the ordinary public replay store; public requests without
-  the load credential retain normal replay enforcement.
+- Every load request uses a unique deterministic nonce and exercises the same SQLite
+  replay-claim path as ordinary public traffic. The versioned production template fixes
+  replay capacity at 131,072 entries, above the 90,000 entries required by both phases.
 - Every public result is accepted only after strict envelope decoding, response-signature
   verification against the protected SPKI/key-ID files, request correlation, and exact
   decision/code/binding semantics. HTTP status alone is never evidence of success.

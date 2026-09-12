@@ -89,7 +89,7 @@ func validateProductionConfig(cfg licenseconfig.Config) error {
 		cfg.PublicAPIBasePath != "/license-api/v1" {
 		return errors.New("production identity, listener, or paths differ")
 	}
-	want := licenseconfig.Limits{MaxBodyBytes: 65536, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600, MaxReplayNonces: 4096, MaxAdminIdempotencyEntries: 1024, MaxAdminIdempotencyBytes: 10485760, ActivationRequests: 30, ValidationRequests: 60, AdminRequests: 120, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 5, ReadTimeoutSeconds: 15, WriteTimeoutSeconds: 15, IdleTimeoutSeconds: 60, ShutdownTimeoutSeconds: 30}
+	want := licenseconfig.Limits{MaxBodyBytes: 65536, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600, MaxReplayNonces: 131072, MaxAdminIdempotencyEntries: 1024, MaxAdminIdempotencyBytes: 10485760, ActivationRequests: 30, ValidationRequests: 60, AdminRequests: 120, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 5, ReadTimeoutSeconds: 15, WriteTimeoutSeconds: 15, IdleTimeoutSeconds: 60, ShutdownTimeoutSeconds: 30}
 	if cfg.Limits != want {
 		return errors.New("production limits differ")
 	}

@@ -84,15 +84,20 @@ func TestApprovedPhasesUseDisjointNonceSequences(t *testing.T) {
 	}
 }
 
-func TestApprovedTenMinutePhasesFitReplayCapacity(t *testing.T) {
+func TestApprovedTenMinutePhasesUseUniqueNoncesWithinProductionCapacity(t *testing.T) {
 	seen := map[string]struct{}{}
+	total := 0
 	for _, rate := range []int{50, 100} {
 		for index := int64(0); index < int64(rate*600); index++ {
 			seen[phaseNonce(approvedSeed, rate, index)] = struct{}{}
+			total++
 		}
 	}
-	if len(seen) != 4096 {
-		t.Fatalf("approved phases use %d distinct nonces, want bounded disjoint pool of 4096", len(seen))
+	if len(seen) != total {
+		t.Fatalf("approved phases use %d distinct nonces for %d requests", len(seen), total)
+	}
+	if total > 131072 {
+		t.Fatalf("approved phases require %d replay entries, production capacity is 131072", total)
 	}
 }
 

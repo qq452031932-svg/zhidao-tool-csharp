@@ -70,16 +70,14 @@ func (a *api) activate(w http.ResponseWriter, r *http.Request) {
 		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
 		return
 	}
-	if !isAuthenticatedLoadRequest(r) {
-		claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
-		if err != nil {
-			a.writeClaims(w, http.StatusServiceUnavailable, requestID, model.CodeServiceUnavailable, nil)
-			return
-		}
-		if !claimed {
-			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
-			return
-		}
+	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
+	if err != nil {
+		a.writeClaims(w, http.StatusServiceUnavailable, requestID, model.CodeServiceUnavailable, nil)
+		return
+	}
+	if !claimed {
+		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
+		return
 	}
 	state, err := a.options.Service.Activate(r.Context(), request.ActivationRequestID, request.Card, request.SoftwareID, request.MachineHash)
 	status, code := mapServiceError(err)
@@ -112,16 +110,14 @@ func (a *api) validate(w http.ResponseWriter, r *http.Request) {
 		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
 		return
 	}
-	if !isAuthenticatedLoadRequest(r) {
-		claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
-		if err != nil {
-			a.writeClaims(w, http.StatusServiceUnavailable, requestID, model.CodeServiceUnavailable, nil)
-			return
-		}
-		if !claimed {
-			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
-			return
-		}
+	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
+	if err != nil {
+		a.writeClaims(w, http.StatusServiceUnavailable, requestID, model.CodeServiceUnavailable, nil)
+		return
+	}
+	if !claimed {
+		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
+		return
 	}
 	state, err := a.options.Service.Validate(r.Context(), request.Card, request.SoftwareID, request.MachineHash)
 	status, code := mapServiceError(err)

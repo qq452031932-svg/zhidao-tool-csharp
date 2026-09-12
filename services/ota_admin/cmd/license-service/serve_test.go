@@ -60,6 +60,21 @@ func TestRunCheckConfigUsesExactProductionContractWithoutStartingServer(t *testi
 		t.Fatalf("check-config stdout=%q", stdout.String())
 	}
 
+	cfg.Limits.MaxReplayNonces--
+	body, err = json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"check-config", "--config", path}, &stdout, &stderr); code != 1 {
+		t.Fatalf("undersized replay capacity check-config code=%d", code)
+	}
+
+	cfg = productionLicenseConfigForTest()
 	cfg.ListenAddress = "127.0.0.1:19092"
 	body, err = json.Marshal(cfg)
 	if err != nil {
@@ -85,7 +100,7 @@ func productionLicenseConfigForTest() licenseconfig.Config {
 		LookupHMACKeyPath: "/etc/superpan-license/lookup.key", SigningPrivateKeyPath: "/etc/superpan-license/response-signing.key",
 		InternalSecretPath: "/etc/superpan-license/admin.secret", LoadTestEnabled: false, LoadTestSecretPath: "",
 		SigningKeyID: "license-signing-0123456789abcdef0123456789abcdef", PublicAPIBasePath: "/license-api/v1",
-		Limits: licenseconfig.Limits{MaxBodyBytes: 65536, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600, MaxReplayNonces: 4096, MaxAdminIdempotencyEntries: 1024, MaxAdminIdempotencyBytes: 10485760, ActivationRequests: 30, ValidationRequests: 60, AdminRequests: 120, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 5, ReadTimeoutSeconds: 15, WriteTimeoutSeconds: 15, IdleTimeoutSeconds: 60, ShutdownTimeoutSeconds: 30},
+		Limits: licenseconfig.Limits{MaxBodyBytes: 65536, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600, MaxReplayNonces: 131072, MaxAdminIdempotencyEntries: 1024, MaxAdminIdempotencyBytes: 10485760, ActivationRequests: 30, ValidationRequests: 60, AdminRequests: 120, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 5, ReadTimeoutSeconds: 15, WriteTimeoutSeconds: 15, IdleTimeoutSeconds: 60, ShutdownTimeoutSeconds: 30},
 	}
 }
 
