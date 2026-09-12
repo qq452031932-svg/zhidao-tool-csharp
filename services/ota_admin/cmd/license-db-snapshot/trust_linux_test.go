@@ -3,12 +3,66 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
+
+type fakeDirectoryOps struct {
+	uid, gid, mode   uint32
+	failServiceChown bool
+	failNextSync     error
+}
+
+func (o *fakeDirectoryOps) Fchmod(_ int, mode uint32) error { o.mode = mode; return nil }
+func (o *fakeDirectoryOps) Fchown(_ int, uid, gid int) error {
+	if o.failServiceChown && uid != 0 {
+		return errors.New("fixture restore owner failure")
+	}
+	o.uid, o.gid = uint32(uid), uint32(gid)
+	return nil
+}
+func (o *fakeDirectoryOps) Sync(*os.File) error {
+	if o.failNextSync != nil {
+		err := o.failNextSync
+		o.failNextSync = nil
+		return err
+	}
+	return nil
+}
+func (o *fakeDirectoryOps) Metadata(int) (uint32, uint32, uint32, error) {
+	return o.uid, o.gid, o.mode, nil
+}
+
+func TestPartialGuardAcquireRollbackSuccessRestoresMetadata(t *testing.T) {
+	original := errors.New("fixture acquire validation failure")
+	ops := &fakeDirectoryOps{uid: 0, gid: 0, mode: 0700, failNextSync: original}
+	lease := &platformDirectoryGuardLease{file: os.NewFile(0, "fixture"), uid: 123, gid: 456, mode: 0700, live: true, ops: ops}
+	err := lease.finishPartialAcquire()
+	if !errors.Is(err, original) || errors.Is(err, ErrManualRepairRequired) {
+		t.Fatalf("unexpected rollback result: %v", err)
+	}
+	if ops.uid != 123 || ops.gid != 456 || ops.mode != 0700 {
+		t.Fatalf("metadata not restored: %#v", ops)
+	}
+}
+
+func TestPartialGuardAcquireRollbackFailureRequiresManualRepair(t *testing.T) {
+	original := errors.New("fixture acquire sync failure")
+	ops := &fakeDirectoryOps{uid: 0, gid: 0, mode: 0700, failServiceChown: true, failNextSync: original}
+	lease := &platformDirectoryGuardLease{file: os.NewFile(0, "fixture"), uid: 123, gid: 456, mode: 0700, live: true, ops: ops}
+	err := lease.finishPartialAcquire()
+	if !errors.Is(err, ErrManualRepairRequired) || !errors.Is(err, original) || !strings.Contains(err.Error(), "keep superpan-license.service stopped; manually restore directory ownership") {
+		t.Fatalf("manual repair error missing: %v", err)
+	}
+	if ops.uid != 0 || ops.gid != 0 || ops.mode != 0700 {
+		t.Fatalf("root control was not re-seized: %#v", ops)
+	}
+}
 
 func TestValidateNodeRejectsSymlinkHardlinkAndWrongMode(t *testing.T) {
 	if os.Geteuid() != 0 {

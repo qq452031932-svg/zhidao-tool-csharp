@@ -27,6 +27,8 @@ const (
 	backupRoot       = "/var/backups/superpan-license"
 )
 
+var ErrManualRepairRequired = errors.New("keep superpan-license.service stopped; manually restore directory ownership")
+
 type ServiceState uint8
 
 const (

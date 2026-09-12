@@ -44,6 +44,25 @@ func (platformSourceBinder) Bind(path string, expected FileIdentity) (SourceBind
 }
 
 type platformDirectoryGuard struct{}
+type directoryGuardOps interface {
+	Fchmod(int, uint32) error
+	Fchown(int, int, int) error
+	Sync(*os.File) error
+	Metadata(int) (uint32, uint32, uint32, error)
+}
+type linuxDirectoryGuardOps struct{}
+
+func (linuxDirectoryGuardOps) Fchmod(fd int, mode uint32) error { return syscall.Fchmod(fd, mode) }
+func (linuxDirectoryGuardOps) Fchown(fd, uid, gid int) error    { return syscall.Fchown(fd, uid, gid) }
+func (linuxDirectoryGuardOps) Sync(file *os.File) error         { return file.Sync() }
+func (linuxDirectoryGuardOps) Metadata(fd int) (uint32, uint32, uint32, error) {
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		return 0, 0, 0, err
+	}
+	return stat.Uid, stat.Gid, uint32(stat.Mode) & 07777, nil
+}
+
 type platformDirectoryGuardLease struct {
 	file     *os.File
 	path     string
@@ -51,6 +70,7 @@ type platformDirectoryGuardLease struct {
 	uid, gid uint32
 	mode     uint32
 	live     bool
+	ops      directoryGuardOps
 }
 
 func (platformDirectoryGuard) Acquire(source string, kind SourceKind) (DirectoryGuardLease, error) {
@@ -89,7 +109,7 @@ func acquirePlatformDirectoryGuard(parent string, live bool, expectedUID, expect
 		file.Close()
 		return nil, errors.New("source directory has untrusted original metadata")
 	}
-	lease := &platformDirectoryGuardLease{file: file, path: parent, identity: FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, uid: stat.Uid, gid: stat.Gid, mode: uint32(stat.Mode) & 07777, live: live}
+	lease := &platformDirectoryGuardLease{file: file, path: parent, identity: FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, uid: stat.Uid, gid: stat.Gid, mode: uint32(stat.Mode) & 07777, live: live, ops: linuxDirectoryGuardOps{}}
 	if !lease.live {
 		if err := lease.Validate(); err != nil {
 			file.Close()
@@ -108,22 +128,25 @@ func acquirePlatformDirectoryGuard(parent string, live bool, expectedUID, expect
 		file.Close()
 		return nil, err
 	}
-	if err := syscall.Fchmod(fd, 0700); err != nil {
-		seizeErr := lease.seizeRoot()
+	if err := lease.finishPartialAcquire(); err != nil {
 		file.Close()
-		return nil, errors.Join(err, seizeErr)
-	}
-	if err := file.Sync(); err != nil {
-		seizeErr := lease.seizeRoot()
-		file.Close()
-		return nil, errors.Join(err, seizeErr)
-	}
-	if err := lease.Validate(); err != nil {
-		seizeErr := lease.seizeRoot()
-		file.Close()
-		return nil, errors.Join(err, seizeErr)
+		return nil, err
 	}
 	return lease, nil
+}
+
+func (g *platformDirectoryGuardLease) finishPartialAcquire() error {
+	fd := int(g.file.Fd())
+	if err := g.ops.Fchmod(fd, 0700); err != nil {
+		return g.recoverPartialAcquire(err)
+	}
+	if err := g.ops.Sync(g.file); err != nil {
+		return g.recoverPartialAcquire(err)
+	}
+	if err := g.Validate(); err != nil {
+		return g.recoverPartialAcquire(err)
+	}
+	return nil
 }
 
 func (g *platformDirectoryGuardLease) Validate() error {
@@ -158,19 +181,19 @@ func (g *platformDirectoryGuardLease) Restore() error {
 		return g.Validate()
 	}
 	fd := int(g.file.Fd())
-	if err := syscall.Fchmod(fd, 0700); err != nil {
+	if err := g.ops.Fchmod(fd, 0700); err != nil {
 		return g.restoreFailure("prepare restore", err)
 	}
-	if err := g.file.Sync(); err != nil {
+	if err := g.ops.Sync(g.file); err != nil {
 		return g.restoreFailure("sync guarded metadata", err)
 	}
-	if err := syscall.Fchown(fd, int(g.uid), int(g.gid)); err != nil {
+	if err := g.ops.Fchown(fd, int(g.uid), int(g.gid)); err != nil {
 		return g.restoreFailure("restore owner", err)
 	}
-	if err := syscall.Fchmod(fd, g.mode); err != nil {
+	if err := g.ops.Fchmod(fd, g.mode); err != nil {
 		return g.restoreFailure("restore mode", err)
 	}
-	if err := g.file.Sync(); err != nil {
+	if err := g.ops.Sync(g.file); err != nil {
 		return g.restoreFailure("sync restored metadata", err)
 	}
 	if err := g.validateMetadata(g.uid, g.gid, g.mode); err != nil {
@@ -181,9 +204,9 @@ func (g *platformDirectoryGuardLease) Restore() error {
 
 func (g *platformDirectoryGuardLease) seizeRoot() error {
 	fd := int(g.file.Fd())
-	chownErr := syscall.Fchown(fd, 0, 0)
-	chmodErr := syscall.Fchmod(fd, 0700)
-	syncErr := g.file.Sync()
+	chownErr := g.ops.Fchown(fd, 0, 0)
+	chmodErr := g.ops.Fchmod(fd, 0700)
+	syncErr := g.ops.Sync(g.file)
 	return errors.Join(chownErr, chmodErr, syncErr)
 }
 
@@ -201,14 +224,28 @@ func wrapOptional(message string, err error) error {
 }
 
 func (g *platformDirectoryGuardLease) validateMetadata(uid, gid, mode uint32) error {
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(g.file.Fd()), &stat); err != nil {
+	actualUID, actualGID, actualMode, err := g.ops.Metadata(int(g.file.Fd()))
+	if err != nil {
 		return err
 	}
-	if stat.Uid != uid || stat.Gid != gid || uint32(stat.Mode)&07777 != mode {
-		return fmt.Errorf("unexpected metadata uid=%d gid=%d mode=%04o", stat.Uid, stat.Gid, uint32(stat.Mode)&07777)
+	if actualUID != uid || actualGID != gid || actualMode != mode {
+		return fmt.Errorf("unexpected metadata uid=%d gid=%d mode=%04o", actualUID, actualGID, actualMode)
 	}
 	return nil
+}
+
+func (g *platformDirectoryGuardLease) recoverPartialAcquire(acquireErr error) error {
+	fd := int(g.file.Fd())
+	restoreErr := errors.Join(g.ops.Fchmod(fd, 0700), g.ops.Sync(g.file), g.ops.Fchown(fd, int(g.uid), int(g.gid)), g.ops.Fchmod(fd, g.mode), g.ops.Sync(g.file))
+	if restoreErr == nil {
+		restoreErr = g.validateMetadata(g.uid, g.gid, g.mode)
+	}
+	if restoreErr == nil {
+		return acquireErr
+	}
+	seizeErr := g.seizeRoot()
+	verifyErr := g.validateMetadata(0, 0, 0700)
+	return errors.Join(ErrManualRepairRequired, acquireErr, fmt.Errorf("partial guard rollback: %w", restoreErr), wrapOptional("re-seize root control", seizeErr), wrapOptional("verify root control", verifyErr))
 }
 
 func validateRootAncestors(parent string) error {

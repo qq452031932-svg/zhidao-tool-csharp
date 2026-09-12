@@ -120,6 +120,19 @@ func TestDirectoryGuardAcquireFailurePreventsSQLiteOpen(t *testing.T) {
 	}
 }
 
+func TestManualRepairAcquireErrorSurvivesSnapshotWrapping(t *testing.T) {
+	events := []string{}
+	opened := false
+	o := testOptions(t, "source.db", "destination.db")
+	o.PathClassifier = func(string, string) (SourceKind, error) { return SourceLive, nil }
+	o.DirectoryGuard = fakeDirectoryGuard{events: &events, acquireErr: ErrManualRepairRequired}
+	o.DatabaseOpener = func(string) (*sql.DB, FileIdentity, error) { opened = true; return nil, FileIdentity{}, nil }
+	_, err := Snapshot(context.Background(), o)
+	if !errors.Is(err, ErrManualRepairRequired) || !strings.Contains(err.Error(), "keep superpan-license.service stopped; manually restore directory ownership") || opened {
+		t.Fatalf("manual repair semantics lost: err=%v opened=%v", err, opened)
+	}
+}
+
 func TestDirectoryGuardRestoreFailureOverridesSuccessfulSnapshot(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "state.db")
