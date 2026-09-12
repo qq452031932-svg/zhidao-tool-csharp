@@ -6,6 +6,8 @@ SERVICE_NAME="superpan-ota-admin.service"
 MOUNT_UNIT_NAME="var-lib-otaadmin-releases.mount"
 SERVICE_USER="superpan-ota-admin"
 SERVICE_GROUP="superpan-ota-admin"
+SHARED_LICENSE_GROUP="superpan-license-admin"
+LICENSE_ADMIN_SECRET="/etc/superpan-license/admin.secret"
 BINARY_TARGET="/opt/superpan-ota-admin/ota-admin"
 UNIT_TARGET="/etc/systemd/system/superpan-ota-admin.service"
 MOUNT_UNIT_TARGET="/etc/systemd/system/${MOUNT_UNIT_NAME}"
@@ -225,7 +227,9 @@ reload_nginx_and_verify() {
     attempt=0
     while [ "$attempt" -lt 10 ]; do
         attempt=$((attempt + 1))
-        after_pid="$(read_nginx_master_pid 2>/dev/null || true)"
+        if ! after_pid="$(read_nginx_master_pid 2>/dev/null)"; then
+            after_pid=""
+        fi
         if [ "$after_pid" = "$before_pid" ] &&
            curl --noproxy '*' --fail --silent --show-error --max-time 2 \
              --resolve ota.fanfh.cn:443:127.0.0.1 \
@@ -365,8 +369,9 @@ fi
 record_unit_enabled_state() {
     local unit="$1"
     local state
-    state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
-    [ -n "$state" ] || state="not-found"
+    if ! state="$(systemctl is-enabled "$unit" 2>/dev/null)"; then
+        [ -n "$state" ] || state="not-found"
+    fi
     printf '%s %s\n' "$unit" "$state" >>"${BACKUP_DIR}/unit-enabled-state.txt"
 }
 record_unit_enabled_state "$SERVICE_NAME"
@@ -385,13 +390,23 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
     SERVICE_WAS_ACTIVE=true
 fi
 
+if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    [ "$(id -gn "$SERVICE_USER")" = "$SERVICE_GROUP" ] || die "existing service user has the wrong primary group"
+    OTA_ACTUAL_GROUPS="$(id -Gn "$SERVICE_USER" | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd, -)"
+    OTA_EXPECTED_GROUPS="$(printf '%s\n%s\n' "$SERVICE_GROUP" "$SHARED_LICENSE_GROUP" | LC_ALL=C sort -u | paste -sd, -)"
+    [ "$OTA_ACTUAL_GROUPS" = "$OTA_EXPECTED_GROUPS" ] || die "existing OTA service user has ambient groups"
+fi
 if ! getent group superpan-ota-admin >/dev/null; then
     groupadd --system "$SERVICE_GROUP"
 fi
+if ! getent group "$SHARED_LICENSE_GROUP" >/dev/null; then
+    groupadd --system "$SHARED_LICENSE_GROUP"
+fi
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    useradd --system --gid "$SERVICE_GROUP" --home-dir "$DATA_ROOT" --shell /sbin/nologin "$SERVICE_USER"
+    useradd --system --gid "$SERVICE_GROUP" --groups "$SHARED_LICENSE_GROUP" --home-dir "$DATA_ROOT" --shell /sbin/nologin "$SERVICE_USER"
 fi
 [ "$(id -gn "$SERVICE_USER")" = "$SERVICE_GROUP" ] || die "existing service user has the wrong primary group"
+usermod --gid "$SERVICE_GROUP" --groups "$SHARED_LICENSE_GROUP" "$SERVICE_USER"
 
 install -d -m 0755 -o root -g root /opt/superpan-ota-admin
 install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"

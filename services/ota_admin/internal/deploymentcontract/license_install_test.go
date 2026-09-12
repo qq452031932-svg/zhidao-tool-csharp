@@ -677,3 +677,106 @@ func TestLicenseInstallersAreFailClosed(t *testing.T) {
 		t.Error("installer must pin loopback listener")
 	}
 }
+
+func TestLicenseInstallIdentity(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`LICENSE_GROUP="superpan-license"`, `OTA_GROUP="superpan-ota-admin"`,
+		`SHARED_GROUP="superpan-license-admin"`,
+		`assert_exact_identity_before_mutation`, `assert_exact_identity_after_creation`,
+		`useradd --system --gid "$LICENSE_GROUP" --groups "$SHARED_GROUP"`,
+		`useradd --system --gid "$OTA_GROUP" --groups "$SHARED_GROUP"`,
+	)
+	for _, forbidden := range []string{"chown -R", "chmod -R", "|| true"} {
+		if strings.Contains(install, forbidden) {
+			t.Errorf("installer contains fail-open or recursive mutation %q", forbidden)
+		}
+	}
+	requireBefore(t, install, "assert_exact_identity_before_mutation", "groupadd --system")
+}
+
+func TestLicenseInstallExactGroups(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	ota := read(t, "deploy", "ota-admin", "install.sh")
+	requireFragments(t, install,
+		`[ "$(id -gn "$user")" = "$primary" ]`,
+		`actual="$(id -Gn "$user" | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd, -)"`,
+		`expected="$(printf '%s\n%s\n' "$primary" "$SHARED_GROUP" | LC_ALL=C sort -u | paste -sd, -)"`,
+		`usermod --gid "$LICENSE_GROUP" --groups "$SHARED_GROUP" "$LICENSE_USER"`,
+		`usermod --gid "$OTA_GROUP" --groups "$SHARED_GROUP" "$OTA_USER"`,
+	)
+	if strings.Contains(install, "-aG") {
+		t.Fatal("installer must replace, not append, supplementary group membership")
+	}
+	if strings.Contains(ota, "|| true") {
+		t.Fatal("OTA installer must not suppress failures with || true")
+	}
+}
+
+func TestLicenseInstallSecretLifecycle(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`ENCRYPTION_KEY="$ETC/encryption.key"`, `LOOKUP_KEY="$ETC/lookup.key"`,
+		`ADMIN_SECRET="$ETC/admin.secret"`, `SIGNING_KEY="$ETC/response-signing.key"`,
+		`SIGNING_KEY_ID="$ETC/response-signing.key-id"`,
+		`SIGNING_SPKI_DER="$ETC/response-signing.spki.der"`,
+		`SIGNING_SPKI_BASE64="$ETC/response-signing.spki.base64"`,
+		`SIGNING_SPKI_SHA256="$ETC/response-signing.spki.sha256"`,
+		`validate_persistent_state_before_mutation`, `create_persistent_state`,
+		`head -c 32 /dev/urandom`, `cmp -s "$ENCRYPTION_KEY" "$LOOKUP_KEY"`,
+		`openssl ecparam -name prime256v1 -genkey -noout`,
+		`openssl ec -in "$SIGNING_KEY" -pubout -outform DER`,
+		`sha256sum -- "$SIGNING_SPKI_DER"`,
+		`PERSISTENT_STATE_MODE="existing"`, `PERSISTENT_STATE_MODE="absent"`,
+		`validate_file "$SIGNING_KEY" root "$LICENSE_GROUP" 640 227 ec-private`,
+		`validate_file "$SIGNING_KEY_ID" root root 644 49 key-id`,
+		`validate_file "$SIGNING_SPKI_DER" root root 644 91 der`,
+		`validate_file "$SIGNING_SPKI_BASE64" root root 644 125 base64`,
+	)
+	for _, forbidden := range []string{"cp -a -- \"$ENCRYPTION_KEY\"", "cp -a -- \"$SIGNING_KEY\""} {
+		if strings.Contains(install, forbidden) {
+			t.Errorf("persistent state contract contains forbidden fragment %q", forbidden)
+		}
+	}
+}
+
+func TestLicenseInstallACL(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`install -d -m 0710 -o root -g "$SHARED_GROUP" "$ETC"`,
+		`install -d -m 0700 -o "$LICENSE_USER" -g "$LICENSE_GROUP" "$DATA"`,
+		`install -d -m 0700 -o root -g root "$BACKUP_DIR"`,
+		`validate_file "$ENCRYPTION_KEY" root "$LICENSE_GROUP" 640 32 raw32`,
+		`validate_file "$LOOKUP_KEY" root "$LICENSE_GROUP" 640 32 raw32`,
+		`validate_file "$ADMIN_SECRET" root "$SHARED_GROUP" 640 32 raw32`,
+		`validate_database_acl`,
+		`validate_existing_acl_before_mutation`,
+	)
+	requireBefore(t, install, `validate_existing_acl_before_mutation`, `groupadd --system superpan-license`)
+}
+
+func TestLicenseInstallConfig(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	ota := read(t, "deploy", "ota-admin", "install.sh")
+	rollback := read(t, "deploy", "license-service", "rollback.sh")
+	requireFragments(t, install,
+		`render_license_config`, `"signing_key_id"`, `atomic_install_file`,
+		`validate_rendered_license_config`, `127.0.0.1:18092`,
+		`validate_ota_shared_secret_config`,
+		`"license_admin_secret_path"[[:space:]]*:[[:space:]]*"/etc/superpan-license/admin.secret"`,
+		`record_persistent_identity`, `database-snapshot-identity.txt`,
+	)
+	requireFragments(t, ota,
+		`SHARED_LICENSE_GROUP="superpan-license-admin"`,
+		`LICENSE_ADMIN_SECRET="/etc/superpan-license/admin.secret"`,
+	)
+	requireFragments(t, rollback,
+		"Persistent database and key material are deliberately preserved",
+		`/var/lib/superpan-license`, `/etc/superpan-license/encryption.key`,
+	)
+	for _, secret := range []string{"encryption.key", "lookup.key", "admin.secret", "response-signing.key"} {
+		if strings.Contains(rollback, `install -m 0640 "$BACKUP_ROOT/`+secret) {
+			t.Errorf("rollback must not restore persistent secret %s", secret)
+		}
+	}
+}
