@@ -15,6 +15,8 @@ OTA_CONFIG_SOURCE=""
 OTA_CONFIG_SHA256=""
 OTA_UNIT_SOURCE=""
 OTA_UNIT_SHA256=""
+PREFLIGHT_ONLY=false
+declare -A SEEN_ARGS=()
 SOURCE_COMMIT_TARGET="/opt/superpan-license/source-commit.txt"
 OTA_INSTALLER="$(cd "$(dirname "${BASH_SOURCE[0]}")/../ota-admin" && pwd)/install.sh"
 
@@ -26,7 +28,7 @@ Usage: install.sh --bundle ABSOLUTE_PATH --source-commit 40_LOWERCASE_HEX \
   --license-config ABSOLUTE_PATH --license-config-sha256 HEX \
   --license-unit ABSOLUTE_PATH --license-unit-sha256 HEX \
   --ota-config ABSOLUTE_PATH --ota-config-sha256 HEX \
-  --ota-unit ABSOLUTE_PATH --ota-unit-sha256 HEX
+  --ota-unit ABSOLUTE_PATH --ota-unit-sha256 HEX [--preflight-only]
 USAGE
 }
 
@@ -39,35 +41,58 @@ require_value() {
     [ "$#" -eq 2 ] && [ -n "$2" ] || die "missing value for $1"
 }
 
+mark_seen() {
+    local option="$1"
+    if [ "${SEEN_ARGS[$option]+present}" = "present" ]; then
+        usage
+        die "option must be provided exactly once: $option"
+    fi
+    SEEN_ARGS["$option"]=1
+}
+
+require_seen() {
+    local option="$1"
+    if [ "${SEEN_ARGS[$option]+present}" != "present" ]; then
+        usage
+        die "missing required option: $option"
+    fi
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --bundle) require_value "$1" "${2:-}"; BUNDLE="$2"; shift 2 ;;
-        --source-commit) require_value "$1" "${2:-}"; SOURCE_COMMIT="$2"; shift 2 ;;
-        --ota-binary-sha256) require_value "$1" "${2:-}"; OTA_BINARY_SHA256="$2"; shift 2 ;;
-        --license-binary-sha256) require_value "$1" "${2:-}"; LICENSE_BINARY_SHA256="$2"; shift 2 ;;
-        --source-manifest-sha256) require_value "$1" "${2:-}"; SOURCE_MANIFEST_SHA256="$2"; shift 2 ;;
-        --license-config) require_value "$1" "${2:-}"; LICENSE_CONFIG_SOURCE="$2"; shift 2 ;;
-        --license-config-sha256) require_value "$1" "${2:-}"; LICENSE_CONFIG_SHA256="$2"; shift 2 ;;
-        --license-unit) require_value "$1" "${2:-}"; LICENSE_UNIT_SOURCE="$2"; shift 2 ;;
-        --license-unit-sha256) require_value "$1" "${2:-}"; LICENSE_UNIT_SHA256="$2"; shift 2 ;;
-        --ota-config) require_value "$1" "${2:-}"; OTA_CONFIG_SOURCE="$2"; shift 2 ;;
-        --ota-config-sha256) require_value "$1" "${2:-}"; OTA_CONFIG_SHA256="$2"; shift 2 ;;
-        --ota-unit) require_value "$1" "${2:-}"; OTA_UNIT_SOURCE="$2"; shift 2 ;;
-        --ota-unit-sha256) require_value "$1" "${2:-}"; OTA_UNIT_SHA256="$2"; shift 2 ;;
+        --bundle) mark_seen "$1"; require_value "$1" "${2:-}"; BUNDLE="$2"; shift 2 ;;
+        --source-commit) mark_seen "$1"; require_value "$1" "${2:-}"; SOURCE_COMMIT="$2"; shift 2 ;;
+        --ota-binary-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; OTA_BINARY_SHA256="$2"; shift 2 ;;
+        --license-binary-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; LICENSE_BINARY_SHA256="$2"; shift 2 ;;
+        --source-manifest-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; SOURCE_MANIFEST_SHA256="$2"; shift 2 ;;
+        --license-config) mark_seen "$1"; require_value "$1" "${2:-}"; LICENSE_CONFIG_SOURCE="$2"; shift 2 ;;
+        --license-config-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; LICENSE_CONFIG_SHA256="$2"; shift 2 ;;
+        --license-unit) mark_seen "$1"; require_value "$1" "${2:-}"; LICENSE_UNIT_SOURCE="$2"; shift 2 ;;
+        --license-unit-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; LICENSE_UNIT_SHA256="$2"; shift 2 ;;
+        --ota-config) mark_seen "$1"; require_value "$1" "${2:-}"; OTA_CONFIG_SOURCE="$2"; shift 2 ;;
+        --ota-config-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; OTA_CONFIG_SHA256="$2"; shift 2 ;;
+        --ota-unit) mark_seen "$1"; require_value "$1" "${2:-}"; OTA_UNIT_SOURCE="$2"; shift 2 ;;
+        --ota-unit-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; OTA_UNIT_SHA256="$2"; shift 2 ;;
+        --preflight-only) mark_seen "$1"; PREFLIGHT_ONLY=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage; die "unknown argument: $1" ;;
     esac
 done
 
+for required in --bundle --source-commit --ota-binary-sha256 --license-binary-sha256 \
+    --source-manifest-sha256 --license-config --license-config-sha256 \
+    --license-unit --license-unit-sha256 --ota-config --ota-config-sha256 \
+    --ota-unit --ota-unit-sha256; do
+    require_seen "$required"
+done
 [ "$(id -u)" -eq 0 ] || die "install.sh must run as root"
-[ -n "$BUNDLE" ] || { usage; die "--bundle is required"; }
 case "$BUNDLE" in /*) ;; *) die "bundle path must be absolute and canonical" ;; esac
 BUNDLE_CANONICAL="$(readlink -f -- "$BUNDLE")" || die "bundle path cannot be canonicalized"
 [ "$BUNDLE_CANONICAL" = "$BUNDLE" ] || die "bundle path must be absolute and canonical"
 [ -d "$BUNDLE" ] && [ ! -L "$BUNDLE" ] || die "bundle must be a real directory"
 [ "$(stat -c '%U:%G' "$BUNDLE")" = "root:root" ] || die "bundle owner must be root:root"
 BUNDLE_MODE="$(stat -c '%a' "$BUNDLE")"
-(( (8#$BUNDLE_MODE & 8#022) == 0 )) || die "bundle must not be group/world writable"
+[ "$BUNDLE_MODE" = "700" ] || die "bundle directory mode must be exactly 0700"
 
 for hash in "$OTA_BINARY_SHA256" "$LICENSE_BINARY_SHA256" "$SOURCE_MANIFEST_SHA256" \
     "$LICENSE_CONFIG_SHA256" "$LICENSE_UNIT_SHA256" "$OTA_CONFIG_SHA256" "$OTA_UNIT_SHA256"; do
@@ -82,9 +107,6 @@ ACTUAL_BUNDLE_NAMES="$(find "$BUNDLE" -mindepth 1 -maxdepth 1 -printf '%f\n' | L
 [ -z "$(find "$BUNDLE" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ] || die "bundle entries must be regular files"
 [ -z "$(find "$BUNDLE" -mindepth 1 -maxdepth 1 -type f -links +1 -print -quit)" ] || die "bundle contains a hard-linked file"
 [ -z "$(find "$BUNDLE" -mindepth 1 -maxdepth 1 -type f -perm /022 -print -quit)" ] || die "bundle files must not be group/world writable"
-if [ "$(find "$BUNDLE" -mindepth 1 -maxdepth 1 -type f ! -user root -print -quit)" ]; then
-    die "bundle files must be owned by root"
-fi
 
 verify_sha256() {
     local source="$1" expected="$2" actual
@@ -128,12 +150,18 @@ printf '%s\n' "$SOURCE_COMMIT" | cmp -s - "$BUNDLE/source-commit.txt" || die "so
 
 [ -f "$OTA_INSTALLER" ] && [ ! -L "$OTA_INSTALLER" ] || die "OTA installer is missing or unsafe"
 bash "$OTA_INSTALLER" --loopback-license-transaction \
+    --preflight-only \
     --binary "$BUNDLE/ota-admin" --binary-sha256 "$OTA_BINARY_SHA256" \
     --config "$OTA_CONFIG_SOURCE" --config-sha256 "$OTA_CONFIG_SHA256" \
     --unit "$OTA_UNIT_SOURCE" --unit-sha256 "$OTA_UNIT_SHA256" \
     --source-commit "$SOURCE_COMMIT"
 
-# MUTATION BOUNDARY: every bundle and trusted-template byte is authenticated.
+# LICENSE_INSTALL_PREFLIGHT_COMPLETE: every input byte and source record is authenticated.
+if [ "$PREFLIGHT_ONLY" = true ]; then
+    echo "license installation preflight complete for source commit $SOURCE_COMMIT"
+    exit 0
+fi
+
 DEST=/opt/superpan-license
 ETC=/etc/superpan-license
 DATA=/var/lib/superpan-license

@@ -39,6 +39,8 @@ LOOPBACK_CONFIG_SHA256=""
 LOOPBACK_UNIT_SOURCE=""
 LOOPBACK_UNIT_SHA256=""
 SOURCE_COMMIT=""
+PREFLIGHT_ONLY=false
+declare -A SEEN_ARGS=()
 
 usage() {
     cat >&2 <<'USAGE'
@@ -49,7 +51,7 @@ Usage: install.sh --binary PATH --binary-sha256 HEX \
 Loopback license transaction preflight (does not mutate in this release):
   install.sh --loopback-license-transaction --binary PATH --binary-sha256 HEX \
     --config PATH --config-sha256 HEX --unit PATH --unit-sha256 HEX \
-    --source-commit 40_LOWERCASE_HEX
+    --source-commit 40_LOWERCASE_HEX --preflight-only
 
 The existing OTA HTTPS server block must already contain exactly this line:
   include /etc/superpan-ota-admin/ota.fanfh.cn.admin.nginx.conf;
@@ -63,6 +65,23 @@ die() {
 
 require_value() {
     [ "$#" -eq 2 ] && [ -n "$2" ] || die "missing value for $1"
+}
+
+mark_seen() {
+    local option="$1"
+    if [ "${SEEN_ARGS[$option]+present}" = "present" ]; then
+        usage
+        die "option must be provided exactly once: $option"
+    fi
+    SEEN_ARGS["$option"]=1
+}
+
+require_seen() {
+    local option="$1"
+    if [ "${SEEN_ARGS[$option]+present}" != "present" ]; then
+        usage
+        die "missing required option: $option"
+    fi
 }
 
 verify_sha256() {
@@ -100,33 +119,42 @@ preflight_loopback_license_transaction() {
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --binary) require_value "$1" "${2:-}"; BINARY_SOURCE="$2"; shift 2 ;;
-        --binary-sha256) require_value "$1" "${2:-}"; BINARY_SHA256="$2"; shift 2 ;;
-        --certificate) require_value "$1" "${2:-}"; CERTIFICATE_SOURCE="$2"; shift 2 ;;
-        --certificate-sha256) require_value "$1" "${2:-}"; CERTIFICATE_SHA256="$2"; shift 2 ;;
-        --publisher-spki-sha256) require_value "$1" "${2:-}"; EXPECTED_SPKI_SHA256="$2"; shift 2 ;;
-        --active-vhost-sha256) require_value "$1" "${2:-}"; ACTIVE_VHOST_SHA256="$2"; shift 2 ;;
-        --loopback-license-transaction) LOOPBACK_LICENSE_TRANSACTION=true; shift ;;
-        --config) require_value "$1" "${2:-}"; LOOPBACK_CONFIG_SOURCE="$2"; shift 2 ;;
-        --config-sha256) require_value "$1" "${2:-}"; LOOPBACK_CONFIG_SHA256="$2"; shift 2 ;;
-        --unit) require_value "$1" "${2:-}"; LOOPBACK_UNIT_SOURCE="$2"; shift 2 ;;
-        --unit-sha256) require_value "$1" "${2:-}"; LOOPBACK_UNIT_SHA256="$2"; shift 2 ;;
-        --source-commit) require_value "$1" "${2:-}"; SOURCE_COMMIT="$2"; shift 2 ;;
+        --binary) mark_seen "$1"; require_value "$1" "${2:-}"; BINARY_SOURCE="$2"; shift 2 ;;
+        --binary-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; BINARY_SHA256="$2"; shift 2 ;;
+        --certificate) mark_seen "$1"; require_value "$1" "${2:-}"; CERTIFICATE_SOURCE="$2"; shift 2 ;;
+        --certificate-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; CERTIFICATE_SHA256="$2"; shift 2 ;;
+        --publisher-spki-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; EXPECTED_SPKI_SHA256="$2"; shift 2 ;;
+        --active-vhost-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; ACTIVE_VHOST_SHA256="$2"; shift 2 ;;
+        --loopback-license-transaction) mark_seen "$1"; LOOPBACK_LICENSE_TRANSACTION=true; shift ;;
+        --preflight-only) mark_seen "$1"; PREFLIGHT_ONLY=true; shift ;;
+        --config) mark_seen "$1"; require_value "$1" "${2:-}"; LOOPBACK_CONFIG_SOURCE="$2"; shift 2 ;;
+        --config-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; LOOPBACK_CONFIG_SHA256="$2"; shift 2 ;;
+        --unit) mark_seen "$1"; require_value "$1" "${2:-}"; LOOPBACK_UNIT_SOURCE="$2"; shift 2 ;;
+        --unit-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; LOOPBACK_UNIT_SHA256="$2"; shift 2 ;;
+        --source-commit) mark_seen "$1"; require_value "$1" "${2:-}"; SOURCE_COMMIT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; die "unknown argument: $1" ;;
     esac
 done
 
-[ "$(id -u)" -eq 0 ] || die "run this installer as root"
 if [ "$LOOPBACK_LICENSE_TRANSACTION" = true ]; then
+    for required in --loopback-license-transaction --preflight-only --binary --binary-sha256 \
+        --config --config-sha256 --unit --unit-sha256 --source-commit; do
+        require_seen "$required"
+    done
+    [ "$(id -u)" -eq 0 ] || die "run this installer as root"
     preflight_loopback_license_transaction
     echo "loopback license transaction preflight complete for source commit $SOURCE_COMMIT"
     exit 0
 fi
+[ "$PREFLIGHT_ONLY" = false ] || die "--preflight-only requires --loopback-license-transaction"
 [ -z "$LOOPBACK_CONFIG_SOURCE$LOOPBACK_CONFIG_SHA256$LOOPBACK_UNIT_SOURCE$LOOPBACK_UNIT_SHA256$SOURCE_COMMIT" ] ||
     die "loopback transaction arguments require --loopback-license-transaction"
-[ -n "$BINARY_SOURCE" ] || { usage; die "--binary is required"; }
-[ -n "$CERTIFICATE_SOURCE" ] || { usage; die "--certificate is required"; }
+for required in --binary --binary-sha256 --certificate --certificate-sha256 \
+    --publisher-spki-sha256 --active-vhost-sha256; do
+    require_seen "$required"
+done
+[ "$(id -u)" -eq 0 ] || die "run this installer as root"
 [[ "$BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "binary SHA-256 must be 64 lowercase hexadecimal characters"
 [[ "$CERTIFICATE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "certificate SHA-256 must be 64 lowercase hexadecimal characters"
 [[ "$EXPECTED_SPKI_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "publisher SPKI SHA-256 must be 64 lowercase hexadecimal characters"
