@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -174,7 +175,7 @@ func (c Config) Validate() error {
 	}
 	normalized := make([]string, 0, len(paths))
 	for _, path := range paths {
-		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		if !isCanonicalAbsolutePath(path) {
 			return errors.New("state and key paths must be canonical absolute paths")
 		}
 		identity := path
@@ -225,6 +226,10 @@ func (c Config) Validate() error {
 		return errors.New("idle timeout is outside the safe range")
 	}
 	return nil
+}
+
+func isCanonicalAbsolutePath(value string) bool {
+	return value != "" && ((filepath.IsAbs(value) && filepath.Clean(value) == value) || (path.IsAbs(value) && path.Clean(value) == value))
 }
 
 func pathsOverlap(first, second string) bool {

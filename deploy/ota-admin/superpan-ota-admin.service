@@ -10,6 +10,7 @@ User=superpan-ota-admin
 Group=superpan-ota-admin
 SupplementaryGroups=superpan-license-admin
 UMask=0077
+ExecStartPre=/bin/sh -ec 'actual=$$(id -Gn | tr " " "\n" | LC_ALL=C sort | tr "\n" " "); test "$$actual" = "superpan-license-admin superpan-ota-admin "'
 WorkingDirectory=/var/lib/superpan-ota-admin
 ExecStart=/opt/superpan-ota-admin/ota-admin serve --config /etc/superpan-ota-admin/config.json
 Restart=on-failure

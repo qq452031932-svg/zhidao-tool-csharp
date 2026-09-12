@@ -32,6 +32,7 @@ User=superpan-license
 Group=superpan-license
 SupplementaryGroups=superpan-license-admin
 UMask=0077
+ExecStartPre=/bin/sh -ec 'actual=$$(id -Gn | tr " " "\n" | LC_ALL=C sort | tr "\n" " "); test "$$actual" = "superpan-license superpan-license-admin "'
 WorkingDirectory=/var/lib/superpan-license
 # The service configuration binds the listener to this loopback endpoint.
 # 127.0.0.1:18092
