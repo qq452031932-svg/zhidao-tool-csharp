@@ -56,8 +56,10 @@ function Read-VerifiedClientRoot([string]$Root) {
 function Assert-NoReparseContainedPath([string]$Root,[string]$Path) {
     $root=[IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar);$path=[IO.Path]::GetFullPath($Path)
     if(-not $path.StartsWith($root+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw'Client artifact escapes its signed root.'}
-    $cursor=[IO.FileInfo]::new($path)
-    while($null-ne $cursor-and $cursor.FullName.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){if($cursor.Exists-and($cursor.Attributes-band[IO.FileAttributes]::ReparsePoint)){throw'Client artifact path contains a reparse point.'};$cursor=$cursor.Directory}
+    $file=[IO.FileInfo]::new($path)
+    if($file.Exists-and($file.Attributes-band[IO.FileAttributes]::ReparsePoint)){throw'Client artifact path contains a reparse point.'}
+    $cursor=$file.Directory
+    while($null-ne $cursor-and $cursor.FullName.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){if($cursor.Exists-and($cursor.Attributes-band[IO.FileAttributes]::ReparsePoint)){throw'Client artifact path contains a reparse point.'};$cursor=$cursor.Parent}
 }
 
 function Get-ObservedTlsSpki([Uri]$Uri) {

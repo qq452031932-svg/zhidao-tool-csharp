@@ -58,6 +58,7 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("BaiduBatchTransfer.App.exe", script, StringComparison.Ordinal);
         Assert.Contains("signtool.exe", script, StringComparison.Ordinal);
         Assert.Contains("Assert-NoReparseContainedPath", script, StringComparison.Ordinal);
+        Assert.Contains("$cursor=$cursor.Parent", script, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>
