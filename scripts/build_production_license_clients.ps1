@@ -13,6 +13,16 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+function Assert-NoReparsePointAncestors([string]$Path) {
+    $cursor = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path)))
+    while ($null -ne $cursor) {
+        if ($cursor.Exists -and ($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Production output ancestors cannot be reparse points.' }
+        $cursor = $cursor.Parent
+    }
+}
+function Assert-LocalDrivePath([string]$Path) {
+    if ($Path.StartsWith('\\', [StringComparison]::Ordinal) -or [IO.Path]::GetPathRoot($Path) -notmatch '^[A-Za-z]:\\$') { throw 'Production output must use a local drive path.' }
+}
 $origin = 'https://ota.fanfh.cn'
 $superPanProduct = '8270e8d7-1791-487d-ad76-0da7a0cbed12'
 $smokeProduct = '6ebd0ccf-f462-47db-958e-cfd426451c88'
@@ -44,7 +54,9 @@ if ($timestamp.Scheme -cne 'https' -or $timestamp.UserInfo -or $timestamp.Query 
 
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repo '.artifacts'))
-if (-not $output.StartsWith($artifactRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+Assert-LocalDrivePath $output
+Assert-NoReparsePointAncestors $output
+if (-not [IO.Path]::GetDirectoryName($output).Equals($artifactRoot, [StringComparison]::OrdinalIgnoreCase) -or
     -not [IO.Path]::GetFileName($output).StartsWith('license-production-clients-', [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputDirectory must be a dedicated .artifacts/license-production-clients-* directory, never an OTA stable feed.' }
 if (Test-Path -LiteralPath $output) { throw 'OutputDirectory must not already exist.' }
 $stage = "$output.partial-$([Guid]::NewGuid().ToString('N'))"

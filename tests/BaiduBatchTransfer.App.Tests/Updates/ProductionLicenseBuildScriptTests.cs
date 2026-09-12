@@ -23,6 +23,8 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.DoesNotContain("$SigningKeyFile", script, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("license-production-clients-", script, StringComparison.Ordinal);
         Assert.Contains("never an OTA stable feed", script, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("GetDirectoryName($output)", script, StringComparison.Ordinal);
+        Assert.Contains("Assert-NoReparsePointAncestors", script, StringComparison.Ordinal);
     }
 
     [Fact]
