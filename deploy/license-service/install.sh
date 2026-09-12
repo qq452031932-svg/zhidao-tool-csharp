@@ -24,6 +24,17 @@ LICENSE_GROUP="superpan-license"
 OTA_USER="superpan-ota-admin"
 OTA_GROUP="superpan-ota-admin"
 SHARED_GROUP="superpan-license-admin"
+ROLLBACK_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rollback.sh"
+LOCK_FILE="/run/lock/superpan-license-install.lock"
+LICENSE_DB_SNAPSHOT="/opt/superpan-license-maintenance/license-db-snapshot"
+LICENSE_DB_SNAPSHOT_SHA256="${LICENSE_DB_SNAPSHOT}.sha256"
+LICENSE_DB_SNAPSHOT_COMMIT="/opt/superpan-license-maintenance/source-commit.txt"
+TRANSACTION_ARMED=false
+TRANSACTION_MUTATED=false
+TRANSACTION_SUCCEEDED=false
+TRANSACTION_BACKUP=""
+SCHEMA_TEST_PIDS=()
+FAILPOINT_REQUIRES_STOPPED_RECOVERY=false
 
 usage() {
     cat >&2 <<'USAGE'
@@ -199,6 +210,10 @@ validate_trusted_path "$OTA_INSTALLER"
 [ "$(stat -c '%h' "$OTA_INSTALLER")" = "1" ] || die "OTA installer must have exactly one link"
 OTA_INSTALLER_MODE="$(stat -c '%a' "$OTA_INSTALLER")"
 (( (8#$OTA_INSTALLER_MODE & 8#022) == 0 )) || die "OTA installer must not be group/world writable"
+validate_trusted_path "$ROLLBACK_SCRIPT"
+[ -f "$ROLLBACK_SCRIPT" ] && [ ! -L "$ROLLBACK_SCRIPT" ] && [ "$(stat -c '%h:%U:%G' "$ROLLBACK_SCRIPT")" = 1:root:root ] || die "rollback script is missing or unsafe"
+ROLLBACK_MODE="$(stat -c '%a' "$ROLLBACK_SCRIPT")"
+(( (8#$ROLLBACK_MODE & 8#022) == 0 )) || die "rollback script must not be group/world writable"
 bash "$OTA_INSTALLER" --loopback-license-transaction \
     --preflight-only \
     --binary "$BUNDLE/ota-admin" --binary-sha256 "$OTA_BINARY_SHA256" \
@@ -212,15 +227,10 @@ if [ "$PREFLIGHT_ONLY" = true ]; then
     exit 0
 fi
 
-# Batch 3 deliberately exposes no mutating normal entrypoint.  Batch 4 must
-# perform the authenticated same-commit OTA replacement before this installer
-# can truthfully report end-to-end success.
-die "complete installation disabled: batch4 OTA transaction is not implemented"
-
 DEST=/opt/superpan-license
 ETC=/etc/superpan-license
 DATA=/var/lib/superpan-license
-BACKUP_DIR=/var/backups/superpan-license
+BACKUP_ROOT=/var/backups/superpan-license
 ENCRYPTION_KEY="$ETC/encryption.key"
 LOOKUP_KEY="$ETC/lookup.key"
 ADMIN_SECRET="$ETC/admin.secret"
@@ -323,9 +333,9 @@ validate_existing_acl_before_mutation() {
         validate_trusted_path /var/lib
         validate_directory "$DATA" "$LICENSE_USER" "$LICENSE_GROUP" 700
     fi
-    if [ -e "$BACKUP_DIR" ] || [ -L "$BACKUP_DIR" ]; then
-        validate_directory "$BACKUP_DIR" root root 700
-        validate_trusted_path "$BACKUP_DIR"
+    if [ -e "$BACKUP_ROOT" ] || [ -L "$BACKUP_ROOT" ]; then
+        validate_directory "$BACKUP_ROOT" root root 700
+        validate_trusted_path "$BACKUP_ROOT"
     fi
     validate_database_acl
 }
@@ -370,6 +380,127 @@ validate_existing_acl_before_mutation
 validate_existing_config_before_mutation
 validate_persistent_state_before_mutation
 
+UPGRADE_MODE=false
+if [ -e "$DEST/superpan-license" ] || [ -e "$DATA/state.db" ]; then
+    [ -f "$DEST/superpan-license" ] && [ ! -L "$DEST/superpan-license" ] && [ -f "$DATA/state.db" ] && [ ! -L "$DATA/state.db" ] ||
+        die "upgrade requires paired old license binary and schema; initial install requires both absent"
+    for source in "$LICENSE_DB_SNAPSHOT" "$LICENSE_DB_SNAPSHOT_SHA256" "$LICENSE_DB_SNAPSHOT_COMMIT"; do
+        validate_trusted_path "$source"
+        [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c '%h:%U:%G' "$source")" = 1:root:root ] || die "unsafe license-db-snapshot input"
+    done
+    SNAPSHOT_EXPECTED="$(awk 'NF==2 && $1 ~ /^[0-9a-f]{64}$/ && $2 == "license-db-snapshot" {print $1}' "$LICENSE_DB_SNAPSHOT_SHA256")"
+    [ -n "$SNAPSHOT_EXPECTED" ] || die "license-db-snapshot sidecar is malformed"
+    verify_sha256 "$LICENSE_DB_SNAPSHOT" "$SNAPSHOT_EXPECTED"
+    printf '%s\n' "$SOURCE_COMMIT" | cmp -s - "$LICENSE_DB_SNAPSHOT_COMMIT" || die "license-db-snapshot is not from the authenticated source commit"
+    UPGRADE_MODE=true
+fi
+
+case "${LICENSE_INSTALL_FAILPOINT:-}" in
+    ""|identity|secret-encryption|secret-lookup|secret-admin|secret-signing|secret-publish|backup|license-binary|license-config|license-unit|license-start|license-health|ota-binary|ota-config|ota-unit|ota-restart|ota-health) ;;
+    *) die "unknown LICENSE_INSTALL_FAILPOINT" ;;
+esac
+failpoint() {
+    local point="$1"
+    if [ "${LICENSE_INSTALL_FAILPOINT:-}" = "$point" ]; then
+        [ "$point" != identity ] || FAILPOINT_REQUIRES_STOPPED_RECOVERY=true
+        die "injected failure at $point"
+    fi
+}
+
+transaction_signal() { exit "$1"; }
+transaction_exit() {
+    local status=$? pid
+    trap - EXIT INT TERM HUP
+    set +e
+    for pid in "${SCHEMA_TEST_PIDS[@]}"; do kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; done
+    if declare -F cleanup_persistent_transaction >/dev/null; then cleanup_persistent_transaction; fi
+    if [ "$TRANSACTION_ARMED" = true ] && [ "$TRANSACTION_MUTATED" = true ] && [ "$TRANSACTION_SUCCEEDED" != true ]; then
+        if [ -f "$TRANSACTION_BACKUP/manifest.sha256" ]; then
+            if ! bash "$ROLLBACK_SCRIPT" "$TRANSACTION_BACKUP"; then
+                systemctl stop superpan-ota-admin.service superpan-license.service 2>/dev/null
+                echo "ERROR: automatic rollback failed; backup retained; services remain stopped for manual repair: $TRANSACTION_BACKUP" >&2
+            fi
+        else
+            systemctl stop superpan-ota-admin.service superpan-license.service 2>/dev/null
+            echo "ERROR: transaction failed before recoverable manifest; services remain stopped for manual repair" >&2
+        fi
+        if [ "$FAILPOINT_REQUIRES_STOPPED_RECOVERY" = true ]; then
+            systemctl stop superpan-ota-admin.service superpan-license.service 2>/dev/null
+            echo "ERROR: identity failure restored file state; services remain stopped for recoverable identity review" >&2
+        fi
+    fi
+    exit "$status"
+}
+
+TRANSACTION_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
+TRANSACTION_BACKUP="$BACKUP_ROOT/$TRANSACTION_ID"
+trap transaction_exit EXIT
+trap 'transaction_signal 130' INT
+trap 'transaction_signal 143' TERM
+trap 'transaction_signal 129' HUP
+TRANSACTION_ARMED=true
+if [ -e "$LOCK_FILE" ] || [ -L "$LOCK_FILE" ]; then
+    [ -f "$LOCK_FILE" ] && [ ! -L "$LOCK_FILE" ] && [ "$(stat -c '%h:%U:%G:%a' "$LOCK_FILE")" = 1:root:root:600 ] || die "fixed transaction lock is unsafe"
+    exec 9>>"$LOCK_FILE"
+else
+    set -o noclobber
+    exec 9>"$LOCK_FILE" || die "cannot create fixed transaction lock"
+    set +o noclobber
+    chmod 0600 "$LOCK_FILE"; chown root:root "$LOCK_FILE"
+fi
+flock -n 9 || die "another license installation transaction is active"
+
+TRANSACTION_MUTATED=true
+install -d -m 0700 -o root -g root "$BACKUP_ROOT"
+mkdir -m 0700 "$TRANSACTION_BACKUP"
+chown root:root "$TRANSACTION_BACKUP"
+[ "$(stat -c '%U:%G:%a' "$TRANSACTION_BACKUP")" = root:root:700 ] || die "transaction backup metadata is unsafe"
+BACKUP_DIR="$TRANSACTION_BACKUP"
+
+record_unit_state() {
+    local unit="$1" enabled active
+    enabled="$(systemctl is-enabled "$unit" 2>/dev/null || :)"; [ -n "$enabled" ] || enabled=not-found
+    active=inactive; systemctl is-active --quiet "$unit" && active=active
+    printf '%s\t%s\t%s\n' "$unit" "$enabled" "$active" >>"$BACKUP_DIR/unit-state.tsv"
+}
+backup_target() {
+    local target="$1" name="$2"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c '%h' "$target")" = 1 ] || die "unsafe rollback target: $target"
+        cp -a -- "$target" "$BACKUP_DIR/$name"
+        printf '%s\t%s\tpresent\t%s\t%s\t%s\t%s\n' "$target" "$name" "$(stat -c '%u' "$target")" "$(stat -c '%g' "$target")" "$(stat -c '%a' "$target")" "$(sha256sum -- "$target" | awk '{print $1}')" >>"$BACKUP_DIR/inventory.tsv"
+    else
+        printf '%s\t%s\tabsent\t-\t-\t-\t-\n' "$target" "$name" >>"$BACKUP_DIR/inventory.tsv"
+    fi
+}
+backup_target "$DEST/superpan-license" license-binary
+backup_target "$ETC/config.json" license-config
+backup_target /etc/systemd/system/superpan-license.service license-unit
+backup_target /opt/superpan-ota-admin/ota-admin ota-binary
+backup_target /etc/superpan-ota-admin/config.json ota-config
+backup_target /etc/systemd/system/superpan-ota-admin.service ota-unit
+backup_target "$SOURCE_COMMIT_TARGET" license-source-commit
+record_unit_state superpan-license.service
+record_unit_state superpan-ota-admin.service
+printf '%s\n' "$SOURCE_COMMIT" >"$BACKUP_DIR/source-commit.txt"
+if [ "$PERSISTENT_STATE_MODE" = existing ]; then
+    {
+        printf 'state existing\n'
+        printf 'key-id %s\n' "$(cat "$SIGNING_KEY_ID")"
+        printf 'spki-sha256 %s\n' "$(cat "$SIGNING_SPKI_SHA256")"
+        printf 'database-sha256 %s\n' "$(sha256sum -- "$DATA/state.db" | awk '{print $1}')"
+    } >"$BACKUP_DIR/persistent-identity.txt"
+else
+    printf 'state absent\n' >"$BACKUP_DIR/persistent-identity.txt"
+fi
+chmod 0600 "$BACKUP_DIR"/*.tsv "$BACKUP_DIR/source-commit.txt" "$BACKUP_DIR/persistent-identity.txt"
+refresh_manifest() {
+    (cd "$BACKUP_DIR"; find . -maxdepth 1 -type f ! -name manifest.sha256 -printf '%f\n' | LC_ALL=C sort | while IFS= read -r name; do sha256sum -- "$name"; done) >"$BACKUP_DIR/manifest.sha256"
+    chmod 0600 "$BACKUP_DIR/manifest.sha256"
+}
+refresh_manifest
+failpoint backup
+
 if ! getent group "$LICENSE_GROUP" >/dev/null; then groupadd --system superpan-license; fi
 if ! getent group "$OTA_GROUP" >/dev/null; then groupadd --system superpan-ota-admin; fi
 if ! getent group "$SHARED_GROUP" >/dev/null; then groupadd --system superpan-license-admin; fi
@@ -384,11 +515,11 @@ fi
 usermod --gid "$LICENSE_GROUP" --groups "$SHARED_GROUP" "$LICENSE_USER"
 usermod --gid "$OTA_GROUP" --groups "$SHARED_GROUP" "$OTA_USER"
 assert_exact_identity_after_creation
+failpoint identity
 
 install -d -m 0755 -o root -g root "$DEST"
 install -d -m 0710 -o root -g "$SHARED_GROUP" "$ETC"
 install -d -m 0700 -o "$LICENSE_USER" -g "$LICENSE_GROUP" "$DATA"
-install -d -m 0700 -o root -g root "$BACKUP_DIR"
 
 atomic_install_file() {
     local source="$1" target="$2" owner="$3" group="$4" mode="$5" temp
@@ -511,15 +642,18 @@ create_persistent_state() {
     local encryption_temp lookup_temp admin_temp signing_temp der_temp base64_temp hash_temp id_temp
     [ "$PERSISTENT_STATE_MODE" = "absent" ] || return
     PERSISTENT_TRANSACTION_ARMED=true
-    trap cleanup_persistent_transaction EXIT
     create_exclusive_temp "$ENCRYPTION_KEY" root "$LICENSE_GROUP" 640 raw32 32 raw32; encryption_temp="$CREATED_TEMP"
+    failpoint secret-encryption
     create_exclusive_temp "$LOOKUP_KEY" root "$LICENSE_GROUP" 640 raw32 32 raw32; lookup_temp="$CREATED_TEMP"
+    failpoint secret-lookup
     create_exclusive_temp "$ADMIN_SECRET" root "$SHARED_GROUP" 640 raw32 32 raw32; admin_temp="$CREATED_TEMP"
+    failpoint secret-admin
     create_exclusive_temp "$SIGNING_KEY" root "$LICENSE_GROUP" 640 ec-private 227 p256; signing_temp="$CREATED_TEMP"
     stage_derived_file "$SIGNING_SPKI_DER" root root 644 91 der "$signing_temp"; der_temp="$CREATED_TEMP"
     stage_derived_file "$SIGNING_SPKI_BASE64" root root 644 125 base64 "$der_temp"; base64_temp="$CREATED_TEMP"
     stage_derived_file "$SIGNING_SPKI_SHA256" root root 644 65 sha256 "$der_temp"; hash_temp="$CREATED_TEMP"
     stage_derived_file "$SIGNING_KEY_ID" root root 644 49 key-id "$der_temp"; id_temp="$CREATED_TEMP"
+    failpoint secret-signing
     PERSISTENT_TEMP_PATHS=("$encryption_temp" "$lookup_temp" "$admin_temp" "$signing_temp" "$id_temp" "$der_temp" "$base64_temp" "$hash_temp")
     ! cmp -s "$encryption_temp" "$lookup_temp" || die "independent random keys unexpectedly matched"
     ! cmp -s "$ENCRYPTION_KEY" "$ADMIN_SECRET" || die "encryption and admin keys must differ"
@@ -528,6 +662,7 @@ create_persistent_state() {
     ! cmp -s "$lookup_temp" "$admin_temp" || die "independent lookup/admin keys unexpectedly matched"
     validate_signing_identity_set "$signing_temp" "$der_temp" "$base64_temp" "$hash_temp" "$id_temp"
     publish_persistent_transaction
+    failpoint secret-publish
 }
 
 create_persistent_state
@@ -557,33 +692,131 @@ validate_rendered_license_config() {
     [ "$(grep -Ec '"internal_secret_path"[[:space:]]*:[[:space:]]*"/etc/superpan-license/admin.secret"' "$path")" -eq 1 ] || die "rendered config admin secret path mismatch"
 }
 
-render_license_config
+write_schema_config() {
+    local source_db="$1" listen="$2" target="$3" key_id
+    key_id="$(cat "$SIGNING_KEY_ID")"
+    sed -e "s/replace-with-generated-key-id/$key_id/" \
+        -e "s#\"license_database_path\"[[:space:]]*:[[:space:]]*\"/var/lib/superpan-license/state.db\"#\"license_database_path\": \"$source_db\"#" \
+        -e "s/127\.0\.0\.1:18092/$listen/" "$LICENSE_CONFIG_SOURCE" >"$target"
+    chmod 0640 "$target"; chown root:"$LICENSE_GROUP" "$target"
+}
 
-"$DEST/superpan-license" check-config --config "$ETC/config.json" >/dev/null
+wait_schema_health() {
+    local attempt
+    for attempt in $(seq 1 30); do
+        curl --noproxy '*' --fail --silent --show-error --max-time 2 http://127.0.0.1:28092/internal/health >/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
+restore_old_license_activity() {
+    if [ "$LICENSE_WAS_ACTIVE" = true ]; then systemctl start superpan-license.service; else systemctl stop superpan-license.service; fi
+}
+
+schema_upgrade_preflight() {
+    if [ "$UPGRADE_MODE" != true ]; then
+        printf 'initial-install: old binary and schema absent\n' >"$BACKUP_DIR/schema-preflight.txt"
+        chmod 0600 "$BACKUP_DIR/schema-preflight.txt"
+        refresh_manifest
+        return
+    fi
+    local before="$BACKUP_DIR/schema-before.db" migrated="$BACKUP_DIR/schema-migrated.db"
+    local after="$BACKUP_DIR/schema-after.db" oldcopy="$BACKUP_DIR/schema-old.db" verified="$BACKUP_DIR/schema-old-verified.db"
+    SCHEMA_NEW_CONFIG="$BACKUP_DIR/schema-new.json"
+    SCHEMA_OLD_CONFIG="$BACKUP_DIR/schema-old.json"
+    LICENSE_WAS_ACTIVE=false; systemctl is-active --quiet superpan-license.service && LICENSE_WAS_ACTIVE=true
+    systemctl stop superpan-license.service
+    BEFORE_SUMMARY="$("$LICENSE_DB_SNAPSHOT" --service superpan-license.service --source "$DATA/state.db" --destination "$before")"
+    restore_old_license_activity
+    cp -- "$before" "$migrated"; chown root:root "$migrated"; chmod 0600 "$migrated"
+    write_schema_config "$migrated" 127.0.0.1:28092 "$SCHEMA_NEW_CONFIG"
+    "$BUNDLE/superpan-license" serve --config "$SCHEMA_NEW_CONFIG" >"$BACKUP_DIR/schema-new.log" 2>&1 &
+    SCHEMA_TEST_PIDS+=("$!")
+    wait_schema_health || die "new license binary failed schema migration health"
+    kill "${SCHEMA_TEST_PIDS[-1]}"; wait "${SCHEMA_TEST_PIDS[-1]}" || :
+    chown root:root "$migrated" "$migrated-wal" "$migrated-shm" 2>/dev/null || :
+    chmod 0600 "$migrated" "$migrated-wal" "$migrated-shm" 2>/dev/null || :
+    systemctl stop superpan-license.service
+    AFTER_SUMMARY="$("$LICENSE_DB_SNAPSHOT" --service superpan-license.service --source "$migrated" --destination "$after")"
+    restore_old_license_activity
+    cp -- "$after" "$oldcopy"; chown root:root "$oldcopy"; chmod 0600 "$oldcopy"
+    write_schema_config "$oldcopy" 127.0.0.1:28092 "$SCHEMA_OLD_CONFIG"
+    "$BACKUP_DIR/license-binary" serve --config "$SCHEMA_OLD_CONFIG" >"$BACKUP_DIR/schema-old.log" 2>&1 &
+    SCHEMA_TEST_PIDS+=("$!")
+    wait_schema_health || die "old license binary cannot read migrated schema"
+    kill "${SCHEMA_TEST_PIDS[-1]}"; wait "${SCHEMA_TEST_PIDS[-1]}" || :
+    chown root:root "$oldcopy" "$oldcopy-wal" "$oldcopy-shm" 2>/dev/null || :
+    chmod 0600 "$oldcopy" "$oldcopy-wal" "$oldcopy-shm" 2>/dev/null || :
+    systemctl stop superpan-license.service
+    OLD_SUMMARY="$("$LICENSE_DB_SNAPSHOT" --service superpan-license.service --source "$oldcopy" --destination "$verified")"
+    restore_old_license_activity
+    AFTER_AGGREGATE="$(printf '%s\n' "$AFTER_SUMMARY" | tr ' ' '\n' | grep '^count_' | LC_ALL=C sort)"
+    OLD_AGGREGATE="$(printf '%s\n' "$OLD_SUMMARY" | tr ' ' '\n' | grep '^count_' | LC_ALL=C sort)"
+    [ "$AFTER_AGGREGATE" = "$OLD_AGGREGATE" ] || die "semantic aggregate mismatch after old-binary compatibility probe"
+    {
+        printf 'before %s\n' "$BEFORE_SUMMARY"
+        printf 'after %s\n' "$AFTER_SUMMARY"
+        printf 'old-read-only %s\n' "$OLD_SUMMARY"
+    } >"$BACKUP_DIR/schema-preflight.txt"
+    chmod 0600 "$BACKUP_DIR/schema-preflight.txt" "$BACKUP_DIR"/schema-*.json "$BACKUP_DIR"/schema-*.log
+    refresh_manifest
+}
+
+schema_upgrade_preflight
 "$BUNDLE/ota-admin" check-config --config "$OTA_CONFIG_SOURCE" >/dev/null
 
 record_persistent_identity() {
-    local record="$BACKUP_DIR/key-set-identity.txt" db_record="$BACKUP_DIR/database-snapshot-identity.txt"
+    local record="$BACKUP_DIR/persistent-identity.txt"
     {
+        printf 'post-preflight\n'
         printf 'key-id %s\n' "$(cat "$SIGNING_KEY_ID")"
         printf 'spki-sha256 %s\n' "$(cat "$SIGNING_SPKI_SHA256")"
         printf 'encryption-sha256 %s\n' "$(sha256sum -- "$ENCRYPTION_KEY" | awk '{print $1}')"
         printf 'lookup-sha256 %s\n' "$(sha256sum -- "$LOOKUP_KEY" | awk '{print $1}')"
         printf 'admin-sha256 %s\n' "$(sha256sum -- "$ADMIN_SECRET" | awk '{print $1}')"
-    } >"$record"
+    } >>"$record"
     if [ -f "$DATA/state.db" ]; then
-        printf 'state.db sha256=%s size=%s\n' "$(sha256sum -- "$DATA/state.db" | awk '{print $1}')" "$(stat -c '%s' "$DATA/state.db")" >"$db_record"
+        printf 'state.db sha256=%s size=%s\n' "$(sha256sum -- "$DATA/state.db" | awk '{print $1}')" "$(stat -c '%s' "$DATA/state.db")" >>"$record"
     else
-        printf 'state.db absent\n' >"$db_record"
+        printf 'state.db absent\n' >>"$record"
     fi
-    chmod 0600 "$record" "$db_record"
+    chmod 0600 "$record"
 }
 record_persistent_identity
+refresh_manifest
 
 install -m 0755 -o root -g root "$BUNDLE/superpan-license" "$DEST/superpan-license"
+failpoint license-binary
+render_license_config
+failpoint license-config
+"$DEST/superpan-license" check-config --config "$ETC/config.json" >/dev/null
 install -m 0644 -o root -g root "$LICENSE_UNIT_SOURCE" /etc/systemd/system/superpan-license.service
+failpoint license-unit
 install -m 0644 -o root -g root "$BUNDLE/source-commit.txt" "$SOURCE_COMMIT_TARGET"
 systemctl daemon-reload
 systemctl enable --now superpan-license.service
+failpoint license-start
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18092/internal/health >/dev/null
-echo "license phase installed; OTA transaction not yet executed"
+failpoint license-health
+bash "$OTA_INSTALLER" --loopback-license-transaction \
+    --binary "$BUNDLE/ota-admin" --binary-sha256 "$OTA_BINARY_SHA256" \
+    --config "$OTA_CONFIG_SOURCE" --config-sha256 "$OTA_CONFIG_SHA256" \
+    --unit "$OTA_UNIT_SOURCE" --unit-sha256 "$OTA_UNIT_SHA256" \
+    --source-commit "$SOURCE_COMMIT" --outer-transaction-root "$TRANSACTION_BACKUP"
+systemctl is-active --quiet superpan-ota-admin.service || die "OTA admin service is not active after controlled install"
+curl --noproxy '*' --fail --silent --show-error --max-time 5 http://127.0.0.1:18091/admin/ >/dev/null
+INSTALLED_LICENSE_SHA="$(sha256sum -- "$DEST/superpan-license" | awk '{print $1}')"
+INSTALLED_OTA_SHA="$(sha256sum -- /opt/superpan-ota-admin/ota-admin | awk '{print $1}')"
+[ "$INSTALLED_LICENSE_SHA" = "$LICENSE_BINARY_SHA256" ] || die "installed license binary hash mismatch"
+[ "$INSTALLED_OTA_SHA" = "$OTA_BINARY_SHA256" ] || die "installed OTA binary hash mismatch"
+{
+    printf 'source-commit %s\n' "$SOURCE_COMMIT"
+    printf 'superpan-license %s\n' "$INSTALLED_LICENSE_SHA"
+    printf 'ota-admin %s\n' "$INSTALLED_OTA_SHA"
+} >"$BACKUP_DIR/installed-hashes.txt"
+chmod 0600 "$BACKUP_DIR/installed-hashes.txt"
+refresh_manifest
+TRANSACTION_SUCCEEDED=true
+TRANSACTION_ARMED=false
+echo "transactional license and OTA installation complete; backup: $TRANSACTION_BACKUP"

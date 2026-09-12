@@ -36,6 +36,34 @@ staging 执行前必须单独确认主机、快照和回滚边界，并保留安
 公共 Nginx 路由片段在授权服务安装和验收完成前不得加入；安装脚本不会自动修改
 现有 vhost，也不会执行 Nginx reload。
 
+授权服务安装现在是一个覆盖授权服务与既有 OTA 后台的单一事务。所有 bundle、模板、
+source commit、现有身份、ACL、密钥配对状态以及升级时的维护工具都在任何修改前完成
+校验。事务使用固定锁，且每次只在 `/var/backups/superpan-license/<transaction-id>`
+创建一个 `root:root`、`0700` 备份。`inventory.tsv` 精确记录两个服务的 binary、config、
+unit 以及授权服务 source-commit 文件原先的 present/absent、数字 owner/group、mode 和
+SHA-256；`unit-state.tsv` 记录两个服务原先的 enabled/active 状态。`manifest.sha256`
+覆盖备份中的每个允许文件。数据库和密钥只以配对身份及指纹写入审计记录，不作为普通
+恢复载荷。
+
+升级已有 schema 时，安装器在恢复 trap 已武装后短暂停止旧授权服务，使用与 bundle
+相同 source commit 的 `/opt/superpan-license-maintenance/license-db-snapshot` 生成一致快照，
+并立即恢复原 active 状态。新 binary 只在 `127.0.0.1:28092` 针对快照副本完成迁移和
+健康检查；再次 checkpoint 后再由旧 binary 对迁移副本完成健康和只读表计数验证。首次
+安装必须同时不存在旧 binary 和数据库；只存在其中之一会 fail closed。Windows 本地只
+验证脚本合同，以上 ELF/systemd 流程仍须在获批的 Linux staging 快照上执行。
+
+正式提交顺序固定为：授权 binary、渲染后的 config、unit、启动与
+`127.0.0.1:18092/internal/health`；随后调用 OTA installer 的受控事务模式，仅替换同一
+commit 的 OTA binary/config/unit，重启并检查 `127.0.0.1:18091/admin/`。该受控路径不
+创建嵌套备份，不安装或读取授权服务公共路由片段，不修改 vhost，也不执行 Nginx 检查
+或 reload。最终再次记录并核对两个已安装 binary 的 SHA-256 与 source commit。
+
+事务失败会保留原退出码并调用 `deploy/license-service/rollback.sh`。rollback 在恢复前
+重新校验固定备份路径、ACL、manifest、allowlist、每个 payload 的 hash 和 metadata，
+按 present/absent 恢复或删除七个枚举目标，执行 daemon-reload，再恢复两个服务原先的
+enabled/active 状态；数据库与密钥绝不覆盖或删除。若 rollback 自身失败，备份会保留，
+两个服务保持停止，并要求人工修复。
+
 1. 在现有 `ota.fanfh.cn` HTTPS `server {}` 内只加入一次下列 include 行。先备份该 vhost，除此之外不复制或改写其他站点配置。片段本身也对非 HTTPS 请求 fail closed，但仍必须只放在 HTTPS block。
 
    ```nginx

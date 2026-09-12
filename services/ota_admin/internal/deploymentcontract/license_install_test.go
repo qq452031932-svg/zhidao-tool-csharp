@@ -241,7 +241,7 @@ func TestLicenseInstallPreflightArgumentsExecutable(t *testing.T) {
 		{"--unit", "/fixture/unit"}, {"--unit-sha256", strings.Repeat("c", 64)},
 		{"--source-commit", strings.Repeat("d", 40)},
 	}
-	for missing := 1; missing < len(otaOptions); missing++ {
+	for missing := 2; missing < len(otaOptions); missing++ {
 		option := otaOptions[missing][0]
 		t.Run("OTA missing "+option, func(t *testing.T) {
 			without := append([][2]string{}, otaOptions[:missing]...)
@@ -733,7 +733,7 @@ func TestLicenseInstallSecretLifecycle(t *testing.T) {
 		`validate_file "$SIGNING_SPKI_DER" root root 644 91 der`,
 		`validate_file "$SIGNING_SPKI_BASE64" root root 644 125 base64`,
 		`PERSISTENT_TEMP_PATHS=()`, `PERSISTENT_PUBLISHED_PATHS=()`,
-		`trap cleanup_persistent_transaction EXIT`, `publish_persistent_transaction`,
+		`trap transaction_exit EXIT`, `publish_persistent_transaction`,
 		`cleanup_persistent_transaction`, `sync_directory "$ETC"`,
 		`exec {fd}>"$temp"`, `stat -Lc '%d:%i:%h' "/proc/self/fd/$fd"`,
 		`! cmp -s "$ENCRYPTION_KEY" "$ADMIN_SECRET"`,
@@ -751,7 +751,8 @@ func TestLicenseInstallACL(t *testing.T) {
 	requireFragments(t, install,
 		`install -d -m 0710 -o root -g "$SHARED_GROUP" "$ETC"`,
 		`install -d -m 0700 -o "$LICENSE_USER" -g "$LICENSE_GROUP" "$DATA"`,
-		`install -d -m 0700 -o root -g root "$BACKUP_DIR"`,
+		`install -d -m 0700 -o root -g root "$BACKUP_ROOT"`,
+		`mkdir -m 0700 "$TRANSACTION_BACKUP"`,
 		`validate_file "$ENCRYPTION_KEY" root "$LICENSE_GROUP" 640 32 raw32`,
 		`validate_file "$LOOKUP_KEY" root "$LICENSE_GROUP" 640 32 raw32`,
 		`validate_file "$ADMIN_SECRET" root "$SHARED_GROUP" 640 32 raw32`,
@@ -770,18 +771,20 @@ func TestLicenseInstallConfig(t *testing.T) {
 		`validate_rendered_license_config`, `127.0.0.1:18092`,
 		`validate_ota_shared_secret_config`,
 		`"license_admin_secret_path"[[:space:]]*:[[:space:]]*"/etc/superpan-license/admin.secret"`,
-		`record_persistent_identity`, `database-snapshot-identity.txt`,
+		`record_persistent_identity`, `persistent-identity.txt`,
 		`"$DEST/superpan-license" check-config --config`,
-		`batch4 OTA transaction is not implemented`,
+		`transactional license and OTA installation complete`,
 	)
-	requireBefore(t, install, `batch4 OTA transaction is not implemented`, `assert_exact_identity_before_mutation`)
+	if strings.Contains(install, `batch4 OTA transaction is not implemented`) {
+		t.Fatal("completed transaction must not retain the batch4 fail-closed placeholder")
+	}
 	requireFragments(t, ota,
 		`SHARED_LICENSE_GROUP="superpan-license-admin"`,
 		`LICENSE_ADMIN_SECRET="/etc/superpan-license/admin.secret"`,
 	)
 	requireFragments(t, rollback,
 		"Persistent database and key material are deliberately preserved",
-		`/var/lib/superpan-license`, `/etc/superpan-license/encryption.key`,
+		`/var/lib/superpan-license`, `encryption.key`,
 	)
 	for _, secret := range []string{"encryption.key", "lookup.key", "admin.secret", "response-signing.key"} {
 		if strings.Contains(rollback, `install -m 0640 "$BACKUP_ROOT/`+secret) {
@@ -796,8 +799,8 @@ func TestLicenseInstallRollbackTrustBoundary(t *testing.T) {
 		`FIXED_BACKUP_ROOT="/var/backups/superpan-license"`,
 		`BACKUP_ROOT must be /var/backups/superpan-license/<id>`,
 		`validate_trusted_path "$BACKUP_ROOT"`, `manifest.sha256`,
-		`EXPECTED_MANIFEST_NAMES`, `sha256sum -c`,
-		`install -m 0640 -o root -g superpan-license`,
+		`ALLOWED_NAMES`, `EXPECTED_TARGETS`, `sha256sum -c`,
+		`restore_inventory`,
 	)
 }
 
@@ -806,4 +809,86 @@ func TestLicenseInstallOTAIdentityBeforeMutation(t *testing.T) {
 	requireFragments(t, ota, `assert_ota_exact_identity_before_mutation`, `OTA_INSTALL_MUTATION_BOUNDARY`)
 	requireBefore(t, ota, `assert_ota_exact_identity_before_mutation`, `validate_backup_root`)
 	requireBefore(t, ota, `assert_ota_exact_identity_before_mutation`, `BACKUP_DIR="$(mktemp -d`)
+}
+
+func TestLicenseInstallCompleteTransactionContract(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`LOCK_FILE="/run/lock/superpan-license-install.lock"`, `flock -n 9`,
+		`TRANSACTION_ID=`, `TRANSACTION_BACKUP="$BACKUP_ROOT/$TRANSACTION_ID"`,
+		`trap transaction_exit EXIT`, `trap 'transaction_signal 130' INT`,
+		`trap 'transaction_signal 143' TERM`, `trap 'transaction_signal 129' HUP`,
+		`TRANSACTION_ARMED=true`, `bash "$ROLLBACK_SCRIPT" "$TRANSACTION_BACKUP"`,
+		`inventory.tsv`, `unit-state.tsv`, `manifest.sha256`, `source-commit.txt`,
+		`license-db-snapshot`, `schema-before.db`, `schema-migrated.db`, `schema-after.db`,
+		`serve --config "$SCHEMA_NEW_CONFIG"`, `serve --config "$SCHEMA_OLD_CONFIG"`,
+		`http://127.0.0.1:28092/internal/health`, `semantic aggregate mismatch`,
+		`systemctl enable --now superpan-license.service`, `http://127.0.0.1:18092/internal/health`,
+		`bash "$OTA_INSTALLER" --loopback-license-transaction`,
+		`http://127.0.0.1:18091/admin/`, `installed-hashes.txt`,
+	)
+	if strings.Contains(install, "complete installation disabled") {
+		t.Fatal("normal installation is still disabled")
+	}
+	requireBefore(t, install, `trap transaction_exit EXIT`, `TRANSACTION_ARMED=true`)
+	requireBefore(t, install, `TRANSACTION_ARMED=true`, `groupadd --system`)
+	requireBefore(t, install, `failpoint license-health`, `--outer-transaction-root "$TRANSACTION_BACKUP"`)
+	for _, forbidden := range []string{"ota.fanfh.cn.license-api.nginx.conf", "nginx -t", "nginx -s reload", "ACTIVE_VHOST"} {
+		if strings.Contains(install, forbidden) { t.Errorf("license transaction contains public Nginx operation %q", forbidden) }
+	}
+}
+
+func TestLoopbackOTAControlledApplyContract(t *testing.T) {
+	ota := read(t, "deploy", "ota-admin", "install.sh")
+	requireFragments(t, ota,
+		`--outer-transaction-root`, `OUTER_TRANSACTION_ROOT`,
+		`apply_loopback_license_transaction`,
+		`install -m 0755 -o root -g root "$BINARY_SOURCE" "$BINARY_TARGET"`,
+		`install -m 0640 -o root -g "$SERVICE_GROUP" "$LOOPBACK_CONFIG_SOURCE" "$CONFIG_TARGET"`,
+		`install -m 0644 -o root -g root "$LOOPBACK_UNIT_SOURCE" "$UNIT_TARGET"`,
+		`systemctl restart "$SERVICE_NAME"`, `http://127.0.0.1:18091/admin/`,
+		`OTA_CONTROLLED_APPLY_COMPLETE`,
+	)
+	controlledAt := strings.Index(ota, "apply_loopback_license_transaction")
+	if controlledAt < 0 { t.Fatal("controlled OTA apply function missing") }
+	controlledEnd := strings.Index(ota[controlledAt:], "# OTA_CONTROLLED_APPLY_COMPLETE")
+	if controlledEnd < 0 { t.Fatal("controlled OTA apply boundary missing") }
+	controlled := ota[controlledAt : controlledAt+controlledEnd]
+	for _, forbidden := range []string{"BACKUP_DIR=", "NGINX_SNIPPET_TARGET", "ACTIVE_VHOST", "reload_nginx"} {
+		if strings.Contains(controlled, forbidden) { t.Errorf("controlled OTA apply contains forbidden nested/public operation %q", forbidden) }
+	}
+}
+
+func TestLicenseRollbackRestoresBothServicesAndStates(t *testing.T) {
+	rollback := read(t, "deploy", "license-service", "rollback.sh")
+	requireFragments(t, rollback,
+		`inventory.tsv`, `unit-state.tsv`, `manifest.sha256`, `EXPECTED_TARGETS`,
+		`/opt/superpan-license/superpan-license`, `/etc/superpan-license/config.json`,
+		`/etc/systemd/system/superpan-license.service`, `/opt/superpan-ota-admin/ota-admin`,
+		`/etc/superpan-ota-admin/config.json`, `/etc/systemd/system/superpan-ota-admin.service`,
+		`restore_inventory`, `systemctl daemon-reload`, `restore_unit_state`,
+		`ROLLBACK_SUCCEEDED=true`, `backup retained; services remain stopped for manual repair`,
+	)
+	for _, secret := range []string{"encryption.key", "lookup.key", "admin.secret", "response-signing.key", "/var/lib/superpan-license"} {
+		if strings.Contains(rollback, `rm -f -- "`+secret) || strings.Contains(rollback, `install `+secret) {
+			t.Errorf("rollback mutates persistent state %q", secret)
+		}
+	}
+}
+
+func TestLicenseInstallerFailpointAllowlist(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install, `LICENSE_INSTALL_FAILPOINT`, `case "${LICENSE_INSTALL_FAILPOINT:-}" in`, `failpoint()`)
+	for _, point := range []string{
+		"identity", "secret-encryption", "secret-lookup", "secret-admin", "secret-signing", "secret-publish",
+		"backup", "license-binary", "license-config", "license-unit", "license-start", "license-health",
+		"ota-binary", "ota-config", "ota-unit", "ota-restart", "ota-health",
+	} { if !strings.Contains(install, point) { t.Errorf("missing failpoint %q", point) } }
+	if strings.Contains(install, "eval ") { t.Fatal("failpoints must never use eval") }
+}
+
+func TestV219HarnessCoversLifecycleAndKeepsLinuxGate(t *testing.T) {
+	harness := read(t, "deploy", "license-service", "test-install-v219.sh")
+	requireFragments(t, harness, "first-install", "upgrade", "rollback", "restart", "failpoint", "Linux", "staging", "single backup")
+	if strings.Contains(harness, "nginx") { t.Fatal("license staging harness must not inspect or modify Nginx") }
 }

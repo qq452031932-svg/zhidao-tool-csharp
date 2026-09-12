@@ -42,6 +42,7 @@ LOOPBACK_UNIT_SOURCE=""
 LOOPBACK_UNIT_SHA256=""
 SOURCE_COMMIT=""
 PREFLIGHT_ONLY=false
+OUTER_TRANSACTION_ROOT=""
 declare -A SEEN_ARGS=()
 
 usage() {
@@ -50,10 +51,11 @@ Usage: install.sh --binary PATH --binary-sha256 HEX \
   --certificate PATH --certificate-sha256 HEX --publisher-spki-sha256 HEX \
   --active-vhost-sha256 HEX
 
-Loopback license transaction preflight (does not mutate in this release):
+Loopback license transaction (preflight-only or controlled apply):
   install.sh --loopback-license-transaction --binary PATH --binary-sha256 HEX \
     --config PATH --config-sha256 HEX --unit PATH --unit-sha256 HEX \
-    --source-commit 40_LOWERCASE_HEX --preflight-only
+    --source-commit 40_LOWERCASE_HEX [--preflight-only | \
+    --outer-transaction-root /var/backups/superpan-license/TRANSACTION_ID]
 
 The existing OTA HTTPS server block must already contain exactly this line:
   include /etc/superpan-ota-admin/ota.fanfh.cn.admin.nginx.conf;
@@ -149,6 +151,54 @@ preflight_loopback_license_transaction() {
     verify_sha256 "$LOOPBACK_UNIT_SOURCE" "$LOOPBACK_UNIT_SHA256"
 }
 
+validate_outer_transaction_root() {
+    case "$OUTER_TRANSACTION_ROOT" in
+        /var/backups/superpan-license/[A-Za-z0-9][A-Za-z0-9._-]*) ;;
+        *) die "--outer-transaction-root must name the license install transaction backup" ;;
+    esac
+    [ "$(dirname "$OUTER_TRANSACTION_ROOT")" = /var/backups/superpan-license ] || die "outer transaction backup must be an immediate child"
+    validate_trusted_path "$OUTER_TRANSACTION_ROOT"
+    [ "$(stat -c '%U:%G:%a' "$OUTER_TRANSACTION_ROOT")" = root:root:700 ] || die "outer transaction backup metadata is unsafe"
+    [ -f "$OUTER_TRANSACTION_ROOT/manifest.sha256" ] || die "outer transaction manifest is missing"
+}
+
+controlled_failpoint() {
+    local point="$1"
+    [ "${LICENSE_INSTALL_FAILPOINT:-}" != "$point" ] || die "injected failure at $point"
+}
+
+apply_loopback_license_transaction() {
+    # The outer license installer exclusively owns backup and rollback. This
+    # path deliberately performs no Nginx, vhost, mount, credential, or backup work.
+    validate_outer_transaction_root
+    [ -f "$LICENSE_ADMIN_SECRET" ] && [ ! -L "$LICENSE_ADMIN_SECRET" ] || die "shared license admin secret is unavailable"
+    [ "$(stat -c '%U:%G:%a' "$LICENSE_ADMIN_SECRET")" = root:superpan-license-admin:640 ] || die "shared license admin secret metadata is unsafe"
+    install -d -m 0755 -o root -g root /opt/superpan-ota-admin
+    install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"
+    install -m 0755 -o root -g root "$BINARY_SOURCE" "$BINARY_TARGET"
+    controlled_failpoint ota-binary
+    install -m 0640 -o root -g "$SERVICE_GROUP" "$LOOPBACK_CONFIG_SOURCE" "$CONFIG_TARGET"
+    controlled_failpoint ota-config
+    install -m 0644 -o root -g root "$LOOPBACK_UNIT_SOURCE" "$UNIT_TARGET"
+    controlled_failpoint ota-unit
+    "$BINARY_TARGET" check-config --config "$CONFIG_TARGET" >/dev/null
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null
+    systemctl restart "$SERVICE_NAME"
+    controlled_failpoint ota-restart
+    local attempt
+    for attempt in $(seq 1 30); do
+        if systemctl is-active --quiet "$SERVICE_NAME" &&
+           curl --noproxy '*' --fail --silent --show-error --max-time 2 http://127.0.0.1:18091/admin/ >/dev/null; then
+            controlled_failpoint ota-health
+            return 0
+        fi
+        sleep 1
+    done
+    die "controlled OTA service did not become ready"
+}
+# OTA_CONTROLLED_APPLY_COMPLETE
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --binary) mark_seen "$1"; require_value "$1" "${2:-}"; BINARY_SOURCE="$2"; shift 2 ;;
@@ -164,23 +214,31 @@ while [ "$#" -gt 0 ]; do
         --unit) mark_seen "$1"; require_value "$1" "${2:-}"; LOOPBACK_UNIT_SOURCE="$2"; shift 2 ;;
         --unit-sha256) mark_seen "$1"; require_value "$1" "${2:-}"; LOOPBACK_UNIT_SHA256="$2"; shift 2 ;;
         --source-commit) mark_seen "$1"; require_value "$1" "${2:-}"; SOURCE_COMMIT="$2"; shift 2 ;;
+        --outer-transaction-root) mark_seen "$1"; require_value "$1" "${2:-}"; OUTER_TRANSACTION_ROOT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; die "unknown argument: $1" ;;
     esac
 done
 
 if [ "$LOOPBACK_LICENSE_TRANSACTION" = true ]; then
-    for required in --loopback-license-transaction --preflight-only --binary --binary-sha256 \
+    for required in --loopback-license-transaction --binary --binary-sha256 \
         --config --config-sha256 --unit --unit-sha256 --source-commit; do
         require_seen "$required"
     done
     [ "$(id -u)" -eq 0 ] || die "run this installer as root"
     preflight_loopback_license_transaction
-    echo "loopback license transaction preflight complete for source commit $SOURCE_COMMIT"
+    if [ "$PREFLIGHT_ONLY" = true ]; then
+        [ -z "$OUTER_TRANSACTION_ROOT" ] || die "--preflight-only and --outer-transaction-root are mutually exclusive"
+        echo "loopback license transaction preflight complete for source commit $SOURCE_COMMIT"
+        exit 0
+    fi
+    [ -n "$OUTER_TRANSACTION_ROOT" ] || die "controlled apply requires --outer-transaction-root"
+    apply_loopback_license_transaction
+    echo "controlled loopback OTA transaction complete for source commit $SOURCE_COMMIT"
     exit 0
 fi
 [ "$PREFLIGHT_ONLY" = false ] || die "--preflight-only requires --loopback-license-transaction"
-[ -z "$LOOPBACK_CONFIG_SOURCE$LOOPBACK_CONFIG_SHA256$LOOPBACK_UNIT_SOURCE$LOOPBACK_UNIT_SHA256$SOURCE_COMMIT" ] ||
+[ -z "$LOOPBACK_CONFIG_SOURCE$LOOPBACK_CONFIG_SHA256$LOOPBACK_UNIT_SOURCE$LOOPBACK_UNIT_SHA256$SOURCE_COMMIT$OUTER_TRANSACTION_ROOT" ] ||
     die "loopback transaction arguments require --loopback-license-transaction"
 for required in --binary --binary-sha256 --certificate --certificate-sha256 \
     --publisher-spki-sha256 --active-vhost-sha256; do
