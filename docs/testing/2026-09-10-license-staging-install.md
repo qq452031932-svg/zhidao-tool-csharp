@@ -28,11 +28,27 @@ The public Nginx include must remain absent during installation. The service is 
 
 ## Authorized Linux staging matrix
 
-On the approved disposable snapshot, invoke
-`deploy/license-service/test-install-v219.sh` separately for `first-install`,
-`upgrade`, `restart`, `rollback`, and each enumerated `failpoint`. Pass the same
-explicit installer arguments used by the reviewed preflight. Each install or
-failpoint invocation must create exactly one backup below the fixed backup root.
+On the approved disposable snapshot, place fixture lifecycle commands
+`fixture-v219-reset` and `fixture-v219-seed-wal` on `PATH`, then run the single
+matrix entry point:
+
+```bash
+sudo bash deploy/license-service/test-install-v219.sh \
+  --bundle /root/reviewed-license-bundle \
+  --fixture-vhost centos7-v219-disposable
+```
+
+`--fixture-vhost` is an opaque disposable-fixture identifier passed only to the
+fixture lifecycle wrappers; it is not a public route or configuration path. The
+reset wrapper restores the named disposable fixture before each independent
+scenario, and the WAL seed wrapper prepares an old-version active service with a
+coherent WAL database for the upgrade scenario. The harness derives all explicit
+hash and template arguments from the reviewed bundle and deploy tree.
+
+The entry point automatically runs first install, WAL upgrade, explicit rollback,
+restart, all 17 failpoints, and normal retries after `secret-publish`,
+`license-binary`, `license-config`, and `license-unit`. Each installer invocation
+must create exactly one backup below the fixed backup root.
 
 The failpoint allowlist is: `identity`, `secret-encryption`, `secret-lookup`,
 `secret-admin`, `secret-signing`, `secret-publish`, `backup`, `license-binary`,
@@ -42,6 +58,12 @@ failure, record that the six service payloads and two unit states were restored,
 or that rollback explicitly retained the sole backup and left both services
 stopped for manual recovery. Never mark a failure as passed merely because it
 returned nonzero.
+
+Every successful scenario also verifies binary/config/unit owner, group and mode;
+enabled/active state; listener address, MainPID and `/proc/<pid>/exe` hash; and
+database/key pairing. A complete key set with an absent database is accepted and
+reported as an interrupted first-install state; partial keys or a database without
+all valid keys fail the matrix.
 
 The staging run must also prove the upgrade snapshot/checkpoint sequence, new
 binary migration on temporary loopback port `28092`, old-binary read compatibility,

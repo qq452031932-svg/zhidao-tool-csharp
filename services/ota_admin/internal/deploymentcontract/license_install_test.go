@@ -823,7 +823,7 @@ func TestLicenseInstallCompleteTransactionContract(t *testing.T) {
 		`license-db-snapshot`, `schema-before.db`, `schema-migrated.db`, `schema-after.db`,
 		`serve --config "$SCHEMA_NEW_CONFIG"`, `serve --config "$SCHEMA_OLD_CONFIG"`,
 		`http://127.0.0.1:28092/internal/health`, `semantic aggregate mismatch`,
-		`systemctl enable --now superpan-license.service`, `http://127.0.0.1:18092/internal/health`,
+		`systemctl restart superpan-license.service`, `http://127.0.0.1:18092/internal/health`,
 		`bash "$OTA_INSTALLER" --loopback-license-transaction`,
 		`http://127.0.0.1:18091/admin/`, `installed-hashes.txt`,
 	)
@@ -891,4 +891,73 @@ func TestV219HarnessCoversLifecycleAndKeepsLinuxGate(t *testing.T) {
 	harness := read(t, "deploy", "license-service", "test-install-v219.sh")
 	requireFragments(t, harness, "first-install", "upgrade", "rollback", "restart", "failpoint", "Linux", "staging", "single backup")
 	if strings.Contains(harness, "nginx") { t.Fatal("license staging harness must not inspect or modify Nginx") }
+}
+
+func TestLicenseRestartProvesNewProcessIdentity(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`systemctl enable superpan-license.service`,
+		`systemctl restart superpan-license.service`,
+		`for attempt in $(seq 1 30)`,
+		`curl --noproxy '*' --fail --silent --show-error --max-time 2 http://127.0.0.1:18092/internal/health`,
+		`systemctl show --property=MainPID --value superpan-license.service`,
+		`/proc/$LICENSE_MAIN_PID/exe`, `installed license process binary hash mismatch`,
+	)
+	if strings.Contains(install, "systemctl enable --now superpan-license.service") {
+		t.Fatal("enable --now may leave the old active process running")
+	}
+	restartAt := strings.LastIndex(install, `systemctl restart superpan-license.service`)
+	readyCallAt := strings.LastIndex(install, `wait_for_installed_license_process`)
+	if restartAt < 0 || readyCallAt < 0 || restartAt >= readyCallAt { t.Fatal("new process readiness must run after explicit restart") }
+}
+
+func TestPersistentKeysWithoutDatabaseIsRetryableFirstInstall(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	harness := read(t, "deploy", "license-service", "test-install-v219.sh")
+	requireFragments(t, install,
+		`PERSISTENT_STATE_MODE="keys-without-database"`,
+		`database absent`,
+		`database-sha256`,
+		`database exists without a complete valid key set`,
+	)
+	requireFragments(t, harness, `RETRY_FAILPOINTS=(secret-publish license-binary license-config license-unit)`)
+	if strings.Contains(install, `sha256sum -- "$DATA/state.db"`) {
+		// The database hash may only appear behind an explicit regular-file branch.
+		requireBefore(t, install, `if [ -f "$DATA/state.db" ]; then`, `sha256sum -- "$DATA/state.db"`)
+	}
+}
+
+func TestRollbackRemovesTransactionCreatedWantsLinksForNotFoundUnits(t *testing.T) {
+	rollback := read(t, "deploy", "license-service", "rollback.sh")
+	requireFragments(t, rollback,
+		`remove_transaction_wants_link`,
+		`/etc/systemd/system/multi-user.target.wants/superpan-license.service`,
+		`/etc/systemd/system/multi-user.target.wants/superpan-ota-admin.service`,
+		`readlink -f -- "$link"`, `systemctl disable "$unit"`,
+		`systemctl is-enabled "$unit"`, `prior not-found unit state was not restored`,
+	)
+	requireBefore(t, rollback, `restore_inventory`, `systemctl daemon-reload`)
+	requireBefore(t, rollback, `systemctl daemon-reload`, `prior not-found unit state was not restored`)
+}
+
+func TestSchemaProbePIDRegistryPreventsPIDReuseKills(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`declare -A SCHEMA_TEST_IDENTITIES=()`, `register_schema_pid`, `unregister_schema_pid`,
+		`kill_registered_schema_processes`, `/proc/$pid/stat`, `/proc/$pid/exe`,
+		`[ "${SCHEMA_TEST_IDENTITIES[$pid]:-}" = "$identity" ]`,
+	)
+	requireBefore(t, install, `kill "$schema_pid"`, `wait "$schema_pid"`)
+	requireBefore(t, install, `wait "$schema_pid"`, `unregister_schema_pid "$schema_pid"`)
+}
+
+func TestV219HarnessHasExecutableFullMatrixEntryPoint(t *testing.T) {
+	harness := read(t, "deploy", "license-service", "test-install-v219.sh")
+	requireFragments(t, harness,
+		`--bundle`, `--fixture-vhost`, `run_full_matrix`, `first-install`, `wal-upgrade`,
+		`FAILPOINTS=(`, `secret-publish`, `ota-health`, `rollback`, `restart`,
+		`assert_metadata`, `assert_unit_state`, `assert_listener_identity`,
+		`assert_persistent_pairing`, `assert_single_backup`,
+	)
+	if strings.Contains(harness, "eval ") { t.Fatal("staging harness must not use eval") }
 }

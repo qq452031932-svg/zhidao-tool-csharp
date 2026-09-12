@@ -33,7 +33,8 @@ TRANSACTION_ARMED=false
 TRANSACTION_MUTATED=false
 TRANSACTION_SUCCEEDED=false
 TRANSACTION_BACKUP=""
-SCHEMA_TEST_PIDS=()
+declare -A SCHEMA_TEST_IDENTITIES=()
+declare -A SCHEMA_TEST_BINARIES=()
 FAILPOINT_REQUIRES_STOPPED_RECOVERY=false
 
 usage() {
@@ -341,11 +342,13 @@ validate_existing_acl_before_mutation() {
 }
 
 validate_persistent_state_before_mutation() {
-    local present=0 path
+    local present=0 path database_present=false
+    [ ! -e "$DATA/state.db" ] && [ ! -L "$DATA/state.db" ] || database_present=true
     for path in "${PERSISTENT_PATHS[@]}"; do
         if [ -e "$path" ] || [ -L "$path" ]; then present=$((present + 1)); fi
     done
     if [ "$present" -eq 0 ]; then
+        [ "$database_present" = false ] || die "database exists without a complete valid key set"
         PERSISTENT_STATE_MODE="absent"
         return
     fi
@@ -364,7 +367,11 @@ validate_persistent_state_before_mutation() {
     ! cmp -s "$ENCRYPTION_KEY" "$ADMIN_SECRET" || die "encryption and admin keys must differ"
     ! cmp -s "$LOOKUP_KEY" "$ADMIN_SECRET" || die "lookup and admin keys must differ"
     validate_signing_identity
-    PERSISTENT_STATE_MODE="existing"
+    if [ "$database_present" = true ]; then
+        PERSISTENT_STATE_MODE="existing"
+    else
+        PERSISTENT_STATE_MODE="keys-without-database"
+    fi
 }
 
 validate_existing_config_before_mutation() {
@@ -412,7 +419,7 @@ transaction_exit() {
     local status=$? pid
     trap - EXIT INT TERM HUP
     set +e
-    for pid in "${SCHEMA_TEST_PIDS[@]}"; do kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; done
+    if declare -F kill_registered_schema_processes >/dev/null; then kill_registered_schema_processes; fi
     if declare -F cleanup_persistent_transaction >/dev/null; then cleanup_persistent_transaction; fi
     if [ "$TRANSACTION_ARMED" = true ] && [ "$TRANSACTION_MUTATED" = true ] && [ "$TRANSACTION_SUCCEEDED" != true ]; then
         if [ -f "$TRANSACTION_BACKUP/manifest.sha256" ]; then
@@ -458,10 +465,21 @@ chown root:root "$TRANSACTION_BACKUP"
 BACKUP_DIR="$TRANSACTION_BACKUP"
 
 record_unit_state() {
-    local unit="$1" enabled active
+    local unit="$1" enabled active link expected wants=absent
     enabled="$(systemctl is-enabled "$unit" 2>/dev/null || :)"; [ -n "$enabled" ] || enabled=not-found
     active=inactive; systemctl is-active --quiet "$unit" && active=active
-    printf '%s\t%s\t%s\n' "$unit" "$enabled" "$active" >>"$BACKUP_DIR/unit-state.tsv"
+    case "$unit" in
+        superpan-license.service) link=/etc/systemd/system/multi-user.target.wants/superpan-license.service ;;
+        superpan-ota-admin.service) link=/etc/systemd/system/multi-user.target.wants/superpan-ota-admin.service ;;
+        *) die "unexpected unit state target" ;;
+    esac
+    expected="/etc/systemd/system/$unit"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        [ -L "$link" ] && [ "$(readlink -f -- "$link")" = "$expected" ] || die "unsafe preexisting wants link for $unit"
+        wants=present
+    fi
+    [ "$enabled" != not-found ] || [ "$wants" = absent ] || die "not-found unit has a preexisting wants link"
+    printf '%s\t%s\t%s\t%s\n' "$unit" "$enabled" "$active" "$wants" >>"$BACKUP_DIR/unit-state.tsv"
 }
 backup_target() {
     local target="$1" name="$2"
@@ -484,14 +502,28 @@ record_unit_state superpan-license.service
 record_unit_state superpan-ota-admin.service
 printf '%s\n' "$SOURCE_COMMIT" >"$BACKUP_DIR/source-commit.txt"
 if [ "$PERSISTENT_STATE_MODE" = existing ]; then
+    [ -f "$DATA/state.db" ] && [ ! -L "$DATA/state.db" ] || die "existing persistent state lost its database"
     {
         printf 'state existing\n'
         printf 'key-id %s\n' "$(cat "$SIGNING_KEY_ID")"
         printf 'spki-sha256 %s\n' "$(cat "$SIGNING_SPKI_SHA256")"
-        printf 'database-sha256 %s\n' "$(sha256sum -- "$DATA/state.db" | awk '{print $1}')"
+        printf 'encryption-sha256 %s\n' "$(sha256sum -- "$ENCRYPTION_KEY" | awk '{print $1}')"
+        printf 'lookup-sha256 %s\n' "$(sha256sum -- "$LOOKUP_KEY" | awk '{print $1}')"
+        printf 'admin-sha256 %s\n' "$(sha256sum -- "$ADMIN_SECRET" | awk '{print $1}')"
+        if [ -f "$DATA/state.db" ]; then printf 'database-sha256 %s\n' "$(sha256sum -- "$DATA/state.db" | awk '{print $1}')"; fi
+    } >"$BACKUP_DIR/persistent-identity.txt"
+elif [ "$PERSISTENT_STATE_MODE" = keys-without-database ]; then
+    {
+        printf 'state keys-without-database\n'
+        printf 'key-id %s\n' "$(cat "$SIGNING_KEY_ID")"
+        printf 'spki-sha256 %s\n' "$(cat "$SIGNING_SPKI_SHA256")"
+        printf 'encryption-sha256 %s\n' "$(sha256sum -- "$ENCRYPTION_KEY" | awk '{print $1}')"
+        printf 'lookup-sha256 %s\n' "$(sha256sum -- "$LOOKUP_KEY" | awk '{print $1}')"
+        printf 'admin-sha256 %s\n' "$(sha256sum -- "$ADMIN_SECRET" | awk '{print $1}')"
+        printf 'database absent\n'
     } >"$BACKUP_DIR/persistent-identity.txt"
 else
-    printf 'state absent\n' >"$BACKUP_DIR/persistent-identity.txt"
+    printf 'state absent\ndatabase absent\n' >"$BACKUP_DIR/persistent-identity.txt"
 fi
 chmod 0600 "$BACKUP_DIR"/*.tsv "$BACKUP_DIR/source-commit.txt" "$BACKUP_DIR/persistent-identity.txt"
 refresh_manifest() {
@@ -710,6 +742,56 @@ wait_schema_health() {
     return 1
 }
 
+schema_process_identity() {
+    local pid="$1" expected_binary="$2" process_hash expected_hash stat_line stat_tail start_time
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ -r "/proc/$pid/stat" ] && [ -e "/proc/$pid/exe" ] || return 1
+    process_hash="$(sha256sum -- "/proc/$pid/exe" | awk '{print $1}')" || return 1
+    expected_hash="$(sha256sum -- "$expected_binary" | awk '{print $1}')" || return 1
+    [ "$process_hash" = "$expected_hash" ] || return 1
+    stat_line="$(cat "/proc/$pid/stat")" || return 1
+    stat_tail="${stat_line##*) }"
+    start_time="$(awk '{print $20}' <<<"$stat_tail")"
+    [[ "$start_time" =~ ^[0-9]+$ ]] || return 1
+    printf '%s:%s\n' "$start_time" "$process_hash"
+}
+
+register_schema_pid() {
+    local pid="$1" expected_binary="$2" identity
+    identity="$(schema_process_identity "$pid" "$expected_binary")" || die "schema probe process identity was not established"
+    SCHEMA_TEST_IDENTITIES["$pid"]="$identity"
+    SCHEMA_TEST_BINARIES["$pid"]="$expected_binary"
+}
+
+unregister_schema_pid() {
+    local pid="$1"
+    unset 'SCHEMA_TEST_IDENTITIES['"$pid"']' 'SCHEMA_TEST_BINARIES['"$pid"']'
+}
+
+stop_registered_schema_process() {
+    local schema_pid="$1" expected_binary="$2" identity
+    identity="$(schema_process_identity "$schema_pid" "$expected_binary")" || die "schema probe process disappeared or changed identity"
+    [ "${SCHEMA_TEST_IDENTITIES[$schema_pid]:-}" = "$identity" ] || die "schema probe registry identity mismatch"
+    kill "$schema_pid"
+    wait "$schema_pid" || :
+    unregister_schema_pid "$schema_pid"
+}
+
+kill_registered_schema_processes() {
+    local pid identity expected_binary
+    for pid in "${!SCHEMA_TEST_IDENTITIES[@]}"; do
+        identity="${SCHEMA_TEST_IDENTITIES[$pid]}"
+        expected_binary="${SCHEMA_TEST_BINARIES[$pid]:-}"
+        [ -n "$expected_binary" ] || { unregister_schema_pid "$pid"; continue; }
+        if kill -0 "$pid" 2>/dev/null && [ "${SCHEMA_TEST_IDENTITIES[$pid]:-}" = "$identity" ] &&
+           [ "$(schema_process_identity "$pid" "$expected_binary" 2>/dev/null || :)" = "$identity" ]; then
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        fi
+        unregister_schema_pid "$pid"
+    done
+}
+
 restore_old_license_activity() {
     if [ "$LICENSE_WAS_ACTIVE" = true ]; then systemctl start superpan-license.service; else systemctl stop superpan-license.service; fi
 }
@@ -722,7 +804,7 @@ schema_upgrade_preflight() {
         return
     fi
     local before="$BACKUP_DIR/schema-before.db" migrated="$BACKUP_DIR/schema-migrated.db"
-    local after="$BACKUP_DIR/schema-after.db" oldcopy="$BACKUP_DIR/schema-old.db" verified="$BACKUP_DIR/schema-old-verified.db"
+    local after="$BACKUP_DIR/schema-after.db" oldcopy="$BACKUP_DIR/schema-old.db" verified="$BACKUP_DIR/schema-old-verified.db" schema_pid
     SCHEMA_NEW_CONFIG="$BACKUP_DIR/schema-new.json"
     SCHEMA_OLD_CONFIG="$BACKUP_DIR/schema-old.json"
     LICENSE_WAS_ACTIVE=false; systemctl is-active --quiet superpan-license.service && LICENSE_WAS_ACTIVE=true
@@ -732,9 +814,10 @@ schema_upgrade_preflight() {
     cp -- "$before" "$migrated"; chown root:root "$migrated"; chmod 0600 "$migrated"
     write_schema_config "$migrated" 127.0.0.1:28092 "$SCHEMA_NEW_CONFIG"
     "$BUNDLE/superpan-license" serve --config "$SCHEMA_NEW_CONFIG" >"$BACKUP_DIR/schema-new.log" 2>&1 &
-    SCHEMA_TEST_PIDS+=("$!")
+    schema_pid="$!"
+    register_schema_pid "$schema_pid" "$BUNDLE/superpan-license"
     wait_schema_health || die "new license binary failed schema migration health"
-    kill "${SCHEMA_TEST_PIDS[-1]}"; wait "${SCHEMA_TEST_PIDS[-1]}" || :
+    stop_registered_schema_process "$schema_pid" "$BUNDLE/superpan-license"
     chown root:root "$migrated" "$migrated-wal" "$migrated-shm" 2>/dev/null || :
     chmod 0600 "$migrated" "$migrated-wal" "$migrated-shm" 2>/dev/null || :
     systemctl stop superpan-license.service
@@ -743,9 +826,10 @@ schema_upgrade_preflight() {
     cp -- "$after" "$oldcopy"; chown root:root "$oldcopy"; chmod 0600 "$oldcopy"
     write_schema_config "$oldcopy" 127.0.0.1:28092 "$SCHEMA_OLD_CONFIG"
     "$BACKUP_DIR/license-binary" serve --config "$SCHEMA_OLD_CONFIG" >"$BACKUP_DIR/schema-old.log" 2>&1 &
-    SCHEMA_TEST_PIDS+=("$!")
+    schema_pid="$!"
+    register_schema_pid "$schema_pid" "$BACKUP_DIR/license-binary"
     wait_schema_health || die "old license binary cannot read migrated schema"
-    kill "${SCHEMA_TEST_PIDS[-1]}"; wait "${SCHEMA_TEST_PIDS[-1]}" || :
+    stop_registered_schema_process "$schema_pid" "$BACKUP_DIR/license-binary"
     chown root:root "$oldcopy" "$oldcopy-wal" "$oldcopy-shm" 2>/dev/null || :
     chmod 0600 "$oldcopy" "$oldcopy-wal" "$oldcopy-shm" 2>/dev/null || :
     systemctl stop superpan-license.service
@@ -786,6 +870,30 @@ record_persistent_identity() {
 record_persistent_identity
 refresh_manifest
 
+wait_for_installed_license_process() {
+    local attempt observed_pid observed_again process_hash installed_hash process_exe
+    installed_hash="$(sha256sum -- "$DEST/superpan-license" | awk '{print $1}')"
+    for attempt in $(seq 1 30); do
+        if systemctl is-active --quiet superpan-license.service; then
+            LICENSE_MAIN_PID="$(systemctl show --property=MainPID --value superpan-license.service 2>/dev/null || :)"
+            if [[ "$LICENSE_MAIN_PID" =~ ^[1-9][0-9]*$ ]] && [ -e "/proc/$LICENSE_MAIN_PID/exe" ]; then
+                process_exe="$(readlink -f -- "/proc/$LICENSE_MAIN_PID/exe" 2>/dev/null || :)"
+                process_hash="$(sha256sum -- "/proc/$LICENSE_MAIN_PID/exe" 2>/dev/null | awk '{print $1}')"
+                if [ -n "$process_exe" ] && [ "$process_hash" = "$installed_hash" ] &&
+                   curl --noproxy '*' --fail --silent --show-error --max-time 2 http://127.0.0.1:18092/internal/health >/dev/null; then
+                    observed_pid="$LICENSE_MAIN_PID"
+                    observed_again="$(systemctl show --property=MainPID --value superpan-license.service 2>/dev/null || :)"
+                    [ "$observed_again" = "$observed_pid" ] || { sleep 1; continue; }
+                    [ "$process_hash" = "$LICENSE_BINARY_SHA256" ] || die "installed license process binary hash mismatch"
+                    return 0
+                fi
+            fi
+        fi
+        sleep 1
+    done
+    die "new license service process did not become healthy with the installed binary"
+}
+
 install -m 0755 -o root -g root "$BUNDLE/superpan-license" "$DEST/superpan-license"
 failpoint license-binary
 render_license_config
@@ -795,9 +903,10 @@ install -m 0644 -o root -g root "$LICENSE_UNIT_SOURCE" /etc/systemd/system/super
 failpoint license-unit
 install -m 0644 -o root -g root "$BUNDLE/source-commit.txt" "$SOURCE_COMMIT_TARGET"
 systemctl daemon-reload
-systemctl enable --now superpan-license.service
+systemctl enable superpan-license.service >/dev/null
+systemctl restart superpan-license.service
 failpoint license-start
-curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18092/internal/health >/dev/null
+wait_for_installed_license_process
 failpoint license-health
 bash "$OTA_INSTALLER" --loopback-license-transaction \
     --binary "$BUNDLE/ota-admin" --binary-sha256 "$OTA_BINARY_SHA256" \

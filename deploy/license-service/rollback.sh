@@ -77,6 +77,7 @@ while IFS=$'\t' read -r target name presence uid gid mode hash; do
 done <"$BACKUP_ROOT/inventory.tsv"
 [ "$(wc -l <"$BACKUP_ROOT/unit-state.tsv")" -eq 2 ] || die "unit state must contain exactly two services"
 [ "$(cut -f1 "$BACKUP_ROOT/unit-state.tsv")" = $'superpan-license.service\nsuperpan-ota-admin.service' ] || die "unit state allowlist mismatch"
+[ "$(awk -F '\t' 'NF!=4 || ($4!="present" && $4!="absent") {bad=1} END {print bad+0}' "$BACKUP_ROOT/unit-state.tsv")" -eq 0 ] || die "unit wants-link state is malformed"
 
 systemctl stop superpan-ota-admin.service 2>/dev/null || :
 systemctl stop superpan-license.service 2>/dev/null || :
@@ -90,18 +91,44 @@ restore_inventory
 # Rollback never writes or removes /var/lib/superpan-license, encryption.key,
 # lookup.key, admin.secret, or response-signing key material.
 systemctl daemon-reload
+remove_transaction_wants_link() {
+    local unit="$1" link expected resolved
+    case "$unit" in
+        superpan-license.service) link=/etc/systemd/system/multi-user.target.wants/superpan-license.service ;;
+        superpan-ota-admin.service) link=/etc/systemd/system/multi-user.target.wants/superpan-ota-admin.service ;;
+        *) die "unexpected wants-link cleanup unit" ;;
+    esac
+    expected="/etc/systemd/system/$unit"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        [ -L "$link" ] || die "transaction wants path is not a symlink"
+        resolved="$(readlink -f -- "$link")" || die "transaction wants link cannot be resolved"
+        [ "$resolved" = "$expected" ] || die "transaction wants link points outside its fixed unit"
+        rm -f -- "$link"
+    fi
+}
 restore_unit_state() {
-    local unit enabled active
-    while IFS=$'\t' read -r unit enabled active; do
+    local unit enabled active wants observed
+    while IFS=$'\t' read -r unit enabled active wants; do
         case "$enabled" in
             enabled) systemctl enable "$unit" >/dev/null ;;
             enabled-runtime) systemctl enable --runtime "$unit" >/dev/null ;;
             disabled) systemctl disable "$unit" >/dev/null ;;
             masked) systemctl mask "$unit" >/dev/null ;;
             masked-runtime) systemctl mask --runtime "$unit" >/dev/null ;;
-            static|indirect|generated|transient|alias|linked|linked-runtime|not-found) ;;
+            static|indirect|generated|transient|alias|linked|linked-runtime) ;;
+            not-found)
+                systemctl disable "$unit" >/dev/null 2>&1 || :
+                [ "$wants" = absent ] || die "not-found unit unexpectedly had a prior wants link"
+                remove_transaction_wants_link "$unit"
+                ;;
             *) die "unsupported prior enablement state for $unit" ;;
         esac
+        observed="$(systemctl is-enabled "$unit" 2>/dev/null || :)"; [ -n "$observed" ] || observed=not-found
+        if [ "$enabled" = not-found ]; then
+            [ "$observed" = not-found ] || die "prior not-found unit state was not restored"
+        else
+            [ "$observed" = "$enabled" ] || die "prior unit enablement state was not restored"
+        fi
         case "$active" in active) systemctl start "$unit" ;; inactive) systemctl stop "$unit" 2>/dev/null || : ;; *) die "invalid prior active state" ;; esac
     done <"$BACKUP_ROOT/unit-state.tsv"
 }

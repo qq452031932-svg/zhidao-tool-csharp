@@ -58,11 +58,25 @@ commit 的 OTA binary/config/unit，重启并检查 `127.0.0.1:18091/admin/`。�
 创建嵌套备份，不安装或读取授权服务公共路由片段，不修改 vhost，也不执行 Nginx 检查
 或 reload。最终再次记录并核对两个已安装 binary 的 SHA-256 与 source commit。
 
+授权 unit 的 enable 与运行版本验证是两个独立步骤：安装器先 `enable`，再显式
+`restart`，最多重试 30 次 loopback health。每次成功候选还必须取得非零 MainPID，确认
+MainPID 在检查前后未变化，并验证 `/proc/<MainPID>/exe` 的 SHA-256 等于刚安装且已认证的
+授权 binary；旧进程即使仍能返回健康也不能通过此门。
+
+完整密钥集已经原子发布、但数据库尚未由服务创建，是中断后可安全重试的首次安装状态，
+审计记录明确写作 `database absent`。部分密钥集，或数据库存在但密钥集缺失/异常，仍会
+在修改前被拒绝。
+
 事务失败会保留原退出码并调用 `deploy/license-service/rollback.sh`。rollback 在恢复前
 重新校验固定备份路径、ACL、manifest、allowlist、每个 payload 的 hash 和 metadata，
 按 present/absent 恢复或删除七个枚举目标，执行 daemon-reload，再恢复两个服务原先的
 enabled/active 状态；数据库与密钥绝不覆盖或删除。若 rollback 自身失败，备份会保留，
 两个服务保持停止，并要求人工修复。
+
+若 unit 原先为 `not-found`，rollback 会在恢复 inventory、删除本次 unit 并执行
+daemon-reload 后，显式 disable，并只对两个固定的 `multi-user.target.wants` 路径验证
+symlink 目标后清理由本事务创建的链接；最后重新查询 `is-enabled`，必须恢复到记录的
+`not-found`（原先为 `disabled` 时则必须仍为 `disabled`）。
 
 1. 在现有 `ota.fanfh.cn` HTTPS `server {}` 内只加入一次下列 include 行。先备份该 vhost，除此之外不复制或改写其他站点配置。片段本身也对非 HTTPS 请求 fail closed，但仍必须只放在 HTTPS block。
 
