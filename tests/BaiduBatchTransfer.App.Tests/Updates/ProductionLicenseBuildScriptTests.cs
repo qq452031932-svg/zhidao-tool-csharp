@@ -40,6 +40,9 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("\"-p:LicenseSigningPublicKey=$LicenseSigningPublicKey\"", script, StringComparison.Ordinal);
         Assert.Contains("\"-p:LicenseCurrentSpkiPin=$CurrentTlsSpkiPin\"", script, StringComparison.Ordinal);
         Assert.Contains("\"-p:LicenseNextSpkiPin=$NextTlsSpkiPin\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseServiceUrl=$origin\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseProductId=$superPanProduct\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:ManagedBrowserHelperPackageDirectory=$helperPackage\"", script, StringComparison.Ordinal);
     }
 
     [Fact]

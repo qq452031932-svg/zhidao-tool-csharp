@@ -77,7 +77,7 @@ try {
     Remove-Item -LiteralPath $archive -Force
     $common = @('-c','Release','-p:RestoreLockedMode=true',"-p:LicenseSigningKeyId=$LicenseSigningKeyId","-p:LicenseSigningPublicKey=$LicenseSigningPublicKey","-p:LicenseCurrentSpkiPin=$CurrentTlsSpkiPin","-p:LicenseNextSpkiPin=$NextTlsSpkiPin")
     $superpan = Join-Path $stage 'superpan'; $smoke = Join-Path $stage 'smoke-nonshipping'; $probe = Join-Path $stage 'boundary-probe-nonshipping'
-    $appArgs = @('publish',(Join-Path $buildRepo 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'),'-o',$superpan) + $common + @('-p:LicenseServiceUrl='+$origin,'-p:LicenseProductId='+$superPanProduct,'-p:ManagedBrowserHelperPackageDirectory='+$helperPackage)
+    $appArgs = @('publish',(Join-Path $buildRepo 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'),'-o',$superpan) + $common + @("-p:LicenseServiceUrl=$origin","-p:LicenseProductId=$superPanProduct","-p:ManagedBrowserHelperPackageDirectory=$helperPackage")
     & dotnet @appArgs; if ($LASTEXITCODE -ne 0) { throw 'SuperPan production publish failed.' }
     & dotnet publish (Join-Path $buildRepo 'tools\license_production_smoke\SuperPan.Licensing.ProductionSmoke.csproj') -o $smoke @common; if ($LASTEXITCODE -ne 0) { throw 'Smoke publish failed.' }
     & dotnet publish (Join-Path $buildRepo 'tools\license_production_boundary_probe\SuperPan.Licensing.ProductionBoundaryProbe.csproj') -o $probe @common; if ($LASTEXITCODE -ne 0) { throw 'Boundary probe publish failed.' }
