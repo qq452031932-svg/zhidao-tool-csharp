@@ -62,7 +62,7 @@ func readTrustedFile(path string, policy trustedFilePolicy, afterOpen func()) ([
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || policy.maximumSize < 1 || policy.exactSize < 0 || policy.exactSize > policy.maximumSize || len(policy.allowedGIDs) == 0 || len(policy.allowedModes) == 0 {
 		return nil, errors.New("trusted file request is invalid")
 	}
-	root, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	root, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, errors.New("open trusted path root")
 	}
@@ -92,7 +92,7 @@ func readTrustedFile(path string, policy trustedFilePolicy, afterOpen func()) ([
 		}
 		flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
 		if index < len(components)-1 {
-			flags |= unix.O_DIRECTORY
+			flags = unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW
 		} else {
 			flags |= unix.O_NONBLOCK
 		}

@@ -754,6 +754,14 @@ func TestLicenseInstallSecretLifecycle(t *testing.T) {
 	}
 }
 
+func TestLicenseTrustedPathTraversalSupportsExecuteOnlySecretDirectories(t *testing.T) {
+	reader := read(t, "services", "ota_admin", "internal", "licensing", "config", "trusted_file_linux.go")
+	requireFragments(t, reader,
+		`unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW`,
+		`flags = unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW`,
+	)
+}
+
 func TestLicensePersistentValidationUsesTheVerifiedProtectedPath(t *testing.T) {
 	install := read(t, "deploy", "license-service", "install.sh")
 	requireFragments(t, install,
