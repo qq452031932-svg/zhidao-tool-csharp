@@ -34,6 +34,45 @@ func TestDeploymentShellScriptsAreExportedWithUnixLineEndings(t *testing.T) {
 	requireFragments(t, attributes, "*.sh text eol=lf")
 }
 
+func TestLicensePublicRouteDeploymentContract(t *testing.T) {
+	capture := read(t, "deploy", "license-service", "capture-baseline.sh")
+	enable := read(t, "deploy", "license-service", "enable-public-route.sh")
+	verify := read(t, "deploy", "license-service", "verify.sh")
+	template := read(t, "deploy", "license-service", "ota.fanfh.cn.license-api.nginx.conf")
+	requireFragments(t, capture,
+		`/var/backups/superpan-license-route`, `umask 077`, `root:root`, `0700`,
+		`active-vhost.sha256`, `include-state.txt`, `certificate.sha256`, `certificate-spki.sha256`,
+		`nginx-master.pid`, `unit-state.tsv`, `listeners.txt`, `ota-health.sha256`, `stable.sha256`,
+		`f.fanfh.cn`, `manifest.sha256`,
+	)
+	requireFragments(t, enable,
+		`--baseline`, `--snippet`, `--snippet-sha256`, `--mode`, `enable|restore`,
+		`/www/server/panel/vhost/nginx/ota.fanfh.cn.conf`,
+		`/etc/nginx/conf.d/ota.fanfh.cn.license-api.include`,
+		`include /etc/nginx/conf.d/ota.fanfh.cn.license-api.include;`,
+		`active-vhost.sha256`, `nginx -t`, `nginx -s reload`, `nginx-master.pid`,
+		`ROLLBACK_ARMED=true`, `trap transaction_exit EXIT`, `restore_pre_route_state`,
+	)
+	requireBefore(t, enable, `trap transaction_exit EXIT`, `ROLLBACK_ARMED=true`)
+	requireBefore(t, enable, `nginx -t`, `nginx -s reload`)
+	requireFragments(t, verify,
+		`--baseline`, `curl --resolve 'ota.fanfh.cn:443:127.0.0.1'`,
+		`Cache-Control`, `no-store`, `/license-api/v1/activate`, `/license-api/v1/validate`,
+		`/internal/health`, `/internal/v1/`, `18091`, `18092`, `ss -ltnp`,
+		`SERVICE_RESTORE_ARMED=true`, `trap cleanup EXIT`, `superpan-license.service`,
+		`superpan-ota-admin.service`,
+	)
+	for _, route := range []string{"activate", "validate"} {
+		block := `location = /license-api/v1/` + route
+		at := strings.Index(template, block)
+		if at < 0 { t.Fatalf("missing %s route", route) }
+		end := strings.Index(template[at:], "}\n")
+		if end < 0 || !strings.Contains(template[at:at+end], `add_header Cache-Control "no-store" always;`) {
+			t.Fatalf("%s route must force Cache-Control no-store", route)
+		}
+	}
+}
+
 func TestLicenseMaintenanceBuilder(t *testing.T) {
 	builder := read(t, "services", "ota_admin", "scripts", "build_linux_license_maintenance_tools.ps1")
 	requireFragments(t, builder,

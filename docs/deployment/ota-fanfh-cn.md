@@ -132,6 +132,30 @@ rollback 对记录的 wants `present/absent` 统一执行固定路径和目标�
 
 安装器重启服务后先等待 `systemctl is-active` 和 loopback `/admin/` 同时就绪，最多 30 秒；只有就绪且 `nginx -t` 已通过，才通过宝塔 Nginx 的绝对路径执行 `nginx -s reload`。安装器在 reload 前后绑定并检查真实 master PID，并等待本机 HTTPS `/admin/` 生效；服务未就绪、master 异常或代理未生效时会失败并保留精确备份/回滚信息。它不依赖 CentOS 7 上可能仅由 SysV generator 生成且不支持 reload 的 `nginx.service`。
 
+## 授权公网路由
+
+授权服务安装、回滚、容量、客户端签名和双 SPKI 信任检查全部通过后，才允许执行公网路由事务。先捕获固定目录下的只读基线，再以审核过的片段哈希启用：
+
+```bash
+BASELINE="$(sudo bash deploy/license-service/capture-baseline.sh | sed -n 's/^LICENSE_ROUTE_BASELINE=//p')"
+SNIPPET_SHA256="$(sha256sum deploy/license-service/ota.fanfh.cn.license-api.nginx.conf | awk '{print $1}')"
+sudo bash deploy/license-service/enable-public-route.sh \
+  --mode enable --baseline "$BASELINE" \
+  --snippet deploy/license-service/ota.fanfh.cn.license-api.nginx.conf \
+  --snippet-sha256 "$SNIPPET_SHA256"
+sudo bash deploy/license-service/verify.sh --baseline "$BASELINE"
+```
+
+脚本只在现有 HTTPS server block 的管理后台 include 前加入一次固定授权 include 行。它先校验原 vhost、基线清单和片段哈希，再执行 `nginx -t` 和 reload，并确认 Nginx master PID 不变。任何失败都会恢复本次事务开始时的 vhost/include；不会修改其他站点、静态发布内容、数据库或证书。
+
+回退公网路由时使用相同基线：
+
+```bash
+sudo bash deploy/license-service/enable-public-route.sh --mode restore --baseline "$BASELINE"
+```
+
+恢复模式只接受“当前 vhost 与基线相比恰好多出受管 include 行”的状态；发现其他并发改动会停止，不会覆盖它们。
+
 ## 验证
 
 确认环境中仍有部署前导出的三个基线值，再执行：

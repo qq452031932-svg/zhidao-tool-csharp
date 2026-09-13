@@ -274,6 +274,7 @@ func validateNginxInclude(body string) error {
 		"proxy_set_header Host ota.fanfh.cn;", "proxy_set_header X-Forwarded-Proto https;",
 		"proxy_set_header X-Real-IP $remote_addr;", "proxy_set_header X-Forwarded-For $remote_addr;",
 		"proxy_set_header X-SuperPan-Load-Test \"\";", "proxy_cache off;",
+		"add_header Cache-Control \"no-store\" always;",
 		"proxy_request_buffering on;", "client_max_body_size 64k;", "proxy_connect_timeout 5s;",
 		"proxy_read_timeout 20s;", "proxy_send_timeout 20s;",
 	}
