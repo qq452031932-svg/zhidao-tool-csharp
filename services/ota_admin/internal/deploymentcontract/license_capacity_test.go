@@ -122,14 +122,14 @@ func TestCapacityShellSyntax(t *testing.T) {
 	}
 }
 
-func TestCapacityDocumentIsUnfilledEvidenceTemplate(t *testing.T) {
+func TestCapacityDocumentRecordsObservedProductionEvidence(t *testing.T) {
 	doc := read(t, "docs", "testing", "2026-09-10-license-capacity-acceptance.md")
-	for _, want := range []string{"50 requests/second", "100 requests/second", "600 seconds", "70%", "10%", "20%", "250 ms", "0.1%", "70%", "1 GiB", "10%", "BUSY", "LOCKED", "PENDING AUTHORIZED LINUX STAGING"} {
+	for _, want := range []string{"50 requests/second", "100 requests/second", "600 seconds", "70%", "10%", "20%", "250 ms", "0.1%", "70%", "1 GiB", "10%", "BUSY", "LOCKED", "PASSED on 2026-09-13", "30,000 requests", "60,000 requests", "quick_check=ok"} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"PASS (staging)", "staging evidence: complete"} {
+	for _, forbidden := range []string{"PASS (staging)", "staging evidence: complete", "PENDING AUTHORIZED LINUX STAGING"} {
 		if strings.Contains(doc, forbidden) {
 			t.Errorf("fabricated evidence marker %q", forbidden)
 		}

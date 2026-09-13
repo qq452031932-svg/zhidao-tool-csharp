@@ -1,5 +1,11 @@
 # OTA 发布后台部署
 
+> 2026-09-13 生产记录：独立授权服务已部署到 `127.0.0.1:18092`，公网仅启用
+> `/license-api/v1/activate` 与 `/license-api/v1/validate`。授权路由完整回退并重新
+> 应用的演练已通过；`superpan-license` 与 `superpan-ota-admin` 均为 active，Nginx
+> master PID 在所有 reload 前后保持 `9117`。生产证书最终恢复为 TLS A。已验证 OTA
+> `/health`、stable 内容及其他 vhost 未被授权服务的停启或路由事务改变。
+
 本文只覆盖现有 `ota.fanfh.cn` HTTPS 静态 OTA 站点上的 `/admin/` 发布后台。现有 `/health`、ACME 验证、证书续期和 `releases/win-x64/stable` 静态服务均保留原配置；发布后台停止时，稳定渠道仍由 Nginx 直接下载。
 
 ## 部署边界

@@ -1,11 +1,11 @@
 # 授权部署工作交接（2026-09-11）
 
-## 当前工作区
+## 当前工作区（2026-09-13 更新）
 
 - 工作树：`.worktrees/license-production-deploy`
 - 分支：`codex/license-production-deploy`
-- 当前状态：工作树干净
-- 最近提交：`d217cb9 fix: traverse signed client paths safely`
+- 当前状态：生产部署与验收完成；待提交最终脱敏证据
+- 已安装二进制源提交：`63c72139a02ece768a82bcc1b2bc8fa15c0b6f90`
 
 ## 已完成并提交
 
@@ -36,19 +36,23 @@
 5. Task 6 最终规格/质量审阅通过；相关 Go 定向包测试全部通过。
 6. Task 7 最终规格/质量审阅通过；生产构建门禁 49 项、smoke/probe 2 项通过，两个 PowerShell 脚本 AST 解析及路径遍历实测通过。
 
-## 尚未完成（不要误判为已验收）
+## 生产完成项
 
-- 尚未在获授权的 Linux staging `MainPID` 上执行 20 分钟完整容量负载。
-- 尚未在 Linux/systemd v219 主机执行安装器或回滚器。
-- 尚未连接 staging 或生产服务器。
-- 尚未启用公网 Nginx 授权路由。
-- 尚未从获授权的已安装服务读取正式 key ID/P-256 SPKI，也未取得 staging TLS A/B/C 和签名客户端的真实轮换证据。
+- 已在获授权的 CentOS 7/systemd 219 主机安装同提交 OTA 与授权服务，未清理任何
+  原有项目、站点、发布代或稳定链接。
+- 50/100 RPS 各 10 分钟容量验收通过，数据库 `quick_check` 和聚合不变量通过。
+- 正式响应签名身份、A/B/C TLS SPKI、Windows 自签名 Authenticode 身份均已校验。
+- A→B→A、B→C、30 分钟离线边界、真实多产品管理流程均通过。
+- 授权公网路由已完成“启用→完整恢复→重新启用”的事务演练和最终验证。
+- 验收卡已删除；两条软件记录按计划停用保留，验收套餐带
+  `DEPLOYMENT-SMOKE-RETAINED` 标记保留。
 
-## 下一步建议
+## 后续运维
 
-1. 由用户明确指定 disposable Linux staging 主机、快照/恢复边界和维护窗口。
-2. 获得对该主机 SSH、上传同提交 bundle、启动临时 systemd unit、运行容量验收和切换 staging TLS A/B/A 的明确授权。
-3. 只在获授权 staging 上记录脱敏容量、数据库、签名身份和轮换证据；生产公网路由与 Nginx 继续保持不变。
+1. 分发 A/B 双 pin 的正式 SuperPan 客户端；B/C 构建仅作为下一次证书轮换准备。
+2. Windows 自签名证书不会自动获得 SmartScreen 信誉，也不会静默安装到用户信任库。
+3. SSH 密钥化、限制 root 密码登录与防扫描属于单独变更，尚未执行，避免在本次部署中
+   扩大服务器修改范围。
 
 ## 服务器边界
 
