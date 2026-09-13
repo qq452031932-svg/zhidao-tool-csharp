@@ -35,7 +35,8 @@ function Read-VerifiedClientRoot([string]$Root) {
     foreach ($file in @($value.files)) {
         if ($file.path -notmatch '^(superpan|smoke-nonshipping|boundary-probe-nonshipping)/[^/].*$' -or $file.path -match '\.\.') { throw 'Manifest file path is invalid.' }
         $path = [IO.Path]::GetFullPath((Join-Path $root $file.path.Replace('/',[IO.Path]::DirectorySeparatorChar)))
-        if (-not $path.StartsWith($root.TrimEnd([IO.Path]::DirectorySeparatorChar)+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase) -or -not $expected.TryAdd($path,$file.sha256)) { throw 'Manifest path escapes or duplicates.' }
+        if (-not $path.StartsWith($root.TrimEnd([IO.Path]::DirectorySeparatorChar)+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase) -or $expected.ContainsKey($path)) { throw 'Manifest path escapes or duplicates.' }
+        $expected.Add($path,$file.sha256)
     }
     $actual = @(foreach ($role in @('superpan','smoke-nonshipping','boundary-probe-nonshipping')) { Get-ChildItem -LiteralPath (Join-Path $root $role) -File -Recurse | Select-Object -ExpandProperty FullName })
     if ($actual.Count -ne $expected.Count) { throw 'Client tree contains missing or extra files.' }

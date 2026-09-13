@@ -75,6 +75,9 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("signtool.exe", script, StringComparison.Ordinal);
         Assert.Contains("Assert-NoReparseContainedPath", script, StringComparison.Ordinal);
         Assert.Contains("$cursor=$cursor.Parent", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TryAdd(", script, StringComparison.Ordinal);
+        Assert.Contains("$expected.ContainsKey($path)", script, StringComparison.Ordinal);
+        Assert.Contains("$expected.Add($path,$file.sha256)", script, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>
