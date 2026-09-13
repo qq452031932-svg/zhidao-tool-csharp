@@ -974,6 +974,28 @@ func TestLicenseRestartProvesNewProcessIdentity(t *testing.T) {
 	if restartAt < 0 || readyCallAt < 0 || restartAt >= readyCallAt { t.Fatal("new process readiness must run after explicit restart") }
 }
 
+func TestSchemaProbeUsesTheExplicitSharedGroupContext(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`command -v setpriv`,
+		`SCHEMA_SHARED_GID=`,
+		`setpriv --groups "$SCHEMA_SHARED_GID" -- "$BUNDLE/superpan-license" serve`,
+		`setpriv --groups "$SCHEMA_SHARED_GID" -- "$BACKUP_DIR/license-binary" serve`,
+	)
+}
+
+func TestFailedSchemaPreflightResealsTheAllowlistedRollbackManifest(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	start := strings.Index(install, "transaction_exit()")
+	end := strings.Index(install[start:], "trap transaction_exit EXIT")
+	if start < 0 || end < 0 {
+		t.Fatal("transaction exit handler was not found")
+	}
+	handler := install[start : start+end]
+	requireBefore(t, handler, `kill_registered_schema_processes`, `refresh_manifest`)
+	requireBefore(t, handler, `refresh_manifest`, `bash "$ROLLBACK_SCRIPT" "$TRANSACTION_BACKUP"`)
+}
+
 func TestPersistentKeysWithoutDatabaseIsRetryableFirstInstall(t *testing.T) {
 	install := read(t, "deploy", "license-service", "install.sh")
 	harness := read(t, "deploy", "license-service", "test-install-v219.sh")

@@ -42,6 +42,7 @@ OLD_LICENSE_BINARY_SHA256=""
 OLD_LICENSE_SOURCE_COMMIT_SHA256=""
 SCHEMA_OLD_CONFIG_SHA256=""
 INSTALL_STATE="initial"
+SCHEMA_SHARED_GID=""
 
 usage() {
     cat >&2 <<'USAGE'
@@ -137,6 +138,7 @@ for required in --bundle --source-commit --ota-binary-sha256 --license-binary-sh
     require_seen "$required"
 done
 [ "$(id -u)" -eq 0 ] || die "install.sh must run as root"
+command -v setpriv >/dev/null || die "setpriv is required"
 case "$BUNDLE" in /*) ;; *) die "bundle path must be absolute and canonical" ;; esac
 validate_trusted_path "$BUNDLE"
 BUNDLE_CANONICAL="$(readlink -f -- "$BUNDLE")" || die "bundle path cannot be canonicalized"
@@ -488,7 +490,7 @@ transaction_exit() {
     if declare -F kill_registered_schema_processes >/dev/null; then kill_registered_schema_processes; fi
     if declare -F cleanup_persistent_transaction >/dev/null; then cleanup_persistent_transaction; fi
     if [ "$TRANSACTION_ARMED" = true ] && [ "$TRANSACTION_MUTATED" = true ] && [ "$TRANSACTION_SUCCEEDED" != true ]; then
-        if [ -f "$TRANSACTION_BACKUP/manifest.sha256" ]; then
+        if declare -F refresh_manifest >/dev/null && refresh_manifest && [ -f "$TRANSACTION_BACKUP/manifest.sha256" ]; then
             if ! bash "$ROLLBACK_SCRIPT" "$TRANSACTION_BACKUP"; then
                 systemctl stop superpan-ota-admin.service superpan-license.service 2>/dev/null
                 echo "ERROR: automatic rollback failed; backup retained; services remain stopped for manual repair: $TRANSACTION_BACKUP" >&2
@@ -624,6 +626,8 @@ fi
 usermod --gid "$LICENSE_GROUP" --groups "$SHARED_GROUP" "$LICENSE_USER"
 usermod --gid "$OTA_GROUP" --groups "$SHARED_GROUP" "$OTA_USER"
 assert_exact_identity_after_creation
+SCHEMA_SHARED_GID="$(getent group "$SHARED_GROUP" | awk -F: 'NF == 4 && $3 ~ /^[0-9]+$/ { print $3 }')"
+[[ "$SCHEMA_SHARED_GID" =~ ^[0-9]+$ ]] || die "shared schema probe group is invalid"
 failpoint identity
 
 install -d -m 0755 -o root -g root "$DEST"
@@ -961,7 +965,7 @@ schema_upgrade_preflight() {
     restore_old_license_activity
     cp -- "$before" "$migrated"; chown root:root "$migrated"; chmod 0600 "$migrated"
     write_schema_config "$migrated" 127.0.0.1:28092 "$SCHEMA_NEW_CONFIG"
-    "$BUNDLE/superpan-license" serve --config "$SCHEMA_NEW_CONFIG" >"$BACKUP_DIR/schema-new.log" 2>&1 &
+    setpriv --groups "$SCHEMA_SHARED_GID" -- "$BUNDLE/superpan-license" serve --config "$SCHEMA_NEW_CONFIG" >"$BACKUP_DIR/schema-new.log" 2>&1 &
     schema_pid="$!"
     register_schema_pid "$schema_pid" "$BUNDLE/superpan-license"
     wait_schema_health || die "new license binary failed schema migration health"
@@ -986,7 +990,7 @@ schema_upgrade_preflight() {
     write_schema_config "$oldcopy" 127.0.0.1:28092 "$SCHEMA_OLD_CONFIG"
     SCHEMA_OLD_CONFIG_SHA256="$(sha256sum -- "$SCHEMA_OLD_CONFIG" | awk '{print $1}')"
     validate_schema_backup_executable
-    "$BACKUP_DIR/license-binary" serve --config "$SCHEMA_OLD_CONFIG" >"$BACKUP_DIR/schema-old.log" 2>&1 &
+    setpriv --groups "$SCHEMA_SHARED_GID" -- "$BACKUP_DIR/license-binary" serve --config "$SCHEMA_OLD_CONFIG" >"$BACKUP_DIR/schema-old.log" 2>&1 &
     schema_pid="$!"
     register_schema_pid "$schema_pid" "$BACKUP_DIR/license-binary"
     wait_schema_health || die "old license binary cannot read migrated schema"
