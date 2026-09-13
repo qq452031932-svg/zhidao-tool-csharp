@@ -6,3 +6,4 @@ tools/managed_browser_helper/requirements.lock text eol=lf
 tools/managed_browser_helper/helper-manifest.json text eol=lf
 tools/managed_browser_helper/license-inputs/* text eol=lf
 tools/managed_browser_helper/THIRD_PARTY_NOTICES.txt text eol=lf whitespace=-blank-at-eol,-blank-at-eof
+*.sh text eol=lf

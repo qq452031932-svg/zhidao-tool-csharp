@@ -29,6 +29,11 @@ func requireBefore(t *testing.T, body, earlier, later string) {
 	}
 }
 
+func TestDeploymentShellScriptsAreExportedWithUnixLineEndings(t *testing.T) {
+	attributes := read(t, ".gitattributes")
+	requireFragments(t, attributes, "*.sh text eol=lf")
+}
+
 func TestLicenseMaintenanceBuilder(t *testing.T) {
 	builder := read(t, "services", "ota_admin", "scripts", "build_linux_license_maintenance_tools.ps1")
 	requireFragments(t, builder,
