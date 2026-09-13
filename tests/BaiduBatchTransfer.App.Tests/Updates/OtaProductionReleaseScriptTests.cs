@@ -130,6 +130,8 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("$productionPackageId = 'SuperPan.BaiduBatchTransfer'", script, StringComparison.Ordinal);
         Assert.Contains("$productionChannel = 'win-x64-stable'", script, StringComparison.Ordinal);
         Assert.Contains("'--signParams',$signParams", script, StringComparison.Ordinal);
+        Assert.Contains("$timestampUri.AbsoluteUri -cne 'http://timestamp.digicert.com/'", script, StringComparison.Ordinal);
+        Assert.Contains("approved DigiCert RFC 3161 endpoint", script, StringComparison.Ordinal);
         Assert.Contains("RSASignaturePadding]::Pkcs1", script, StringComparison.Ordinal);
         Assert.Contains("verify-production-directory", script, StringComparison.Ordinal);
         Assert.Contains("verify-reopened-production-zip", script, StringComparison.Ordinal);

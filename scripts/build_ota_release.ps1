@@ -220,9 +220,10 @@ function Invoke-ProductionRelease {
         Assert-SafeProductionUriText $TimestampUrl 'TimestampUrl'
         $timestampUri = $null
         if (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri) -or
-            $timestampUri.Scheme -cne 'https' -or -not [string]::IsNullOrEmpty($timestampUri.UserInfo) -or
+            $timestampUri.AbsoluteUri -cne 'http://timestamp.digicert.com/' -or
+            -not [string]::IsNullOrEmpty($timestampUri.UserInfo) -or
             -not [string]::IsNullOrEmpty($timestampUri.Query) -or -not [string]::IsNullOrEmpty($timestampUri.Fragment)) {
-            throw 'TimestampUrl must be an absolute HTTPS URL without credentials, query, or fragment.'
+            throw 'TimestampUrl must be the approved DigiCert RFC 3161 endpoint.'
         }
     }
 
