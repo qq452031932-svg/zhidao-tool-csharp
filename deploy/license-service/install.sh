@@ -882,8 +882,16 @@ schema_process_identity() {
 }
 
 register_schema_pid() {
-    local pid="$1" expected_binary="$2" identity
-    identity="$(schema_process_identity "$pid" "$expected_binary")" || die "schema probe process identity was not established"
+    local pid="$1" expected_binary="$2" identity="" attempt
+    # setpriv replaces itself with the service through execve. On a loaded host,
+    # /proc can briefly expose the pre-exec image after $! has been assigned.
+    for attempt in {1..100}; do
+        identity="$(schema_process_identity "$pid" "$expected_binary" 2>/dev/null || :)"
+        [ -n "$identity" ] && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    [ -n "$identity" ] || die "schema probe process identity was not established"
     SCHEMA_TEST_IDENTITIES["$pid"]="$identity"
     SCHEMA_TEST_BINARIES["$pid"]="$expected_binary"
 }

@@ -1042,6 +1042,7 @@ func TestSchemaProbePIDRegistryPreventsPIDReuseKills(t *testing.T) {
 		`declare -A SCHEMA_TEST_IDENTITIES=()`, `register_schema_pid`, `unregister_schema_pid`,
 		`kill_registered_schema_processes`, `/proc/$pid/stat`, `/proc/$pid/exe`,
 		`[ "${SCHEMA_TEST_IDENTITIES[$pid]:-}" = "$identity" ]`,
+		`for attempt in {1..100}; do`, `sleep 0.05`,
 	)
 	requireBefore(t, install, `kill "$schema_pid"`, `wait "$schema_pid"`)
 	requireBefore(t, install, `wait "$schema_pid"`, `unregister_schema_pid "$schema_pid"`)
