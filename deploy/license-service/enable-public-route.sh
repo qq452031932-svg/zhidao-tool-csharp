@@ -4,6 +4,7 @@ umask 077
 
 ACTIVE_VHOST=/www/server/panel/vhost/nginx/ota.fanfh.cn.conf
 ROUTE_INCLUDE=/etc/nginx/conf.d/ota.fanfh.cn.license-api.include
+ROUTE_INCLUDE_PARENT=/etc/nginx/conf.d
 INCLUDE_LINE='include /etc/nginx/conf.d/ota.fanfh.cn.license-api.include;'
 BACKUP_ROOT=/var/backups/superpan-license-route
 NGINX=/www/server/nginx/sbin/nginx
@@ -30,12 +31,14 @@ case "$BASELINE" in "$BACKUP_ROOT"/baseline-*) ;; *) die "baseline is outside th
 
 TRANSACTION="$(mktemp -d "$BACKUP_ROOT/transaction.XXXXXX")"
 cp -a -- "$ACTIVE_VHOST" "$TRANSACTION/active-vhost.conf"
+INCLUDE_PARENT_CREATED=false
 if [ -e "$ROUTE_INCLUDE" ]; then cp -a -- "$ROUTE_INCLUDE" "$TRANSACTION/route-include.conf"; else : >"$TRANSACTION/include-was-absent"; fi
 ROLLBACK_ARMED=false
 restore_pre_route_state() {
     cp -a -- "$TRANSACTION/active-vhost.conf" "$ACTIVE_VHOST"
     if [ -f "$TRANSACTION/include-was-absent" ]; then rm -f -- "$ROUTE_INCLUDE"; else cp -a -- "$TRANSACTION/route-include.conf" "$ROUTE_INCLUDE"; fi
     "$NGINX" -t && "$NGINX" -s reload
+    if [ "$INCLUDE_PARENT_CREATED" = true ]; then rmdir -- "$ROUTE_INCLUDE_PARENT"; fi
 }
 transaction_exit() {
     local status=$?
@@ -48,6 +51,12 @@ trap transaction_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 ROLLBACK_ARMED=true
+if [ ! -e "$ROUTE_INCLUDE_PARENT" ]; then
+    install -d -m 0755 -o root -g root "$ROUTE_INCLUDE_PARENT"
+    INCLUDE_PARENT_CREATED=true
+elif [ ! -d "$ROUTE_INCLUDE_PARENT" ] || [ -L "$ROUTE_INCLUDE_PARENT" ]; then
+    die "route include parent is not a regular directory"
+fi
 
 EXPECTED_VHOST_SHA256="$(cat "$BASELINE/active-vhost.sha256")"
 BEFORE_PID="$(tr -d '[:space:]' <"$NGINX_PID_FILE")"
@@ -73,6 +82,7 @@ else
     cmp -s "$ACTIVE_VHOST.new" "$BASELINE/active-vhost.conf" || die "vhost has changes beyond the managed include line"
     cp -a -- "$BASELINE/active-vhost.conf" "$ACTIVE_VHOST"
     if [ "$(cat "$BASELINE/include-state.txt")" = absent ]; then rm -f -- "$ROUTE_INCLUDE"; else cp -a -- "$BASELINE/route-include.conf" "$ROUTE_INCLUDE"; fi
+    if [ "$INCLUDE_PARENT_CREATED" = true ]; then rmdir -- "$ROUTE_INCLUDE_PARENT"; fi
 fi
 
 # The absolute-path invocations below are the required nginx -t / nginx -s reload transaction.

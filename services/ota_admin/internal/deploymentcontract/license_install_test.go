@@ -49,6 +49,7 @@ func TestLicensePublicRouteDeploymentContract(t *testing.T) {
 		`--baseline`, `--snippet`, `--snippet-sha256`, `--mode`, `enable|restore`,
 		`/www/server/panel/vhost/nginx/ota.fanfh.cn.conf`,
 		`/etc/nginx/conf.d/ota.fanfh.cn.license-api.include`,
+		`ROUTE_INCLUDE_PARENT`, `INCLUDE_PARENT_CREATED`, `install -d -m 0755 -o root -g root`, `rmdir -- "$ROUTE_INCLUDE_PARENT"`,
 		`include /etc/nginx/conf.d/ota.fanfh.cn.license-api.include;`,
 		`active-vhost.sha256`, `nginx -t`, `nginx -s reload`, `nginx-master.pid`,
 		`ROLLBACK_ARMED=true`, `trap transaction_exit EXIT`, `restore_pre_route_state`,
