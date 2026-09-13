@@ -35,12 +35,29 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return runCompatProbe(arguments[1:], stdout, stderr)
 	case "init-admin":
 		return runInitAdmin(arguments[1:], stdout, stderr)
+	case "publish-bundle":
+		return runPublishBundle(arguments[1:], stdout, stderr)
 	case "serve":
 		return runServe(arguments[1:], stdout, stderr)
 	default:
 		writeUsage(stderr)
 		return 2
 	}
+}
+
+func runPublishBundle(arguments []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("publish-bundle", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "", "root-owned service configuration file")
+	bundlePath := flags.String("bundle", "", "validated production upload bundle")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if *configPath == "" || *bundlePath == "" || flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: ota-admin publish-bundle --config PATH --bundle PATH")
+		return 2
+	}
+	return runPublishBundleFiles(*configPath, *bundlePath, stdout, stderr)
 }
 
 func runCheckConfig(arguments []string, stdout, stderr io.Writer) int {

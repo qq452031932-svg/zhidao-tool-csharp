@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -16,8 +17,11 @@ import (
 	"testing"
 	"time"
 
+	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/config"
+	"fanfh.cn/superpan/ota-admin/internal/deploy"
 	"fanfh.cn/superpan/ota-admin/internal/store"
+	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
 
 func TestRunCheckConfigValidatesProductionWithoutOpeningState(t *testing.T) {
@@ -43,6 +47,65 @@ func TestRunCheckConfigValidatesProductionWithoutOpeningState(t *testing.T) {
 	}
 	if _, err := os.Stat("/var/lib/superpan-ota-admin/state.db"); err == nil {
 		t.Fatal("check-config opened production state")
+	}
+}
+
+func TestRunRecognizesPublishBundleCommand(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"publish-bundle"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("code = %d, want 2 for missing required flags", code)
+	}
+	if strings.Contains(stderr.String(), "usage: ota-admin <") || !strings.Contains(stderr.String(), "usage: ota-admin publish-bundle") {
+		t.Fatalf("stderr = %q, want publish-bundle usage", stderr.String())
+	}
+}
+
+type recordingBundleReceiver struct{}
+
+func (recordingBundleReceiver) Receive(context.Context, io.Reader, int64) (*upload.Envelope, error) {
+	return &upload.Envelope{}, nil
+}
+
+type recordingCandidateAcceptor struct{ sessionID string }
+
+func (acceptor *recordingCandidateAcceptor) AcceptNewEnvelopeForActiveSession(_ context.Context, sessionID, operationID string, _ *upload.Envelope) (candidate.Summary, error) {
+	acceptor.sessionID = sessionID
+	return candidate.Summary{CandidateID: "11111111-1111-4111-8111-111111111111", OperationID: operationID, State: string(store.CandidateValidated)}, nil
+}
+
+type recordingBundlePublisher struct{ sessionID string }
+
+func (publisher *recordingBundlePublisher) PublishForActiveSession(_ context.Context, sessionID, candidateID, operationID string) (deploy.PublishResult, error) {
+	publisher.sessionID = sessionID
+	return deploy.PublishResult{CandidateID: candidateID, OperationID: operationID, ReleaseID: operationID, Version: "1.1.0", State: "succeeded"}, nil
+}
+
+func TestPublishBundleWithComponentsRevokesTemporarySession(t *testing.T) {
+	stateRoot := t.TempDir()
+	if err := os.Chmod(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(stateRoot, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	bundlePath := filepath.Join(stateRoot, "bundle.zip")
+	if err := os.WriteFile(bundlePath, []byte("test bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	acceptor := &recordingCandidateAcceptor{}
+	publisher := &recordingBundlePublisher{}
+	random := bytes.NewReader(bytes.Repeat([]byte{0x42}, 128))
+	now := time.Unix(1_800_000_000, 0).UTC()
+	result, err := publishBundleWithComponents(context.Background(), bundlePath, database, recordingBundleReceiver{}, acceptor, publisher, random, func() time.Time { return now })
+	if err != nil || result.Version != "1.1.0" || acceptor.sessionID == "" || publisher.sessionID != acceptor.sessionID {
+		t.Fatalf("result=%+v acceptor=%q publisher=%q err=%v", result, acceptor.sessionID, publisher.sessionID, err)
+	}
+	persisted, err := database.Session(context.Background(), acceptor.sessionID)
+	if err != nil || persisted.State != store.SessionRevoked {
+		t.Fatalf("temporary session=%+v err=%v, want revoked", persisted, err)
 	}
 }
 
