@@ -41,6 +41,13 @@ func TestOpenCreatesIsolatedLicenseSchemaAndConfiguresSQLite(t *testing.T) {
 	if busyTimeout < 1000 {
 		t.Fatalf("busy_timeout = %d, want at least 1000", busyTimeout)
 	}
+	var cacheSize int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA cache_size`).Scan(&cacheSize); err != nil {
+		t.Fatal(err)
+	}
+	if cacheSize != -256 {
+		t.Fatalf("cache_size = %d, want -256 KiB per connection", cacheSize)
+	}
 	var versionDDL string
 	if err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='license_schema_version'`).Scan(&versionDDL); err != nil {
 		t.Fatal(err)

@@ -421,6 +421,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	query := u.Query()
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMilliseconds))
+	query.Add("_pragma", "cache_size(-256)")
 	u.RawQuery = query.Encode()
 	metrics := &metricCounters{}
 	db := sql.OpenDB(newMetricsConnector(u.String(), metrics))
