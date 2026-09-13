@@ -17,7 +17,7 @@ func TestCapacityUnitParsesAndMatchesProductionIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"User", "Group", "SupplementaryGroups", "UMask", "NoNewPrivileges", "PrivateTmp", "PrivateDevices", "ProtectSystem", "ProtectHome", "InaccessibleDirectories", "CapabilityBoundingSet", "RestrictAddressFamilies", "LimitNOFILE", "TimeoutStopSec"} {
+	for _, key := range []string{"User", "Group", "SupplementaryGroups", "UMask", "Environment", "NoNewPrivileges", "PrivateTmp", "PrivateDevices", "ProtectSystem", "ProtectHome", "InaccessibleDirectories", "CapabilityBoundingSet", "RestrictAddressFamilies", "LimitNOFILE", "TimeoutStopSec"} {
 		if !reflect.DeepEqual(load["Service"][key], prod["Service"][key]) {
 			t.Errorf("%s differs: load=%v prod=%v", key, load["Service"][key], prod["Service"][key])
 		}

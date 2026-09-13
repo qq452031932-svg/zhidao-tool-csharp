@@ -8,6 +8,7 @@ User=superpan-license
 Group=superpan-license
 SupplementaryGroups=superpan-license-admin
 UMask=0077
+Environment=GOMEMLIMIT=12MiB
 ExecStartPre=/bin/sh -ec 'actual=$$(id -Gn | tr " " "\n" | LC_ALL=C sort | tr "\n" " "); test "$$actual" = "superpan-license superpan-license-admin "'
 WorkingDirectory=/var/lib/license-capacity-18093
 ExecStart=/opt/superpan-license/superpan-license serve --config /etc/superpan-license-capacity-18093/config.json
