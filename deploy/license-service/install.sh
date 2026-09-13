@@ -261,8 +261,17 @@ exact_groups() {
 }
 
 assert_exact_identity_before_mutation() {
-    if id -u "$LICENSE_USER" >/dev/null 2>&1; then exact_groups "$LICENSE_USER" "$LICENSE_GROUP"; fi
-    if id -u "$OTA_USER" >/dev/null 2>&1; then exact_groups "$OTA_USER" "$OTA_GROUP"; fi
+    local user primary actual expected
+    for user in "$LICENSE_USER" "$OTA_USER"; do
+        if [ "$user" = "$LICENSE_USER" ]; then primary="$LICENSE_GROUP"; else primary="$OTA_GROUP"; fi
+        if id -u "$user" >/dev/null 2>&1; then
+            [ "$(id -gn "$user")" = "$primary" ] || die "service user $user has unexpected primary group"
+            actual="$(id -Gn "$user" | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd, -)"
+            expected="$(printf '%s\n%s\n' "$primary" "$SHARED_GROUP" | LC_ALL=C sort -u | paste -sd, -)"
+            [ "$actual" = "$primary" ] || [ "$actual" = "$expected" ] ||
+                die "service user $user has unexpected pre-install supplementary groups"
+        fi
+    done
 }
 
 assert_exact_identity_after_creation() {

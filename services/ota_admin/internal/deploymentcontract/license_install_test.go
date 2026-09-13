@@ -689,6 +689,8 @@ func TestLicenseInstallIdentity(t *testing.T) {
 		`LICENSE_GROUP="superpan-license"`, `OTA_GROUP="superpan-ota-admin"`,
 		`SHARED_GROUP="superpan-license-admin"`,
 		`assert_exact_identity_before_mutation`, `assert_exact_identity_after_creation`,
+		`[ "$actual" = "$primary" ] || [ "$actual" = "$expected" ]`,
+		`service user $user has unexpected pre-install supplementary groups`,
 		`useradd --system --gid "$LICENSE_GROUP" --groups "$SHARED_GROUP"`,
 		`useradd --system --gid "$OTA_GROUP" --groups "$SHARED_GROUP"`,
 	)
