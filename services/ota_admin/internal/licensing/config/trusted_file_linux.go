@@ -51,7 +51,7 @@ func readSharedFile(path string, exactSize, maximumSize int64) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("exactly one supplementary group is required")
 	}
-	policy, err := sharedFilePolicy(groups, exactSize, maximumSize)
+	policy, err := sharedFilePolicyForProcessGroups(groups, os.Getgid(), exactSize, maximumSize)
 	if err != nil {
 		return nil, err
 	}

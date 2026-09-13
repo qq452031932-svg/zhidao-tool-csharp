@@ -294,3 +294,25 @@ func sharedFilePolicy(groups []int, exactSize, maximumSize int64) (trustedFilePo
 		allowedModes: map[os.FileMode]struct{}{0o600: {}, 0o640: {}},
 	}, nil
 }
+
+func sharedFilePolicyForProcessGroups(groups []int, primaryGID int, exactSize, maximumSize int64) (trustedFilePolicy, error) {
+	if primaryGID < 0 {
+		return trustedFilePolicy{}, errors.New("primary group is invalid")
+	}
+	supplementary := make([]int, 0, len(groups))
+	seen := make(map[int]struct{}, len(groups))
+	for _, group := range groups {
+		if group < 0 {
+			return trustedFilePolicy{}, errors.New("supplementary group is invalid")
+		}
+		if group == primaryGID {
+			continue
+		}
+		if _, exists := seen[group]; exists {
+			return trustedFilePolicy{}, errors.New("supplementary group is duplicated")
+		}
+		seen[group] = struct{}{}
+		supplementary = append(supplementary, group)
+	}
+	return sharedFilePolicy(supplementary, exactSize, maximumSize)
+}
