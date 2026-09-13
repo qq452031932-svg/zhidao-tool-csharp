@@ -905,6 +905,14 @@ func TestLoopbackOTAControlledApplyContract(t *testing.T) {
 	}
 }
 
+func TestOTARuntimeReadsTheAdminSecretThroughTheSupplementaryGroupPolicy(t *testing.T) {
+	serve := read(t, "services", "ota_admin", "cmd", "ota-admin", "serve.go")
+	requireFragments(t, serve, `licenseconfig.ReadSharedSecret32(cfg.LicenseAdminSecretPath)`)
+	if strings.Contains(serve, `config.ReadTrustedFile(cfg.LicenseAdminSecretPath`) {
+		t.Fatal("OTA runtime reads the shared admin secret through its primary-group-only config reader")
+	}
+}
+
 func TestLicenseRollbackRestoresBothServicesAndStates(t *testing.T) {
 	rollback := read(t, "deploy", "license-service", "rollback.sh")
 	requireFragments(t, rollback,

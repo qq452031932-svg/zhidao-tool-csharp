@@ -23,6 +23,7 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/deploy"
 	"fanfh.cn/superpan/ota-admin/internal/httpapi"
 	"fanfh.cn/superpan/ota-admin/internal/licenseadmin"
+	licenseconfig "fanfh.cn/superpan/ota-admin/internal/licensing/config"
 	"fanfh.cn/superpan/ota-admin/internal/operation"
 	"fanfh.cn/superpan/ota-admin/internal/publisher"
 	"fanfh.cn/superpan/ota-admin/internal/release"
@@ -36,7 +37,6 @@ const (
 	maximumSourceHMACKeyBytes        = 65
 	maximumAPIJSONBytes              = 64 << 10
 	maximumLicenseAdminResponseBytes = 8 << 20
-	licenseAdminSecretBytes          = 32
 	loginPreauthorizationLifetime    = 5 * time.Minute
 )
 
@@ -99,7 +99,7 @@ func serve(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) err
 		return err
 	}
 	defer clear(sourceHMACKey)
-	licenseSecret, err := config.ReadTrustedFile(cfg.LicenseAdminSecretPath, licenseAdminSecretBytes)
+	licenseSecret, err := licenseconfig.ReadSharedSecret32(cfg.LicenseAdminSecretPath)
 	if err != nil {
 		return errors.New("load license admin credential")
 	}
