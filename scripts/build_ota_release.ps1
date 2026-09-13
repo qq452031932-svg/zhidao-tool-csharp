@@ -357,6 +357,7 @@ function Invoke-ProductionRelease {
             'global.json',
             'NuGet.Config',
             '.config/dotnet-tools.json',
+            'eng/license/ProductionLicenseTrust.targets',
             'eng/ota/SuperPan.OtaPublisher.cer',
             'eng/ota/production-source-overrides.sha256',
             'scripts/Test-OtaUploadBundle.ps1',

@@ -136,6 +136,7 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("rev-parse", script, StringComparison.Ordinal);
         Assert.Contains("ls-tree", script, StringComparison.Ordinal);
         Assert.Contains("production-source-overrides.sha256", script, StringComparison.Ordinal);
+        Assert.Contains("eng/license/ProductionLicenseTrust.targets", script, StringComparison.Ordinal);
         Assert.Contains("Reviewed production source override hash differs", script, StringComparison.Ordinal);
         Assert.Contains("Staged reviewed production source override hash differs", script, StringComparison.Ordinal);
         Assert.DoesNotContain("git -C $Source ls-files", script, StringComparison.Ordinal);
