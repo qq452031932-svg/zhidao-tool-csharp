@@ -177,6 +177,7 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("lib/app/BaiduBatchTransfer.App.exe", validator, StringComparison.Ordinal);
         Assert.Contains("Every executable carried by an inner archive", validator, StringComparison.Ordinal);
         Assert.Contains("$publisherTimestampRequired", validator, StringComparison.Ordinal);
+        Assert.Contains("$ExpectedPackageVersion -ceq $currentVersion", validator, StringComparison.Ordinal);
         Assert.Contains("current/BaiduBatchTransfer.App.exe", validator, StringComparison.Ordinal);
         Assert.Contains("lib/app/BaiduBatchTransfer.App.exe", validator, StringComparison.Ordinal);
         Assert.Contains("Publisher certificate SPKI pin does not match", validator, StringComparison.Ordinal);

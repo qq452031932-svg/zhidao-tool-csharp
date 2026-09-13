@@ -651,7 +651,8 @@ try {
                 $executableIndex++
                 $input = $requiredEntry.Open(); $output = [IO.File]::Create($destination)
                 try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
-                $publisherTimestampRequired = $RequireTimestamp.IsPresent -and $requiredName -in @(
+                $publisherTimestampRequired = $RequireTimestamp.IsPresent -and
+                    $ExpectedPackageVersion -ceq $currentVersion -and $requiredName -in @(
                     'current/BaiduBatchTransfer.App.exe',
                     'lib/app/BaiduBatchTransfer.App.exe')
                 Assert-Authenticode $destination $ExpectedPublisherSpkiSha256 $publisherTimestampRequired "$Description::$requiredName"
