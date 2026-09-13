@@ -55,6 +55,7 @@ type AdminStore interface {
 	ListSoftware(context.Context, int, int) ([]model.Software, int, error)
 	CreateSoftware(context.Context, string) (model.Software, error)
 	CreateSoftwareAt(context.Context, string, time.Time) (model.Software, error)
+	CreateSoftwareWithIDAt(context.Context, string, string, time.Time) (model.Software, error)
 	RenameSoftware(context.Context, string, string) error
 	SetSoftwareEnabled(context.Context, string, bool) error
 	ListPackages(context.Context, int, int) ([]model.Package, int, error)
@@ -76,6 +77,7 @@ type AdminStore interface {
 // business mutation and encrypted replay record share one SQLite transaction.
 type AdminMutationTransaction interface {
 	CreateSoftwareAt(context.Context, string, time.Time) (model.Software, error)
+	CreateSoftwareWithIDAt(context.Context, string, string, time.Time) (model.Software, error)
 	RenameSoftware(context.Context, string, string) error
 	SetSoftwareEnabled(context.Context, string, bool) error
 	CreatePackageAt(context.Context, string, []string, time.Time) (model.Package, error)
@@ -659,6 +661,17 @@ func (s *Service) ListSoftware(ctx context.Context, page, pageSize int) ([]model
 }
 
 func (s *Service) CreateSoftware(ctx context.Context, name string) (model.Software, error) {
+	return s.createSoftware(ctx, "", name)
+}
+
+func (s *Service) CreateSoftwareWithID(ctx context.Context, id, name string) (model.Software, error) {
+	if !validUUID(id) {
+		return model.Software{}, ErrInvalidRequest
+	}
+	return s.createSoftware(ctx, id, name)
+}
+
+func (s *Service) createSoftware(ctx context.Context, id, name string) (model.Software, error) {
 	if model.ValidateAdminName(name) != nil {
 		return model.Software{}, ErrInvalidRequest
 	}
@@ -669,9 +682,17 @@ func (s *Service) CreateSoftware(ctx context.Context, name string) (model.Softwa
 	var item model.Software
 	var err error
 	if tx, ok := adminMutationTransaction(ctx); ok {
-		item, err = tx.CreateSoftwareAt(ctx, name, now)
+		if id == "" {
+			item, err = tx.CreateSoftwareAt(ctx, name, now)
+		} else {
+			item, err = tx.CreateSoftwareWithIDAt(ctx, id, name, now)
+		}
 	} else if admin, ok := s.store.(AdminStore); ok {
-		item, err = admin.CreateSoftwareAt(ctx, name, now)
+		if id == "" {
+			item, err = admin.CreateSoftwareAt(ctx, name, now)
+		} else {
+			item, err = admin.CreateSoftwareWithIDAt(ctx, id, name, now)
+		}
 	} else {
 		return model.Software{}, errors.New("admin store unavailable")
 	}

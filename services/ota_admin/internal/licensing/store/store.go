@@ -144,10 +144,15 @@ func (tx *AdminTransaction) Complete(ctx context.Context, key string, record mod
 }
 
 func (tx *AdminTransaction) CreateSoftwareAt(ctx context.Context, name string, createdAt time.Time) (model.Software, error) {
-	if tx == nil || !tx.active || model.ValidateAdminName(name) != nil || createdAt.IsZero() {
+	return tx.CreateSoftwareWithIDAt(ctx, uuid.NewString(), name, createdAt)
+}
+
+func (tx *AdminTransaction) CreateSoftwareWithIDAt(ctx context.Context, id, name string, createdAt time.Time) (model.Software, error) {
+	parsed, parseErr := uuid.Parse(id)
+	if tx == nil || !tx.active || parseErr != nil || parsed.String() != id || model.ValidateAdminName(name) != nil || createdAt.IsZero() {
 		return model.Software{}, errors.New("invalid software")
 	}
-	software := model.Software{ID: uuid.NewString(), Name: name, Enabled: true, CreatedAt: canonicalTime(createdAt)}
+	software := model.Software{ID: id, Name: name, Enabled: true, CreatedAt: canonicalTime(createdAt)}
 	if _, err := tx.conn.ExecContext(ctx, `INSERT INTO license_software(id,name,enabled,created_at) VALUES(?,?,1,?)`, software.ID, software.Name, unixTime(software.CreatedAt)); err != nil {
 		if isUniqueConstraint(err) {
 			return model.Software{}, ErrConflict
@@ -471,10 +476,18 @@ func (s *Store) CreateSoftware(ctx context.Context, name string) (model.Software
 }
 
 func (s *Store) CreateSoftwareAt(ctx context.Context, name string, createdAt time.Time) (model.Software, error) {
+	return s.CreateSoftwareWithIDAt(ctx, uuid.NewString(), name, createdAt)
+}
+
+func (s *Store) CreateSoftwareWithIDAt(ctx context.Context, id, name string, createdAt time.Time) (model.Software, error) {
+	parsed, parseErr := uuid.Parse(id)
+	if parseErr != nil || parsed.String() != id {
+		return model.Software{}, errors.New("software id is invalid")
+	}
 	if err := model.ValidateAdminName(name); err != nil {
 		return model.Software{}, errors.New("software name is required")
 	}
-	software := model.Software{ID: uuid.NewString(), Name: name, Enabled: true, CreatedAt: canonicalTime(createdAt)}
+	software := model.Software{ID: id, Name: name, Enabled: true, CreatedAt: canonicalTime(createdAt)}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO license_software(id,name,enabled,created_at) VALUES(?,?,1,?)`, software.ID, software.Name, unixTime(software.CreatedAt))
 	if err != nil {
 		if isUniqueConstraint(err) {

@@ -31,6 +31,7 @@ type LicenseService interface {
 type AdminService interface {
 	ListSoftware(context.Context, int, int) ([]model.Software, int, error)
 	CreateSoftware(context.Context, string) (model.Software, error)
+	CreateSoftwareWithID(context.Context, string, string) (model.Software, error)
 	RenameSoftware(context.Context, string, string) error
 	SetSoftwareEnabled(context.Context, string, bool) error
 	ListPackages(context.Context, int, int) ([]model.Package, int, error)

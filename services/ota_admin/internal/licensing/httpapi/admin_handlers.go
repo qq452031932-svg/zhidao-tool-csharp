@@ -23,6 +23,7 @@ import (
 )
 
 var adminNameFields = map[string]struct{}{"name": {}}
+var adminSoftwareCreateFields = map[string]struct{}{"id": {}, "name": {}}
 var adminEmptyFields = map[string]struct{}{}
 var adminPackageFields = map[string]struct{}{"name": {}, "software_ids": {}}
 var adminMembersFields = map[string]struct{}{"software_ids": {}}
@@ -36,6 +37,11 @@ var adminCardSearchFields = map[string]struct{}{
 }
 
 type adminNameRequest struct {
+	Name string `json:"name"`
+}
+
+type adminSoftwareCreateRequest struct {
+	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
@@ -280,12 +286,18 @@ func (a *api) listSoftware(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) createSoftware(w http.ResponseWriter, r *http.Request) {
-	var request adminNameRequest
-	if a.decodeRequest(w, r, &request, adminNameFields) != nil {
+	var request adminSoftwareCreateRequest
+	if a.decodeRequest(w, r, &request, adminSoftwareCreateFields) != nil {
 		a.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	item, err := a.options.AdminService.CreateSoftware(r.Context(), request.Name)
+	var item model.Software
+	var err error
+	if request.ID == "" {
+		item, err = a.options.AdminService.CreateSoftware(r.Context(), request.Name)
+	} else {
+		item, err = a.options.AdminService.CreateSoftwareWithID(r.Context(), request.ID, request.Name)
+	}
 	if err != nil {
 		a.writeAdminServiceError(w, err)
 		return

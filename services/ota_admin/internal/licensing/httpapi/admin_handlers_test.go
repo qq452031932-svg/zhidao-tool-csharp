@@ -309,6 +309,26 @@ func (h *adminHarness) request(method, path, body string, idempotency bool) *htt
 	return w
 }
 
+func TestAdminCanProvisionAnExplicitImmutableSoftwareID(t *testing.T) {
+	h := newAdminHarness(t, 100)
+	const productID = "8270e8d7-1791-487d-ad76-0da7a0cbed12"
+	created := h.request(http.MethodPost, "/internal/v1/software", `{"id":"`+productID+`","name":"DEPLOYMENT-SMOKE-SUPERPAN"}`, true)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("explicit software create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var software model.Software
+	if err := json.Unmarshal(created.Body.Bytes(), &software); err != nil {
+		t.Fatal(err)
+	}
+	if software.ID != productID || software.Name != "DEPLOYMENT-SMOKE-SUPERPAN" || !software.Enabled {
+		t.Fatalf("created software=%+v", software)
+	}
+	invalid := h.request(http.MethodPost, "/internal/v1/software", `{"id":"not-a-uuid","name":"invalid"}`, true)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid explicit id status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
 func TestAdminRequiresImmediateLoopbackAndExactCanonicalBearer(t *testing.T) {
 	h := newAdminHarness(t, 100)
 	tests := []struct {
