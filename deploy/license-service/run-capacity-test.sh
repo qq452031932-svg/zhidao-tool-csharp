@@ -77,7 +77,7 @@ awk -v want="$EXPECTED_UID" '$1=="Uid:"{found=1;ok=($2==want&&$3==want&&$4==want
 awk -v want="$EXPECTED_GID" '$1=="Gid:"{found=1;ok=($2==want&&$3==want&&$4==want&&$5==want)} END{exit !(found&&ok)}' "/proc/$MAIN_PID/status" || die 'runtime Gid mismatch'
 [ "$(awk '$1=="Umask:"{print $2}' "/proc/$MAIN_PID/status")" = 0077 ] || die 'runtime Umask mismatch'
 [ "$(awk '$1=="Max"&&$2=="open"&&$3=="files"{print $4":"$5}' "/proc/$MAIN_PID/limits")" = 4096:4096 ] || die 'runtime NOFILE mismatch'
-ACTUAL_GROUPS=$(awk '$1=="Groups:"{for(i=2;i<=NF;i++)print $i}' "/proc/$MAIN_PID/status" | sort -n | tr '\n' ' '); EXPECTED_GROUPS=$(printf '%s\n%s\n' "$EXPECTED_GID" "$ADMIN_GID" | sort -n -u | tr '\n' ' ')
+ACTUAL_GROUPS=$(sed -n 's/^Groups:[[:space:]]*//p' "/proc/$MAIN_PID/status" | tr ' ' '\n' | sed '/^$/d' | sort -n -u | tr '\n' ' '); EXPECTED_GROUPS=$(printf '%s\n%s\n' "$EXPECTED_GID" "$ADMIN_GID" | sort -n -u | tr '\n' ' ')
 [ "$ACTUAL_GROUPS" = "$EXPECTED_GROUPS" ] || die 'runtime groups mismatch'
 for attempt in $(seq 1 30); do curl --noproxy '*' --fail --silent --max-time 2 "$ORIGIN/internal/health" >/dev/null && break; [ "$attempt" = 30 ] && die 'health unavailable'; sleep 1; done
 
