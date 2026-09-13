@@ -309,7 +309,7 @@ func sharedFilePolicyForProcessGroups(groups []int, primaryGID int, exactSize, m
 			continue
 		}
 		if _, exists := seen[group]; exists {
-			return trustedFilePolicy{}, errors.New("supplementary group is duplicated")
+			continue
 		}
 		seen[group] = struct{}{}
 		supplementary = append(supplementary, group)

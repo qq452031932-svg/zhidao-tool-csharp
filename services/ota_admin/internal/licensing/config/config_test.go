@@ -335,14 +335,14 @@ func TestSharedSecretPolicyRequiresExactlyOneSupplementaryGroup(t *testing.T) {
 }
 
 func TestSharedSecretPolicyExcludesTheProcessPrimaryGroup(t *testing.T) {
-	policy, err := sharedFilePolicyForProcessGroups([]int{989, 990}, 990, 32, 32)
+	policy, err := sharedFilePolicyForProcessGroups([]int{989, 989, 990}, 990, 32, 32)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := policy.allowedGIDs[989]; !ok || len(policy.allowedGIDs) != 1 {
 		t.Fatalf("allowed groups = %v", policy.allowedGIDs)
 	}
-	for _, groups := range [][]int{{990}, {988, 989, 990}, {989, 989, 990}} {
+	for _, groups := range [][]int{{990}, {988, 989, 990}} {
 		if _, err := sharedFilePolicyForProcessGroups(groups, 990, 32, 32); err == nil {
 			t.Fatalf("process groups %v accepted without exactly one distinct supplementary group", groups)
 		}
