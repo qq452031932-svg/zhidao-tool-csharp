@@ -10,6 +10,11 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'Production')][switch]$Production,
     [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$ProductionFeedUrl,
     [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$SigningCertificateThumbprint,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$LicenseSigningKeyId,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$LicenseSigningPublicKey,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$LicenseCurrentSpkiPin,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$LicenseNextSpkiPin,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$LicenseServiceUrl,
     [Parameter(ParameterSetName = 'Production')][string]$TimestampUrl
 )
 
@@ -480,15 +485,21 @@ function Invoke-ProductionRelease {
         Invoke-ProductionCommand 'vpk-root-help' 'dotnet' @('tool','run','vpk','--','--help') $sourceSnapshot
         Invoke-ProductionCommand 'vpk-pack-help' 'dotnet' @('tool','run','vpk','--','pack','--help') $sourceSnapshot
         $helperPackageDirectory = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts\managed-session-pipeline-20260901\helper-bundle-r2'))
+        $licenseProperties = @(
+            "-p:LicenseSigningKeyId=$LicenseSigningKeyId",
+            "-p:LicenseSigningPublicKey=$LicenseSigningPublicKey",
+            "-p:LicenseCurrentSpkiPin=$LicenseCurrentSpkiPin",
+            "-p:LicenseNextSpkiPin=$LicenseNextSpkiPin",
+            "-p:LicenseServiceUrl=$LicenseServiceUrl")
         $restoreProperties = @('-r','win-x64','-p:RuntimeIdentifier=win-x64','-p:SelfContained=true',
             "-p:VersionPrefix=$Version","-p:UpdateFeedUrl=$normalizedFeedUrl",'-p:OtaAcceptanceBuild=false','-p:OtaAcceptanceFeedPath=',
-            "-p:UpdateChannel=$productionChannel","-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory")
+            "-p:UpdateChannel=$productionChannel","-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory") + $licenseProperties
         Invoke-ProductionCommand 'dotnet-restore-locked' 'dotnet' (@('restore',$appProject,'--locked-mode') + $restoreProperties) $sourceSnapshot
-        Invoke-ProductionCommand 'dotnet-publish' 'dotnet' @(
+        Invoke-ProductionCommand 'dotnet-publish' 'dotnet' (@(
             'publish',$appProject,'-c','Release','-r','win-x64','--self-contained','true','--no-restore','-o',$publishDirectory,
             "-p:VersionPrefix=$Version",'-p:RuntimeIdentifier=win-x64','-p:SelfContained=true',"-p:UpdateFeedUrl=$normalizedFeedUrl",
             '-p:OtaAcceptanceBuild=false','-p:OtaAcceptanceFeedPath=',"-p:UpdateChannel=$productionChannel",
-            "-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory") $sourceSnapshot
+            "-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory") + $licenseProperties) $sourceSnapshot
         if (-not (Test-Path -LiteralPath (Join-Path $publishDirectory 'BaiduBatchTransfer.App.exe') -PathType Leaf)) { throw 'Published production main executable is missing.' }
         $publishedAssemblyPath = Join-Path $publishDirectory 'BaiduBatchTransfer.App.dll'
         if (-not (Test-Path -LiteralPath $publishedAssemblyPath -PathType Leaf)) { throw 'Published production metadata assembly is missing.' }

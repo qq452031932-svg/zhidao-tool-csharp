@@ -25,6 +25,16 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("ParameterSetName = 'Production')][string]$ProductionFeedUrl", script, StringComparison.Ordinal);
         Assert.Contains("ParameterSetName = 'Production')][string]$SigningCertificateThumbprint", script, StringComparison.Ordinal);
         Assert.Contains("ParameterSetName = 'Production')][string]$TimestampUrl", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][string]$LicenseSigningKeyId", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][string]$LicenseSigningPublicKey", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][string]$LicenseCurrentSpkiPin", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][string]$LicenseNextSpkiPin", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][string]$LicenseServiceUrl", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseSigningKeyId=$LicenseSigningKeyId\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseSigningPublicKey=$LicenseSigningPublicKey\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseCurrentSpkiPin=$LicenseCurrentSpkiPin\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseNextSpkiPin=$LicenseNextSpkiPin\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseServiceUrl=$LicenseServiceUrl\"", script, StringComparison.Ordinal);
         Assert.Contains("$signParams", script, StringComparison.Ordinal);
         Assert.DoesNotContain("$AuthenticityMode", script, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("$acceptancePackageId = 'SuperPan.BaiduBatchTransfer.OtaAcceptance'", script, StringComparison.Ordinal);
