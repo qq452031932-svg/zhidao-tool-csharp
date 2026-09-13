@@ -60,7 +60,7 @@ public sealed class OtaProductionReleaseScriptTests
     {
         var root = FindRepositoryRoot();
         var output = Path.Combine(root, ".artifacts", $"ota-production-version-test-{Guid.NewGuid():N}");
-        var result = await RunPowerShellAsync(BuildScriptPath(),
+        var result = await RunProductionPowerShellAsync(
             "-Production", "-Version", version, "-OutputDirectory", output,
             "-ProductionFeedUrl", "https://ota.example.test/releases/win-x64/stable/",
             "-SigningCertificateThumbprint", new string('A', 40));
@@ -78,7 +78,7 @@ public sealed class OtaProductionReleaseScriptTests
     {
         var root = FindRepositoryRoot();
         var output = Path.Combine(root, ".artifacts", $"ota-production-feed-test-{Guid.NewGuid():N}");
-        var result = await RunPowerShellAsync(BuildScriptPath(),
+        var result = await RunProductionPowerShellAsync(
             "-Production", "-Version", "1.2.3", "-OutputDirectory", output,
             "-ProductionFeedUrl", feedUrl,
             "-SigningCertificateThumbprint", new string('A', 40));
@@ -97,7 +97,7 @@ public sealed class OtaProductionReleaseScriptTests
     {
         var root = FindRepositoryRoot();
         var output = Path.Combine(root, ".artifacts", $"ota-production-timestamp-test-{Guid.NewGuid():N}");
-        var result = await RunPowerShellAsync(BuildScriptPath(),
+        var result = await RunProductionPowerShellAsync(
             "-Production", "-Version", "1.2.3", "-OutputDirectory", output,
             "-ProductionFeedUrl", "https://ota.example.test/releases/win-x64/stable/",
             "-SigningCertificateThumbprint", new string('A', 40),
@@ -106,6 +106,19 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("TimestampUrl", result.Output, StringComparison.OrdinalIgnoreCase);
         Assert.False(Directory.Exists(output));
+    }
+
+    private static Task<ScriptResult> RunProductionPowerShellAsync(params string[] arguments)
+    {
+        var complete = arguments.Concat(new[]
+        {
+            "-LicenseSigningKeyId", "key-1",
+            "-LicenseSigningPublicKey", "public-key",
+            "-LicenseCurrentSpkiPin", new string('a', 64),
+            "-LicenseNextSpkiPin", new string('b', 64),
+            "-LicenseServiceUrl", "https://license.example.test/license-api/",
+        }).ToArray();
+        return RunPowerShellAsync(BuildScriptPath(), complete);
     }
 
     [Fact]
