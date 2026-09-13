@@ -29,6 +29,8 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("git -C $repo archive", script, StringComparison.Ordinal);
         Assert.Contains("SignedCms", script, StringComparison.Ordinal);
         Assert.Contains("Source changed during", script, StringComparison.Ordinal);
+        Assert.Contains("[ValidateSet('http://timestamp.digicert.com')]", script, StringComparison.Ordinal);
+        Assert.Contains("$timestamp.AbsoluteUri -cne 'http://timestamp.digicert.com/'", script, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -7,7 +7,7 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$CurrentTlsSpkiPin,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$NextTlsSpkiPin,
     [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{40}$')][string]$SigningCertificateThumbprint,
-    [Parameter(Mandatory)][ValidatePattern('^https://[^\s;,]+$')][string]$TimestampUrl,
+    [Parameter(Mandatory)][ValidateSet('http://timestamp.digicert.com')][string]$TimestampUrl,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ManagedBrowserHelperPackageDirectory
 )
@@ -55,7 +55,7 @@ $certificate = $matches[0]
 $codeSigningOid = '1.3.6.1.5.5.7.3.3'
 if (@($certificate.Extensions | Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and @($_.EnhancedKeyUsages | Where-Object Value -CEQ $codeSigningOid).Count -eq 1 }).Count -ne 1) { throw 'Signing certificate lacks Code Signing EKU.' }
 $timestamp = [Uri]$TimestampUrl
-if ($timestamp.Scheme -cne 'https' -or $timestamp.UserInfo -or $timestamp.Query -or $timestamp.Fragment) { throw 'TimestampUrl must be a credential-free HTTPS origin/path.' }
+if ($timestamp.AbsoluteUri -cne 'http://timestamp.digicert.com/' -or $timestamp.UserInfo -or $timestamp.Query -or $timestamp.Fragment) { throw 'TimestampUrl must be the approved DigiCert RFC 3161 endpoint.' }
 
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repo '.artifacts'))
