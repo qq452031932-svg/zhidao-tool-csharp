@@ -891,6 +891,7 @@ func TestLoopbackOTAControlledApplyContract(t *testing.T) {
 		`install -m 0755 -o root -g root "$BINARY_SOURCE" "$BINARY_TARGET"`,
 		`install -m 0640 -o root -g "$SERVICE_GROUP" "$LOOPBACK_CONFIG_SOURCE" "$CONFIG_TARGET"`,
 		`install -m 0644 -o root -g root "$LOOPBACK_UNIT_SOURCE" "$UNIT_TARGET"`,
+		`runuser -u "$SERVICE_USER" -- "$BINARY_TARGET" check-config --config "$CONFIG_TARGET"`,
 		`systemctl restart "$SERVICE_NAME"`, `http://127.0.0.1:18091/admin/`,
 		`OTA_CONTROLLED_APPLY_COMPLETE`,
 	)

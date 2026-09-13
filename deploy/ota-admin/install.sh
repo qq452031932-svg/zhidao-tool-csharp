@@ -124,6 +124,7 @@ verify_sha256() {
 }
 
 preflight_loopback_license_transaction() {
+    command -v runuser >/dev/null || die "runuser is required"
     [ -z "$CERTIFICATE_SOURCE$CERTIFICATE_SHA256$EXPECTED_SPKI_SHA256$ACTIVE_VHOST_SHA256" ] ||
         die "public-install arguments are forbidden in loopback license transaction mode"
     [ -n "$BINARY_SOURCE" ] || die "--binary is required for loopback license transaction"
@@ -181,7 +182,7 @@ apply_loopback_license_transaction() {
     controlled_failpoint ota-config
     install -m 0644 -o root -g root "$LOOPBACK_UNIT_SOURCE" "$UNIT_TARGET"
     controlled_failpoint ota-unit
-    "$BINARY_TARGET" check-config --config "$CONFIG_TARGET" >/dev/null
+    runuser -u "$SERVICE_USER" -- "$BINARY_TARGET" check-config --config "$CONFIG_TARGET" >/dev/null
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null
     systemctl restart "$SERVICE_NAME"
