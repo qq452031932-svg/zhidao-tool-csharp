@@ -32,6 +32,17 @@ public sealed class ProductionLicenseBuildScriptTests
     }
 
     [Fact]
+    public void WrapperKeepsMsBuildPropertyNamesAndValuesInSingleArguments()
+    {
+        var script = File.ReadAllText(Path.Combine(Root(), "scripts", "build_production_license_clients.ps1"));
+
+        Assert.Contains("\"-p:LicenseSigningKeyId=$LicenseSigningKeyId\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseSigningPublicKey=$LicenseSigningPublicKey\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseCurrentSpkiPin=$CurrentTlsSpkiPin\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"-p:LicenseNextSpkiPin=$NextTlsSpkiPin\"", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void RotationRehearsalIsFailClosedAndRedacted()
     {
         var script = File.ReadAllText(Path.Combine(Root(), "scripts", "test_license_spki_rotation.ps1"));
