@@ -78,6 +78,7 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.DoesNotContain(".TryAdd(", script, StringComparison.Ordinal);
         Assert.Contains("$expected.ContainsKey($path)", script, StringComparison.Ordinal);
         Assert.Contains("$expected.Add($path,$file.sha256)", script, StringComparison.Ordinal);
+        Assert.Contains("tr -d ''\\r\\n'' | base64 -d", script, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>
