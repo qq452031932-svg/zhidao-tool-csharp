@@ -36,6 +36,24 @@ func TestProductionWorkloadAllowsOnlyApprovedPhases(t *testing.T) {
 		}
 	}
 }
+func TestApprovedWarmupIsBoundedAndUsesDistinctNonces(t *testing.T) {
+	workload := Workload{Rate: 50, DurationSeconds: 600}
+	options, err := approvedWarmupOptions(workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.Requests != 3000 || options.Interval != 20*time.Millisecond || options.HealthInterval != time.Second {
+		t.Fatalf("warmup options = %+v", options)
+	}
+	if options.NonceSeed == 0 || phaseNonce(options.NonceSeed, workload.Rate, 0) == phaseNonce(approvedSeed, workload.Rate, 0) {
+		t.Fatal("warmup nonce domain is not distinct")
+	}
+	for _, invalid := range []Workload{{Rate: 100, DurationSeconds: 600}, {Rate: 50, DurationSeconds: 599}} {
+		if _, err := approvedWarmupOptions(invalid); err == nil {
+			t.Fatalf("accepted invalid warmup workload %+v", invalid)
+		}
+	}
+}
 
 func TestOriginIsExplicitLiteralIPv4Loopback(t *testing.T) {
 	if err := validateOrigin("http://127.0.0.1:18093"); err != nil {

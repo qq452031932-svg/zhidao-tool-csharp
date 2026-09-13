@@ -85,6 +85,13 @@ for attempt in $(seq 1 30); do curl --noproxy '*' --fail --silent --max-time 2 "
 RATE_LIMIT_SEEN=false
 for request in $(seq 1 200); do code=$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time 2 -H 'Content-Type: application/json' --data '{}' "$ORIGIN/license-api/v1/activate"); [ "$code" = 429 ] && RATE_LIMIT_SEEN=true && break; done
 [ "$RATE_LIMIT_SEEN" = true ] || die 'ordinary public rate limiting was not observed'
+WARMUP_REPORT=
+exec 3<"$SECRET_FILE"
+if ! WARMUP_REPORT="$(runuser -u superpan-license -- "$TOOLS/license-loadtest" --origin "$ORIGIN" --rate 50 --duration-seconds 600 --manifest "$MANIFEST" --load-secret-fd 3 --warmup)"; then exec 3<&-; die 'capacity warmup failed'; fi
+exec 3<&-
+case "$WARMUP_REPORT" in requests=3000*) ;; *) die 'capacity warmup request count mismatch' ;; esac
+printf 'warmup_requests=3000 %s\n' "${WARMUP_REPORT#requests=3000 }"
+
 
 sample_process(){ trap 'exit 0' TERM; while kill -0 "$MAIN_PID" 2>/dev/null; do read -r _ _ _ _ _ _ _ _ _ _ _ _ _ utime stime _ <"/proc/$MAIN_PID/stat" || exit 1; rss=$(awk '/^VmRSS:/{print $2}' "/proc/$MAIN_PID/status") || exit 1; mem=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo) || exit 1; [ -n "$rss" ] && [ -n "$mem" ] || exit 1; printf '%s %s %s %s\n' "$(date +%s)" "$((utime+stime))" "$rss" "$mem" >>"$SAMPLES" || exit 1; sleep 1; done; exit 1; }
 run_phase(){

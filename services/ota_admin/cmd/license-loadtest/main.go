@@ -120,6 +120,7 @@ type storeMetrics struct {
 type phaseOptions struct {
 	Requests                 int64
 	Interval, HealthInterval time.Duration
+	NonceSeed                int64
 }
 type responseTrust struct {
 	keyID     string
@@ -144,6 +145,10 @@ func runPhase(ctx context.Context, origin string, workload Workload, manifest Ma
 	}
 	if err := manifest.Validate(); err != nil {
 		return Report{}, err
+	}
+	requestManifest := manifest
+	if options.NonceSeed != 0 {
+		requestManifest.Seed = options.NonceSeed
 	}
 	if options.Requests == 0 {
 		if err := workload.ValidateProduction(); err != nil {
@@ -218,7 +223,7 @@ func runPhase(ctx context.Context, origin string, workload Workload, manifest Ma
 			defer wg.Done()
 			kind := classify(index)
 			id := requestIdentity(index, kind)
-			body, path := requestBody(manifest, workload.Rate, index, kind, time.Now().UTC())
+			body, path := requestBody(requestManifest, workload.Rate, index, kind, time.Now().UTC())
 			req, e := http.NewRequestWithContext(ctx, http.MethodPost, origin+path, bytes.NewReader(body))
 			if e == nil {
 				req.Header.Set("Content-Type", "application/json")
@@ -419,6 +424,13 @@ func readSecretFD(fd int) (string, error) {
 	}
 	return authwire.EncodeInternalToken(b), nil
 }
+
+func approvedWarmupOptions(workload Workload) (phaseOptions, error) {
+	if workload.Rate != 50 || workload.DurationSeconds != 600 {
+		return phaseOptions{}, errors.New("warmup requires the approved 50 rps workload")
+	}
+	return phaseOptions{Requests: 3000, Interval: time.Second / 50, HealthInterval: time.Second, NonceSeed: approvedSeed + 1}, nil
+}
 func runCLI(args []string) error {
 	fs := flag.NewFlagSet("license-loadtest", flag.ContinueOnError)
 	origin := fs.String("origin", "", "loopback origin")
@@ -426,6 +438,7 @@ func runCLI(args []string) error {
 	duration := fs.Int("duration-seconds", 0, "approved duration")
 	manifestPath := fs.String("manifest", "", "protected manifest")
 	secretFD := fs.Int("load-secret-fd", -1, "protected descriptor")
+	warmup := fs.Bool("warmup", false, "run the fixed steady-state warmup")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -435,6 +448,14 @@ func runCLI(args []string) error {
 	w := Workload{*rate, *duration}
 	if err := w.ValidateProduction(); err != nil {
 		return err
+	}
+	options := phaseOptions{}
+	if *warmup {
+		warmupOptions, warmupErr := approvedWarmupOptions(w)
+		if warmupErr != nil {
+			return warmupErr
+		}
+		options = warmupOptions
 	}
 	data, err := readProtectedFile(*manifestPath)
 	if err != nil {
@@ -448,7 +469,7 @@ func runCLI(args []string) error {
 	if err != nil {
 		return err
 	}
-	report, err := runPhase(context.Background(), *origin, w, manifest, token, phaseOptions{})
+	report, err := runPhase(context.Background(), *origin, w, manifest, token, options)
 	if err != nil {
 		return err
 	}
