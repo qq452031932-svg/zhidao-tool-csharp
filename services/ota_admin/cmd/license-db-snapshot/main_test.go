@@ -18,6 +18,23 @@ type fakeServiceProbe struct {
 	err   error
 }
 
+func TestParseSystemdActiveStateAcceptsV219PropertyOutput(t *testing.T) {
+	for input, want := range map[string]ServiceState{
+		"ActiveState=inactive\n": ServiceStopped,
+		"ActiveState=active\n":   ServiceActive,
+	} {
+		got, err := parseSystemdActiveState([]byte(input))
+		if err != nil || got != want {
+			t.Fatalf("parseSystemdActiveState(%q) = %v, %v; want %v", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"inactive\n", "ActiveState=failed\n", "ActiveState=inactive\nextra\n", ""} {
+		if _, err := parseSystemdActiveState([]byte(input)); err == nil {
+			t.Fatalf("parseSystemdActiveState(%q) accepted malformed or ambiguous output", input)
+		}
+	}
+}
+
 func (p fakeServiceProbe) State(context.Context, string) (ServiceState, error) { return p.state, p.err }
 
 type permissiveTrust struct{}

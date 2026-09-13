@@ -551,22 +551,34 @@ func collectTableNames(rows tableRows) ([]string, error) {
 
 type systemdProbe struct{}
 
-func (systemdProbe) State(ctx context.Context, service string) (ServiceState, error) {
-	if service != requiredService {
-		return ServiceUnknown, errors.New("invalid service")
+func parseSystemdActiveState(out []byte) (ServiceState, error) {
+	line := strings.TrimSuffix(string(out), "\n")
+	if line == "" || strings.ContainsAny(line, "\r\n") {
+		return ServiceUnknown, errors.New("invalid systemd ActiveState output")
 	}
-	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", service).Output()
-	if err != nil {
-		return ServiceUnknown, err
+	property, value, found := strings.Cut(line, "=")
+	if !found || property != "ActiveState" {
+		return ServiceUnknown, errors.New("invalid systemd ActiveState property")
 	}
-	switch strings.TrimSpace(string(out)) {
+	switch value {
 	case "inactive":
 		return ServiceStopped, nil
 	case "active":
 		return ServiceActive, nil
 	default:
-		return ServiceUnknown, nil
+		return ServiceUnknown, errors.New("unsupported systemd ActiveState")
 	}
+}
+
+func (systemdProbe) State(ctx context.Context, service string) (ServiceState, error) {
+	if service != requiredService {
+		return ServiceUnknown, errors.New("invalid service")
+	}
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", service).Output()
+	if err != nil {
+		return ServiceUnknown, err
+	}
+	return parseSystemdActiveState(out)
 }
 
 func main() {

@@ -913,8 +913,20 @@ kill_registered_schema_processes() {
     done
 }
 
+stop_license_for_schema() {
+    if systemctl stop superpan-license.service 2>/dev/null; then
+        return 0
+    fi
+    if [ "$INSTALL_STATE" = interrupted-initial ] &&
+       [ "${PREFLIGHT_UNIT_ENABLED[superpan-license.service]}" = not-found ] &&
+       ! systemctl is-active --quiet superpan-license.service; then
+        return 0
+    fi
+    die "license service could not be stopped for schema verification"
+}
+
 restore_old_license_activity() {
-    if [ "$LICENSE_WAS_ACTIVE" = true ]; then systemctl start superpan-license.service; else systemctl stop superpan-license.service; fi
+    if [ "$LICENSE_WAS_ACTIVE" = true ]; then systemctl start superpan-license.service; else stop_license_for_schema; fi
 }
 
 validate_schema_backup_executable() {
@@ -944,7 +956,7 @@ schema_upgrade_preflight() {
     SCHEMA_NEW_CONFIG="$BACKUP_DIR/schema-new.json"
     SCHEMA_OLD_CONFIG="$BACKUP_DIR/schema-old.json"
     LICENSE_WAS_ACTIVE=false; systemctl is-active --quiet superpan-license.service && LICENSE_WAS_ACTIVE=true
-    systemctl stop superpan-license.service
+    stop_license_for_schema
     BEFORE_SUMMARY="$("$LICENSE_DB_SNAPSHOT" --service superpan-license.service --source "$DATA/state.db" --destination "$before")"
     restore_old_license_activity
     cp -- "$before" "$migrated"; chown root:root "$migrated"; chmod 0600 "$migrated"
@@ -956,7 +968,7 @@ schema_upgrade_preflight() {
     stop_registered_schema_process "$schema_pid" "$BUNDLE/superpan-license"
     chown root:root "$migrated" "$migrated-wal" "$migrated-shm" 2>/dev/null || :
     chmod 0600 "$migrated" "$migrated-wal" "$migrated-shm" 2>/dev/null || :
-    systemctl stop superpan-license.service
+    stop_license_for_schema
     AFTER_SUMMARY="$("$LICENSE_DB_SNAPSHOT" --service superpan-license.service --source "$migrated" --destination "$after")"
     restore_old_license_activity
     if [ "$INSTALL_STATE" = interrupted-initial ]; then
@@ -981,7 +993,7 @@ schema_upgrade_preflight() {
     stop_registered_schema_process "$schema_pid" "$BACKUP_DIR/license-binary"
     chown root:root "$oldcopy" "$oldcopy-wal" "$oldcopy-shm" 2>/dev/null || :
     chmod 0600 "$oldcopy" "$oldcopy-wal" "$oldcopy-shm" 2>/dev/null || :
-    systemctl stop superpan-license.service
+    stop_license_for_schema
     OLD_SUMMARY="$("$LICENSE_DB_SNAPSHOT" --service superpan-license.service --source "$oldcopy" --destination "$verified")"
     restore_old_license_activity
     validate_schema_semantics "$BEFORE_SUMMARY" "$AFTER_SUMMARY" "$OLD_SUMMARY" "$BACKUP_DIR"

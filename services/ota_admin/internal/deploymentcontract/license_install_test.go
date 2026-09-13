@@ -943,10 +943,10 @@ func TestLicenseDeploymentScriptsUseV219CompatibleSystemctlProperties(t *testing
 		{"deploy", "license-service", "install.sh"},
 		{"deploy", "license-service", "run-capacity-test.sh"},
 		{"deploy", "license-service", "test-install-v219.sh"},
+		{"services", "ota_admin", "cmd", "license-db-snapshot", "main.go"},
 	} {
 		body := read(t, path...)
-		if strings.Contains(body, `systemctl show --property=MainPID --value`) ||
-			strings.Contains(body, `systemctl show --property=User --value`) {
+		if strings.Contains(body, `--value`) {
 			t.Fatalf("%v uses systemctl show --value, which is unsupported by systemd v219", path)
 		}
 	}
@@ -982,6 +982,8 @@ func TestPersistentKeysWithoutDatabaseIsRetryableFirstInstall(t *testing.T) {
 		`database absent`,
 		`database-sha256`,
 		`database exists without a complete valid key set`,
+		`stop_license_for_schema`,
+		`PREFLIGHT_UNIT_ENABLED[superpan-license.service]`,
 	)
 	requireFragments(t, harness, `RETRY_FAILPOINTS=(secret-publish license-binary license-config license-unit license-start license-health ota-binary ota-config ota-unit ota-restart ota-health)`)
 	if strings.Contains(install, `sha256sum -- "$DATA/state.db"`) {
