@@ -730,6 +730,7 @@ func TestLicenseInstallSecretLifecycle(t *testing.T) {
 		`SIGNING_SPKI_BASE64="$ETC/response-signing.spki.base64"`,
 		`SIGNING_SPKI_SHA256="$ETC/response-signing.spki.sha256"`,
 		`validate_persistent_state_before_mutation`, `create_persistent_state`,
+		`[ "$PERSISTENT_STATE_MODE" = "absent" ] || return 0`,
 		`head -c 32 /dev/urandom`, `cmp -s "$ENCRYPTION_KEY" "$LOOKUP_KEY"`,
 		`openssl ecparam -name prime256v1 -genkey -noout`,
 		`openssl ec -in "$private_key" -pubout -outform DER`,

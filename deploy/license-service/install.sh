@@ -754,7 +754,7 @@ publish_persistent_transaction() {
 
 create_persistent_state() {
     local encryption_temp lookup_temp admin_temp signing_temp der_temp base64_temp hash_temp id_temp
-    [ "$PERSISTENT_STATE_MODE" = "absent" ] || return
+    [ "$PERSISTENT_STATE_MODE" = "absent" ] || return 0
     PERSISTENT_TRANSACTION_ARMED=true
     create_exclusive_temp "$ENCRYPTION_KEY" root "$LICENSE_GROUP" 640 raw32 32 raw32; encryption_temp="$CREATED_TEMP"
     failpoint secret-encryption
