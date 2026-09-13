@@ -639,8 +639,11 @@ try {
                 }
             }
             # Every executable carried by an inner archive must be explicitly
-            # classified; every publisher-owned executable is then independently
-            # checked against its Authenticode image digest and publisher SPKI.
+            # classified; every publisher-owned executable is independently checked
+            # against its Authenticode image digest and publisher SPKI. Velopack 1.2
+            # creates its launcher/updater stubs after its timestamped application-signing
+            # pass, so the timestamp requirement applies to the application executable;
+            # the outer Setup executable is timestamped and checked separately below.
             foreach ($requiredName in $RequiredPublisherExecutables) {
                 $requiredEntry = $inner.GetEntry($requiredName)
                 if ($null -eq $requiredEntry -or $requiredEntry.Length -le 0) { throw "$Description has an empty required publisher executable." }
@@ -648,7 +651,10 @@ try {
                 $executableIndex++
                 $input = $requiredEntry.Open(); $output = [IO.File]::Create($destination)
                 try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
-                Assert-Authenticode $destination $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent "$Description::$requiredName"
+                $publisherTimestampRequired = $RequireTimestamp.IsPresent -and $requiredName -in @(
+                    'current/BaiduBatchTransfer.App.exe',
+                    'lib/app/BaiduBatchTransfer.App.exe')
+                Assert-Authenticode $destination $ExpectedPublisherSpkiSha256 $publisherTimestampRequired "$Description::$requiredName"
             }
             $psfSpki = '7a1e6298a8fc5ec53e6389ad8532cb869e36233caf30c5ee0a1108d09a2b9801'
             foreach ($thirdPartyName in $AllowedThirdPartyExecutables) {
