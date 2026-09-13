@@ -80,7 +80,7 @@ function Invoke-ExactSmoke([string]$Executable,[Security.SecureString]$Card) {
     try {
         $plain=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr); $start=[Diagnostics.ProcessStartInfo]::new($Executable); $start.UseShellExecute=$false; $start.RedirectStandardInput=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true; $start.ArgumentList.Add('activate');$start.ArgumentList.Add('--card-stdin')
         $process=[Diagnostics.Process]::Start($start); $process.StandardInput.WriteLine($plain); $process.StandardInput.Close(); $output=$process.StandardOutput.ReadToEnd().Trim(); $process.WaitForExit()
-        if($process.ExitCode-ne 0-or $output-cne 'ok'){throw 'Exact signed smoke client did not authorize through the observed TLS phase.'}
+        if($process.ExitCode-ne 0-or $output-cne 'ok'){throw "Exact signed smoke client did not authorize through the observed TLS phase (exit=$($process.ExitCode), safe_code=$output)."}
     } finally { if($null-ne $plain){$plain=$null};[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
