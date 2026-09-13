@@ -5,8 +5,8 @@ This is a redacted evidence template. Execute only against a disposable instance
 
 ## Fixed workload
 
-- Before measurement, run one fixed 50 requests/second, 60-second steady-state warmup through the same signed public and SQLite paths, using a separate deterministic nonce domain. Record only its aggregate report.
-- Start CPU/RSS sampling only after that warmup completes, so RSS growth measures steady-state retention instead of Go/SQLite cold-start allocation.
+- Before each measured phase, run a fixed 60-second steady-state warmup at that phase's rate through the same signed public and SQLite paths, using a separate deterministic nonce domain. Record only its aggregate report.
+- Start CPU/RSS sampling only after the corresponding warmup completes, so RSS growth measures steady-state retention instead of rate-specific Go/SQLite cold-start allocation.
 
 - 50 requests/second for 600 seconds, followed by 100 requests/second for 600 seconds
 - 70% valid validation, 10% idempotent activation, 20% deliberate business rejection

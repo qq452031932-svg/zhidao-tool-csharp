@@ -426,10 +426,10 @@ func readSecretFD(fd int) (string, error) {
 }
 
 func approvedWarmupOptions(workload Workload) (phaseOptions, error) {
-	if workload.Rate != 50 || workload.DurationSeconds != 600 {
-		return phaseOptions{}, errors.New("warmup requires the approved 50 rps workload")
+	if workload.DurationSeconds != 600 || (workload.Rate != 50 && workload.Rate != 100) {
+		return phaseOptions{}, errors.New("warmup requires an approved production workload")
 	}
-	return phaseOptions{Requests: 3000, Interval: time.Second / 50, HealthInterval: time.Second, NonceSeed: approvedSeed + 1}, nil
+	return phaseOptions{Requests: int64(workload.Rate * 60), Interval: time.Second / time.Duration(workload.Rate), HealthInterval: time.Second, NonceSeed: approvedSeed + 1}, nil
 }
 func runCLI(args []string) error {
 	fs := flag.NewFlagSet("license-loadtest", flag.ContinueOnError)

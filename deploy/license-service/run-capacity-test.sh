@@ -85,12 +85,14 @@ for attempt in $(seq 1 30); do curl --noproxy '*' --fail --silent --max-time 2 "
 RATE_LIMIT_SEEN=false
 for request in $(seq 1 200); do code=$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time 2 -H 'Content-Type: application/json' --data '{}' "$ORIGIN/license-api/v1/activate"); [ "$code" = 429 ] && RATE_LIMIT_SEEN=true && break; done
 [ "$RATE_LIMIT_SEEN" = true ] || die 'ordinary public rate limiting was not observed'
-WARMUP_REPORT=
-exec 3<"$SECRET_FILE"
-if ! WARMUP_REPORT="$(runuser -u superpan-license -- "$TOOLS/license-loadtest" --origin "$ORIGIN" --rate 50 --duration-seconds 600 --manifest "$MANIFEST" --load-secret-fd 3 --warmup)"; then exec 3<&-; die 'capacity warmup failed'; fi
-exec 3<&-
-case "$WARMUP_REPORT" in requests=3000*) ;; *) die 'capacity warmup request count mismatch' ;; esac
-printf 'warmup_requests=3000 %s\n' "${WARMUP_REPORT#requests=3000 }"
+warm_up(){
+  local rate=$1 expected=$2 report=
+  exec 3<"$SECRET_FILE"
+  if ! report="$(runuser -u superpan-license -- "$TOOLS/license-loadtest" --origin "$ORIGIN" --rate "$rate" --duration-seconds 600 --manifest "$MANIFEST" --load-secret-fd 3 --warmup)"; then exec 3<&-; die 'capacity warmup failed'; fi
+  exec 3<&-
+  case "$report" in "requests=$expected "*) ;; *) die 'capacity warmup request count mismatch' ;; esac
+  printf 'warmup_rate=%s %s\n' "$rate" "$report"
+}
 
 
 sample_process(){ trap 'exit 0' TERM; while kill -0 "$MAIN_PID" 2>/dev/null; do read -r _ _ _ _ _ _ _ _ _ _ _ _ _ utime stime _ <"/proc/$MAIN_PID/stat" || exit 1; rss=$(awk '/^VmRSS:/{print $2}' "/proc/$MAIN_PID/status") || exit 1; mem=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo) || exit 1; [ -n "$rss" ] && [ -n "$mem" ] || exit 1; printf '%s %s %s %s\n' "$(date +%s)" "$((utime+stime))" "$rss" "$mem" >>"$SAMPLES" || exit 1; sleep 1; done; exit 1; }
@@ -111,8 +113,10 @@ run_phase(){
   awk -v value="$CPU_AVG" 'BEGIN{exit !(value<70)}' || die 'CPU_AVG threshold failed'; [ "$MEMORY_FLOOR" -gt 1048576 ] || die 'MEMORY_FLOOR threshold failed'; awk -v value="$RSS_GROWTH" 'BEGIN{exit !(value<10)}' || die 'RSS_GROWTH threshold failed'
   printf 'rate=%s samples=%s coverage_seconds=%s cpu_avg_pct=%s rss_start_kib=%s rss_end_kib=%s rss_growth_pct=%s memory_floor_kib=%s\n' "$rate" "$sample_count" "$coverage" "$CPU_AVG" "$RSS_START" "$RSS_END" "$RSS_GROWTH" "$MEMORY_FLOOR"
 }
+warm_up 50 3000
 run_phase 50 600
 sleep 10
+warm_up 100 6000
 run_phase 100 600
 
 systemctl stop superpan-license-loadtest.service

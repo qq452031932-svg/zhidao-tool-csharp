@@ -48,8 +48,10 @@ func TestCapacityOrchestratorHasExactIdentitySamplingAndCleanupContract(t *testi
 }
 func TestCapacityWarmupCompletesBeforeProcessSampling(t *testing.T) {
 	body := read(t, "deploy", "license-service", "run-capacity-test.sh")
-	requireFragments(t, body, "--warmup", "warmup_requests=3000")
+	requireFragments(t, body, "--warmup", "warm_up 50 3000", "warm_up 100 6000")
 	requireBefore(t, body, "--warmup", "sample_process & SAMPLER_PID=$!")
+	requireBefore(t, body, "warm_up 50 3000", "run_phase 50 600")
+	requireBefore(t, body, "warm_up 100 6000", "run_phase 100 600")
 	if strings.Count(body, "--warmup") != 1 {
 		t.Fatalf("warmup invocation count = %d, want 1", strings.Count(body, "--warmup"))
 	}
