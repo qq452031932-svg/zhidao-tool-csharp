@@ -90,7 +90,7 @@ $a=Read-VerifiedClientRoot $ClientRootA; $bc=Read-VerifiedClientRoot $ClientRoot
 if($a.nextTlsSpki-cne $bc.currentTlsSpki-or @(@($a.currentTlsSpki,$a.nextTlsSpki,$bc.nextTlsSpki)|Sort-Object -Unique).Count-ne 3-or $a.signingSpkiDerBase64-cne $bc.signingSpkiDerBase64-or $a.signingKeyId-cne $bc.signingKeyId){throw 'A/B and B/C signed manifests do not form one trust chain.'}
 
 $challenge=[Text.Encoding]::UTF8.GetBytes(([ordered]@{nonce=[Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant();endpoint=$uri.AbsoluteUri;sourceCommit=$ExpectedSourceCommit;issuedUtc=[DateTime]::UtcNow.ToString('O')}|ConvertTo-Json -Compress))
-$remote='set -eu; umask 077; t=$(mktemp); trap ''rm -f "$t"'' EXIT; tr -d ''\r\n'' | base64 -d >"$t"; cat /etc/superpan-license/response-signing.key-id; base64 -w0 /etc/superpan-license/response-signing.spki.der; printf "\n"; openssl dgst -sha256 -sign /etc/superpan-license/response-signing.pem "$t" | base64 -w0; printf "\n"'
+$remote='set -eu; umask 077; t=$(mktemp); trap ''rm -f "$t"'' EXIT; tr -d ''\r\n'' | base64 -d >"$t"; cat /etc/superpan-license/response-signing.key-id; base64 -w0 /etc/superpan-license/response-signing.spki.der; printf "\n"; openssl dgst -sha256 -sign /etc/superpan-license/response-signing.key "$t" | base64 -w0; printf "\n"'
 $remoteLines=@([Convert]::ToBase64String($challenge)|& ssh -- ("root@"+$ServerHost) $remote)
 if($LASTEXITCODE-ne 0-or $remoteLines.Count-ne 3-or $remoteLines[0]-cne $a.signingKeyId-or $remoteLines[1]-cne $a.signingSpkiDerBase64){throw 'Installed response-signing identity does not match the exact clients.'}
 $der=[Convert]::FromBase64String($remoteLines[1]);$key=[Security.Cryptography.ECDsa]::Create()
