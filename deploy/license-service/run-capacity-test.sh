@@ -125,7 +125,7 @@ START_ATTEMPTED=false
 printf 'stopped\n' >"$STOPPED_MARKER"; chown superpan-license:superpan-license "$STOPPED_MARKER"; chmod 600 "$STOPPED_MARKER"
 runuser -u superpan-license -- "$TOOLS/license-dbcheck" --database "$DATABASE" --root "$ROOT" --stopped-marker "$STOPPED_MARKER" --expected-counts "$EXPECTED_COUNTS"
 assert_public_absent
-for file in "$STOPPED_MARKER" "$ROOT/process-50.samples" "$ROOT/process-100.samples" "$EXPECTED_COUNTS" "$ROOT/state.db-wal" "$ROOT/state.db-shm" "$ROOT/state.db-journal" "$DATABASE"; do [ ! -e "$file" ] || rm -f -- "$file"; done
+for file in "$STOPPED_MARKER" "$ROOT/process-50.samples" "$ROOT/process-100.samples" "$EXPECTED_COUNTS" "$ROOT/state.db-wal" "$ROOT/state.db-shm" "$ROOT/state.db-journal" "$DATABASE" "$MANIFEST"; do [ ! -e "$file" ] || rm -f -- "$file"; done
 for file in "$CONFIG" "$CONFIG_ROOT/encryption.key" "$CONFIG_ROOT/lookup.key" "$CONFIG_ROOT/response-signing.key" "$CONFIG_ROOT/admin.secret" "$SECRET_FILE" "$CONFIG_ROOT/response-signing.key-id" "$CONFIG_ROOT/response-signing.spki.der" "$CONFIG_ROOT/response-signing.spki.base64" "$CONFIG_ROOT/response-signing.spki.sha256"; do [ ! -e "$file" ] || rm -f -- "$file"; done
 rmdir -- "$ROOT"
 rmdir -- "$CONFIG_ROOT"

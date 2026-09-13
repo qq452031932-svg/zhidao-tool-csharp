@@ -67,6 +67,12 @@ func TestCapacityCleanupStopsUnitAfterEveryStartAttempt(t *testing.T) {
 	}
 }
 
+func TestCapacitySuccessCleanupRemovesManifestBeforeStateRoot(t *testing.T) {
+	body := read(t, "deploy", "license-service", "run-capacity-test.sh")
+	requireFragments(t, body, `"$MANIFEST"`, `rmdir -- "$ROOT"`)
+	requireBefore(t, body, `"$MANIFEST"`, `rmdir -- "$ROOT"`)
+}
+
 func validateCapacityRuntimeContract(body string) error {
 	for _, required := range []string{"jq -S '{public_api_base_path,limits}'", "runtime Uid mismatch", "runtime Gid mismatch", "runtime Umask mismatch", "runtime NOFILE mismatch", "ACTUAL_GROUPS", "run_phase 50 600", "run_phase 100 600", "phase sample count too low", "phase sample coverage too short", "wait \"$SAMPLER_PID\""} {
 		if !strings.Contains(body, required) {
