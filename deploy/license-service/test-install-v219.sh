@@ -19,6 +19,12 @@ FAILPOINTS=(identity secret-encryption secret-lookup secret-admin secret-signing
 RETRY_FAILPOINTS=(secret-publish license-binary license-config license-unit license-start license-health ota-binary ota-config ota-unit ota-restart ota-health)
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+read_systemd_property() {
+    local property="$1" unit="$2" output
+    output="$(systemctl show --property="$property" "$unit")"
+    [ "$(printf '%s\n' "$output" | wc -l)" -eq 1 ] || return 1
+    case "$output" in "$property="*) printf '%s\n' "${output#*=}" ;; *) return 1 ;; esac
+}
 usage() { echo "usage: test-install-v219.sh --bundle ABSOLUTE_PATH --fixture-vhost FIXTURE_ID" >&2; exit 2; }
 mark_seen() { [ "${SEEN_ARGS[$1]+set}" != set ] || die "duplicate option: $1"; SEEN_ARGS["$1"]=1; }
 while [ "$#" -gt 0 ]; do
@@ -135,7 +141,7 @@ assert_unit_state() {
 }
 assert_listener_identity() {
     local unit="$1" port="$2" binary="$3" expected_hash="$4" pid process_hash sockets endpoints
-    pid="$(systemctl show --property=MainPID --value "$unit")"
+    pid="$(read_systemd_property MainPID "$unit")"
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "$unit MainPID"
     process_hash="$(sha256sum -- "/proc/$pid/exe" | awk '{print $1}')"
     [ "$process_hash" = "$expected_hash" ] && [ "$(sha256sum -- "$binary" | awk '{print $1}')" = "$expected_hash" ] || die "$unit process identity"

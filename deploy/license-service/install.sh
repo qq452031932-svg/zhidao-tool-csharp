@@ -1021,19 +1021,29 @@ record_persistent_identity() {
 record_persistent_identity
 refresh_manifest
 
+read_systemd_main_pid() {
+    local output
+    output="$(systemctl show --property=MainPID superpan-license.service 2>/dev/null || :)"
+    [ "$(printf '%s\n' "$output" | wc -l)" -eq 1 ] || return 1
+    case "$output" in
+        MainPID=*) printf '%s\n' "${output#MainPID=}" ;;
+        *) return 1 ;;
+    esac
+}
+
 wait_for_installed_license_process() {
     local attempt observed_pid observed_again process_hash installed_hash process_exe
     installed_hash="$(sha256sum -- "$DEST/superpan-license" | awk '{print $1}')"
     for attempt in $(seq 1 30); do
         if systemctl is-active --quiet superpan-license.service; then
-            LICENSE_MAIN_PID="$(systemctl show --property=MainPID --value superpan-license.service 2>/dev/null || :)"
+            LICENSE_MAIN_PID="$(read_systemd_main_pid || :)"
             if [[ "$LICENSE_MAIN_PID" =~ ^[1-9][0-9]*$ ]] && [ -e "/proc/$LICENSE_MAIN_PID/exe" ]; then
                 process_exe="$(readlink -f -- "/proc/$LICENSE_MAIN_PID/exe" 2>/dev/null || :)"
                 process_hash="$(sha256sum -- "/proc/$LICENSE_MAIN_PID/exe" 2>/dev/null | awk '{print $1}')"
                 if [ -n "$process_exe" ] && [ "$process_hash" = "$installed_hash" ] &&
                    curl --noproxy '*' --fail --silent --show-error --max-time 2 http://127.0.0.1:18092/internal/health >/dev/null; then
                     observed_pid="$LICENSE_MAIN_PID"
-                    observed_again="$(systemctl show --property=MainPID --value superpan-license.service 2>/dev/null || :)"
+                    observed_again="$(read_systemd_main_pid || :)"
                     [ "$observed_again" = "$observed_pid" ] || { sleep 1; continue; }
                     [ "$process_hash" = "$LICENSE_BINARY_SHA256" ] || die "installed license process binary hash mismatch"
                     return 0

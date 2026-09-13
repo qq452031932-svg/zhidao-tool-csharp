@@ -938,6 +938,20 @@ func TestV219HarnessCoversLifecycleAndKeepsLinuxGate(t *testing.T) {
 	if strings.Contains(harness, "nginx") { t.Fatal("license staging harness must not inspect or modify Nginx") }
 }
 
+func TestLicenseDeploymentScriptsUseV219CompatibleSystemctlProperties(t *testing.T) {
+	for _, path := range [][]string{
+		{"deploy", "license-service", "install.sh"},
+		{"deploy", "license-service", "run-capacity-test.sh"},
+		{"deploy", "license-service", "test-install-v219.sh"},
+	} {
+		body := read(t, path...)
+		if strings.Contains(body, `systemctl show --property=MainPID --value`) ||
+			strings.Contains(body, `systemctl show --property=User --value`) {
+			t.Fatalf("%v uses systemctl show --value, which is unsupported by systemd v219", path)
+		}
+	}
+}
+
 func TestLicenseRestartProvesNewProcessIdentity(t *testing.T) {
 	install := read(t, "deploy", "license-service", "install.sh")
 	requireFragments(t, install,
@@ -945,9 +959,13 @@ func TestLicenseRestartProvesNewProcessIdentity(t *testing.T) {
 		`systemctl restart superpan-license.service`,
 		`for attempt in $(seq 1 30)`,
 		`curl --noproxy '*' --fail --silent --show-error --max-time 2 http://127.0.0.1:18092/internal/health`,
-		`systemctl show --property=MainPID --value superpan-license.service`,
+		`read_systemd_main_pid`,
+		`systemctl show --property=MainPID superpan-license.service`,
 		`/proc/$LICENSE_MAIN_PID/exe`, `installed license process binary hash mismatch`,
 	)
+	if strings.Contains(install, `systemctl show --property=MainPID --value`) {
+		t.Fatal("systemd v219 does not support systemctl show --value")
+	}
 	if strings.Contains(install, "systemctl enable --now superpan-license.service") {
 		t.Fatal("enable --now may leave the old active process running")
 	}

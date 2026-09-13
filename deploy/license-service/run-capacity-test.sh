@@ -25,6 +25,12 @@ ORIGIN=http://127.0.0.1:18093
 
 canonical_file(){ [ -f "$1" ] && [ ! -L "$1" ] && [ "$(readlink -f -- "$1")" = "$1" ] && [ "$(stat -c '%h' "$1")" = 1 ] || die 'untrusted input file'; }
 canonical_dir(){ [ -d "$1" ] && [ ! -L "$1" ] && [ "$(readlink -f -- "$1")" = "$1" ] || die 'untrusted input directory'; }
+read_systemd_property(){
+  local property=$1 unit=$2 output
+  output=$(systemctl show --property="$property" "$unit")
+  [ "$(printf '%s\n' "$output" | wc -l)" -eq 1 ] || return 1
+  case "$output" in "$property="*) printf '%s\n' "${output#*=}" ;; *) return 1 ;; esac
+}
 assert_public_absent(){ [ ! -e "$PUBLIC_INCLUDE" ] || die 'public include must remain absent'; }
 assert_public_absent
 canonical_dir "$BUNDLE"; canonical_dir "$TOOLS"; canonical_dir "$ROOT"
@@ -52,14 +58,14 @@ cleanup_failure(){
 trap cleanup_failure EXIT INT TERM HUP
 START_ATTEMPTED=true
 systemctl start "$UNIT"
-MAIN_PID=$(systemctl show --property=MainPID --value "$UNIT"); [[ "$MAIN_PID" =~ ^[1-9][0-9]*$ ]] || die 'invalid MainPID'
+MAIN_PID=$(read_systemd_property MainPID "$UNIT"); [[ "$MAIN_PID" =~ ^[1-9][0-9]*$ ]] || die 'invalid MainPID'
 [ "$(readlink -f -- "/proc/$MAIN_PID/exe")" = /opt/superpan-license/superpan-license ] || die 'MainPID executable mismatch'
 [ "$(sha256sum "/proc/$MAIN_PID/exe" | cut -d' ' -f1)" = "$EXPECTED_SERVICE_HASH" ] || die 'MainPID binary hash mismatch'
-[ "$(systemctl show --property=User --value "$UNIT")" = superpan-license ] || die 'unit user mismatch'
-[ "$(systemctl show --property=Group --value "$UNIT")" = superpan-license ] || die 'unit group mismatch'
-[ "$(systemctl show --property=SupplementaryGroups --value "$UNIT")" = superpan-license-admin ] || die 'unit supplementary groups mismatch'
-[ "$(systemctl show --property=UMask --value "$UNIT")" = 0077 ] || die 'unit umask mismatch'
-[ "$(systemctl show --property=LimitNOFILE --value "$UNIT")" = 4096 ] || die 'unit limit mismatch'
+[ "$(read_systemd_property User "$UNIT")" = superpan-license ] || die 'unit user mismatch'
+[ "$(read_systemd_property Group "$UNIT")" = superpan-license ] || die 'unit group mismatch'
+[ "$(read_systemd_property SupplementaryGroups "$UNIT")" = superpan-license-admin ] || die 'unit supplementary groups mismatch'
+[ "$(read_systemd_property UMask "$UNIT")" = 0077 ] || die 'unit umask mismatch'
+[ "$(read_systemd_property LimitNOFILE "$UNIT")" = 4096 ] || die 'unit limit mismatch'
 EXPECTED_UID=$(id -u superpan-license); EXPECTED_GID=$(id -g superpan-license); ADMIN_GID=$(getent group superpan-license-admin | cut -d: -f3)
 awk -v want="$EXPECTED_UID" '$1=="Uid:"{found=1;ok=($2==want&&$3==want&&$4==want&&$5==want)} END{exit !(found&&ok)}' "/proc/$MAIN_PID/status" || die 'runtime Uid mismatch'
 awk -v want="$EXPECTED_GID" '$1=="Gid:"{found=1;ok=($2==want&&$3==want&&$4==want&&$5==want)} END{exit !(found&&ok)}' "/proc/$MAIN_PID/status" || die 'runtime Gid mismatch'
