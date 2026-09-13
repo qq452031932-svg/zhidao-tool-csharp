@@ -753,6 +753,35 @@ func TestLicenseInstallSecretLifecycle(t *testing.T) {
 	}
 }
 
+func TestLicensePersistentValidationUsesTheVerifiedProtectedPath(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`exec {fd}>&-`, `exec {fd}<"$temp"`,
+		`input_path="$7"`,
+		`ec-private) openssl ec -in "$input_path"`,
+		`der) openssl pkey -pubin -inform DER -in "$input_path"`,
+		`validate_open_file "$fd" "$owner" "$group" "$mode" "$size" "$format" "$temp"`,
+		`for path in "${PERSISTENT_TEMP_PATHS[@]-}"`,
+		`for path in "${PERSISTENT_PUBLISHED_PATHS[@]-}"`,
+	)
+	if strings.Count(install, `exec {fd}<"$temp"`) != 2 {
+		t.Fatal("both generated and derived files must be reopened at offset zero before validation")
+	}
+}
+
+func TestLicenseSigningValidationSupportsCentOS7OpenSSL(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`openssl ec -in "$path" -noout`,
+		`ec-private) openssl ec -in "$input_path" -noout`,
+		`openssl ec -in "$private_key" -noout -text`,
+		`openssl ec -in "$private_key" -pubout -outform DER`,
+	)
+	if strings.Contains(install, `openssl ec -in "$path" -check`) || strings.Contains(install, `openssl ec -in "$input_path" -check`) {
+		t.Fatal("CentOS 7 OpenSSL 1.0.2 does not support the ec -check option")
+	}
+}
+
 func TestLicenseInstallACL(t *testing.T) {
 	install := read(t, "deploy", "license-service", "install.sh")
 	requireFragments(t, install,

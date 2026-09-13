@@ -303,7 +303,7 @@ validate_file() {
         ec-private)
             [ "$(grep -c '^-----BEGIN EC PRIVATE KEY-----$' "$path")" -eq 1 ] &&
                 [ "$(grep -c '^-----END EC PRIVATE KEY-----$' "$path")" -eq 1 ] || die "invalid canonical EC private key PEM"
-            openssl ec -in "$path" -check -noout >/dev/null 2>&1 || die "invalid EC private key"
+            openssl ec -in "$path" -noout >/dev/null 2>&1 || die "invalid EC private key"
             ;;
         der) openssl pkey -pubin -inform DER -in "$path" -noout >/dev/null 2>&1 || die "invalid SPKI DER" ;;
         config) ;;
@@ -651,26 +651,27 @@ cleanup_persistent_transaction() {
     local status=$? path
     if [ "$PERSISTENT_TRANSACTION_ARMED" = true ]; then
         set +e
-        for path in "${PERSISTENT_TEMP_PATHS[@]}"; do rm -f -- "$path"; done
-        for path in "${PERSISTENT_PUBLISHED_PATHS[@]}"; do rm -f -- "$path"; done
+        for path in "${PERSISTENT_TEMP_PATHS[@]-}"; do [ -n "$path" ] && rm -f -- "$path"; done
+        for path in "${PERSISTENT_PUBLISHED_PATHS[@]-}"; do [ -n "$path" ] && rm -f -- "$path"; done
         sync_directory "$ETC"
     fi
     return "$status"
 }
 
 validate_open_file() {
-    local fd="$1" owner="$2" group="$3" mode="$4" size="$5" format="$6" path="/proc/self/fd/$1"
-    [ "$(stat -Lc '%U:%G:%a:%h' "$path")" = "$owner:$group:$mode:1" ] || die "open persistent file metadata mismatch"
-    [ "$(stat -Lc '%s' "$path")" = "$size" ] || die "open persistent file size mismatch"
+    local fd="$1" owner="$2" group="$3" mode="$4" size="$5" format="$6" input_path="$7" descriptor_path="/proc/self/fd/$1"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$descriptor_path")" = "$owner:$group:$mode:1" ] || die "open persistent file metadata mismatch"
+    [ "$(stat -Lc '%s' "$descriptor_path")" = "$size" ] || die "open persistent file size mismatch"
     case "$format" in
-        raw32) [ "$(wc -c <"$path")" -eq 32 ] || die "invalid open raw secret" ;;
-        key-id) [[ "$(cat "$path")" =~ ^license-signing-[0-9a-f]{32}$ ]] && [ "$(wc -l <"$path")" -eq 1 ] || die "invalid open key ID" ;;
-        sha256) [[ "$(cat "$path")" =~ ^[0-9a-f]{64}$ ]] && [ "$(wc -l <"$path")" -eq 1 ] || die "invalid open hash" ;;
-        base64) [[ "$(cat "$path")" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ "$(wc -l <"$path")" -eq 1 ] || die "invalid open base64" ;;
-        ec-private) openssl ec -in "$path" -check -noout >/dev/null 2>&1 || die "invalid open EC key" ;;
-        der) openssl pkey -pubin -inform DER -in "$path" -noout >/dev/null 2>&1 || die "invalid open DER" ;;
+        raw32) [ "$(wc -c <"$input_path")" -eq 32 ] || die "invalid open raw secret" ;;
+        key-id) [[ "$(cat "$input_path")" =~ ^license-signing-[0-9a-f]{32}$ ]] && [ "$(wc -l <"$input_path")" -eq 1 ] || die "invalid open key ID" ;;
+        sha256) [[ "$(cat "$input_path")" =~ ^[0-9a-f]{64}$ ]] && [ "$(wc -l <"$input_path")" -eq 1 ] || die "invalid open hash" ;;
+        base64) [[ "$(cat "$input_path")" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ "$(wc -l <"$input_path")" -eq 1 ] || die "invalid open base64" ;;
+        ec-private) openssl ec -in "$input_path" -noout >/dev/null 2>&1 || die "invalid open EC key" ;;
+        der) openssl pkey -pubin -inform DER -in "$input_path" -noout >/dev/null 2>&1 || die "invalid open DER" ;;
         *) die "unknown open persistent format" ;;
     esac
+    [ "$(stat -Lc '%d:%i:%h' "$descriptor_path")" = "$(stat -Lc '%d:%i:%h' "$input_path")" ] || die "validated persistent path changed identity"
 }
 
 create_exclusive_temp() {
@@ -695,11 +696,13 @@ create_exclusive_temp() {
     esac
     chmod "$mode" "/proc/self/fd/$fd"
     chown "$owner:$group" "/proc/self/fd/$fd"
+    sync -f "/proc/self/fd/$fd" 2>/dev/null || sync
+    exec {fd}>&-
+    exec {fd}<"$temp"
     fd_identity="$(stat -Lc '%d:%i:%h' "/proc/self/fd/$fd")"
     path_identity="$(stat -Lc '%d:%i:%h' "$temp")"
     [ "$fd_identity" = "$path_identity" ] && [ "${fd_identity##*:}" = 1 ] || die "persistent temporary inode changed"
-    validate_open_file "$fd" "$owner" "$group" "$mode" "$size" "$format"
-    sync -f "/proc/self/fd/$fd" 2>/dev/null || sync
+    validate_open_file "$fd" "$owner" "$group" "$mode" "$size" "$format" "$temp"
     exec {fd}>&-
     CREATED_TEMP="$temp"
 }
@@ -725,11 +728,13 @@ stage_derived_file() {
     esac
     chmod "$mode" "/proc/self/fd/$fd"
     chown "$owner:$group" "/proc/self/fd/$fd"
+    sync -f "/proc/self/fd/$fd" 2>/dev/null || sync
+    exec {fd}>&-
+    exec {fd}<"$temp"
     fd_identity="$(stat -Lc '%d:%i:%h' "/proc/self/fd/$fd")"
     path_identity="$(stat -Lc '%d:%i:%h' "$temp")"
     [ "$fd_identity" = "$path_identity" ] && [ "${fd_identity##*:}" = 1 ] || die "derived temporary inode changed"
-    validate_open_file "$fd" "$owner" "$group" "$mode" "$size" "$format"
-    sync -f "/proc/self/fd/$fd" 2>/dev/null || sync
+    validate_open_file "$fd" "$owner" "$group" "$mode" "$size" "$format" "$temp"
     exec {fd}>&-
     CREATED_TEMP="$temp"
 }
