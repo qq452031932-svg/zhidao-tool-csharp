@@ -20,10 +20,13 @@ public sealed record LocalHistoryCleanupPreview
     public const int MaximumSnapshotTokenLength = 256;
 
     public LocalHistoryCleanupPreview(
+        LocalHistoryKind Kind,
         int TerminalBatchCount,
         bool HasConflicts,
         string? SnapshotToken)
     {
+        if (!Enum.IsDefined(Kind) || Kind == LocalHistoryKind.Unspecified)
+            throw new ArgumentOutOfRangeException(nameof(Kind));
         if (TerminalBatchCount < 0)
             throw new ArgumentOutOfRangeException(nameof(TerminalBatchCount));
         if (SnapshotToken is not null &&
@@ -32,11 +35,13 @@ public sealed record LocalHistoryCleanupPreview
         if (TerminalBatchCount > 0 && SnapshotToken is null)
             throw new ArgumentException("A snapshot token is required when terminal batches exist.", nameof(SnapshotToken));
 
+        this.Kind = Kind;
         this.TerminalBatchCount = TerminalBatchCount;
         this.HasConflicts = HasConflicts;
         this.SnapshotToken = SnapshotToken;
     }
 
+    public LocalHistoryKind Kind { get; }
     public int TerminalBatchCount { get; }
     public bool HasConflicts { get; }
     public string? SnapshotToken { get; }
@@ -72,7 +77,6 @@ public interface ILocalTerminalHistoryStore
         CancellationToken cancellationToken = default);
 
     Task<LocalHistoryCleanupResult> DeleteAsync(
-        LocalHistoryKind kind,
-        string snapshotToken,
+        LocalHistoryCleanupPreview confirmedPreview,
         CancellationToken cancellationToken = default);
 }

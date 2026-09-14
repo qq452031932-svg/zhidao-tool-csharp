@@ -7,27 +7,30 @@ public sealed class LocalTerminalHistoryService(ILocalTerminalHistoryStore store
     private readonly ILocalTerminalHistoryStore store =
         store ?? throw new ArgumentNullException(nameof(store));
 
-    public Task<LocalHistoryCleanupPreview> PreviewAsync(
+    public async Task<LocalHistoryCleanupPreview> PreviewAsync(
         LocalHistoryKind kind,
         CancellationToken cancellationToken = default)
     {
         ValidateKind(kind);
-        return store.PreviewAsync(kind, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        var preview = await store.PreviewAsync(kind, cancellationToken).ConfigureAwait(false);
+        if (preview.Kind != kind)
+            throw new InvalidOperationException("The local history preview kind does not match the request.");
+        return preview;
     }
 
     public async Task<LocalHistoryCleanupResult> DeleteAsync(
-        LocalHistoryKind kind,
         LocalHistoryCleanupPreview confirmedPreview,
         CancellationToken cancellationToken = default)
     {
-        ValidateKind(kind);
         ArgumentNullException.ThrowIfNull(confirmedPreview);
+        cancellationToken.ThrowIfCancellationRequested();
         if (confirmedPreview.HasConflicts)
             return new(0, LocalHistoryCleanupDisposition.Conflict);
         if (confirmedPreview.TerminalBatchCount == 0)
             return new(0, LocalHistoryCleanupDisposition.NothingToDelete);
 
-        return await store.DeleteAsync(kind, confirmedPreview.SnapshotToken!, cancellationToken).ConfigureAwait(false);
+        return await store.DeleteAsync(confirmedPreview, cancellationToken).ConfigureAwait(false);
     }
 
     private static void ValidateKind(LocalHistoryKind kind)
