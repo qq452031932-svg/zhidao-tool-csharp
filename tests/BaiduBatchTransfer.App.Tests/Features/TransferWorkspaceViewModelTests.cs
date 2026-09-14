@@ -368,6 +368,29 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task CallerCancellationAfterCommittedCleanupStillResetsCurrentOpenWorkspace()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var store = new CurrentImportCleanupStore { BeforeReturn = cancellation.Cancel };
+        using var fixture = Fixture.Create(
+            importCleanupStore: store,
+            importCleanupInteraction: new CurrentImportCleanupInteraction());
+        fixture.ApplyReadyDraft();
+        var session = Assert.IsType<Guid>(fixture.Import.SessionId);
+
+        await fixture.ViewModel.ClearCurrentImportAsync(cancellation.Token);
+
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.True(store.ReturnedResult);
+        Assert.Null(fixture.Import.SessionId);
+        Assert.Null(fixture.Wizard.CurrentImportSessionId);
+        Assert.Equal(0, fixture.Wizard.ReadyResourceCount);
+        Assert.False(fixture.ViewModel.CanStart);
+        Assert.Equal("已清空当前导入，可重新选择 Excel", fixture.ViewModel.StatusMessage);
+        Assert.Equal([session], fixture.ImportWorkflow.DiscardedSessions);
+    }
+
+    [Fact]
     public async Task CleanupCompletionNeverResetsANewerImportedSession()
     {
         var store = new CurrentImportCleanupStore { Block = true };
@@ -3616,6 +3639,7 @@ public sealed class TransferWorkspaceViewModelTests
         public bool Block { get; set; }
         public bool CancellationObserved { get; private set; }
         public bool ReturnedResult { get; private set; }
+        public Action? BeforeReturn { get; set; }
 
         public async Task<LocalImportDraftCleanupResult> DeleteAsync(
             Guid importSessionId,
@@ -3633,6 +3657,7 @@ public sealed class TransferWorkspaceViewModelTests
                 throw;
             }
             if (Exception is not null) throw Exception;
+            BeforeReturn?.Invoke();
             ReturnedResult = true;
             return Result;
         }

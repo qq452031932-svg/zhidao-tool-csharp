@@ -377,7 +377,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
                 var result = await importDraftCleanupService!
                     .DeleteAsync(capturedSession, linked.Token)
                     .ConfigureAwait(true);
-                if (isClosed || linked.IsCancellationRequested) return;
+                if (isClosed) return;
                 if (result.Disposition is LocalImportDraftCleanupDisposition.Deleted or
                     LocalImportDraftCleanupDisposition.AlreadyAbsent)
                 {
@@ -403,6 +403,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
                     RaiseStartState();
                     return;
                 }
+                if (linked.IsCancellationRequested) return;
                 StatusMessage = result.Disposition switch
                 {
                     LocalImportDraftCleanupDisposition.BatchConflict =>
