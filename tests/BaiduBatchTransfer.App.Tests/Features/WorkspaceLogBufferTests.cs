@@ -84,6 +84,28 @@ public sealed class WorkspaceLogBufferTests
     }
 
     [Fact]
+    public void ClearRemovesEntriesAndResetsConsecutiveDuplicateTracking()
+    {
+        var buffer = new WorkspaceLogBuffer();
+        var first = new DateTimeOffset(2026, 9, 14, 8, 0, 0, TimeSpan.Zero);
+        var second = first.AddSeconds(1);
+
+        buffer.AppendSafe("正在处理", timestamp: first);
+        buffer.Clear();
+
+        var duplicateCursor = typeof(WorkspaceLogBuffer).GetField(
+            "lastAppendedEntry",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(duplicateCursor);
+        Assert.Null(duplicateCursor.GetValue(buffer));
+
+        buffer.AppendSafe("正在处理", timestamp: second);
+
+        var entry = Assert.Single(buffer.Entries);
+        Assert.Equal(second, entry.Timestamp);
+    }
+
+    [Fact]
     public void SupportsEveryExplicitLevel()
     {
         var buffer = new WorkspaceLogBuffer();

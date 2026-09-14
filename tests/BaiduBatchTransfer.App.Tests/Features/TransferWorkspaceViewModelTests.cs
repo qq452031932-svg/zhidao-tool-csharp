@@ -809,6 +809,58 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public void ClearLogsCommandClearsOnlyRuntimeLogsAndReportsThroughStatus()
+    {
+        using var fixture = Fixture.Valid();
+
+        Assert.True(fixture.ViewModel.CanClearLogs);
+        Assert.True(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+
+        fixture.ViewModel.ClearLogsCommand.Execute(null);
+
+        Assert.Empty(fixture.ViewModel.Logs);
+        Assert.Equal("运行日志已清空。", fixture.ViewModel.StatusMessage);
+        Assert.Equal("运行日志已清空。", fixture.ViewModel.UserFacingStatusMessage);
+        Assert.False(fixture.ViewModel.CanClearLogs);
+        Assert.False(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ClearLogsCommandIsDisabledWhileBusyAndAfterClose()
+    {
+        var precheck = new BlockingPrecheckWorkflow();
+        using var fixture = Fixture.Valid(precheckWorkflow: precheck);
+
+        var starting = fixture.ViewModel.StartAsync();
+        await precheck.Started.Task;
+
+        Assert.False(fixture.ViewModel.CanClearLogs);
+        Assert.False(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+
+        precheck.Release();
+        await starting;
+        fixture.ViewModel.Close();
+
+        Assert.False(fixture.ViewModel.CanClearLogs);
+        Assert.False(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public void RuntimeLogTabHeaderPlacesAccessibleClearButtonBesideRecentLimit()
+    {
+        var path = Path.Combine(FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Transfers", "TransferWorkspaceView.xaml");
+        var document = XDocument.Load(path);
+        var button = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "Button" &&
+            (string?)element.Attribute("Command") == "{Binding ClearLogsCommand}");
+        var header = Assert.IsType<XElement>(button.Parent);
+
+        Assert.Equal("清空日志", (string?)button.Attribute("Content"));
+        Assert.Equal("清空运行日志", (string?)button.Attribute("AutomationProperties.Name"));
+        Assert.Contains(header.Elements(), element => (string?)element.Attribute("Text") == "最近 100 条");
+    }
+
+    [Fact]
     public async Task UserFacingStatusMessageNotifiesWheneverInternalStatusChanges()
     {
         using var fixture = Fixture.Valid();

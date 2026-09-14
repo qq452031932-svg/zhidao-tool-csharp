@@ -89,6 +89,61 @@ public sealed class ShareWorkspaceViewModelTests
     }
 
     [Fact]
+    public void ClearLogsCommandClearsOnlyRuntimeLogsAndReportsThroughStatus()
+    {
+        using var vm = Fixture(activeAccount: AccountA);
+
+        Assert.True(vm.CanClearLogs);
+        Assert.True(vm.ClearLogsCommand.CanExecute(null));
+
+        vm.ClearLogsCommand.Execute(null);
+
+        Assert.Empty(vm.Logs);
+        Assert.Equal("运行日志已清空。", vm.StatusMessage);
+        Assert.Equal("运行日志已清空。", vm.UserFacingStatusMessage);
+        Assert.False(vm.CanClearLogs);
+        Assert.False(vm.ClearLogsCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ClearLogsCommandIsDisabledWhileBusyAndAfterClose()
+    {
+        var store = new FakeStore
+        {
+            BeforeGetBatches = cancellationToken => Task.Delay(Timeout.Infinite, cancellationToken),
+        };
+        using var vm = Fixture(store: store, activeAccount: AccountA);
+
+        var loading = vm.InitializeAsync();
+        await store.DelayedHistoryStarted.Task;
+
+        Assert.False(vm.CanClearLogs);
+        Assert.False(vm.ClearLogsCommand.CanExecute(null));
+
+        vm.Close();
+        await loading;
+
+        Assert.False(vm.CanClearLogs);
+        Assert.False(vm.ClearLogsCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public void RuntimeLogHeaderPlacesAccessibleClearButtonBesideRecentLimit()
+    {
+        var path = Path.Combine(FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Shares", "ShareWorkspaceView.xaml");
+        var document = XDocument.Load(path);
+        var button = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "Button" &&
+            (string?)element.Attribute("Command") == "{Binding ClearLogsCommand}");
+        var header = Assert.IsType<XElement>(button.Parent);
+
+        Assert.Equal("清空日志", (string?)button.Attribute("Content"));
+        Assert.Equal("清空运行日志", (string?)button.Attribute("AutomationProperties.Name"));
+        Assert.Contains(header.Elements(), element => (string?)element.Attribute("Text") == "运行日志");
+        Assert.Contains(header.Elements(), element => (string?)element.Attribute("Text") == "最近 100 条");
+    }
+
+    [Fact]
     public async Task DisposePreventsLateStatusFromAppendingToLogs()
     {
         var store = new FakeStore

@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.IO;
 using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Services;
@@ -148,6 +149,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
             ChooseResultDirectoryAsync,
             () => CanEditSelection);
         StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
+        ClearLogsCommand = new RelayCommand(ClearLogs, () => CanClearLogs);
         ResetPendingDraftCommand = new AsyncRelayCommand(
             ResetPendingDraftAsync,
             () => CanResetPendingDraft);
@@ -162,6 +164,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
             PreviousHistoryPageAsync, () => CanLoadPreviousHistoryPage);
         NextHistoryPageCommand = new AsyncRelayCommand(
             NextHistoryPageAsync, () => CanLoadNextHistoryPage);
+        ((INotifyCollectionChanged)Logs).CollectionChanged += OnLogsChanged;
         logBuffer.AppendSafe(StatusMessage);
     }
 
@@ -322,6 +325,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public bool CanLoadPreviousHistoryPage => CanSelectHistory && HistoryPageNumber > 1;
     public bool CanLoadNextHistoryPage => CanSelectHistory &&
         (long)HistoryPageNumber * historyPageSize < historyTotalCount;
+    public bool CanClearLogs => !IsClosed && !IsBusy && Logs.Count > 0;
 
     public IAsyncRelayCommand PickResourcesCommand { get; }
     public IAsyncRelayCommand ChooseResultDirectoryCommand { get; }
@@ -336,6 +340,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public IRelayCommand CancelSaveResultsCommand { get; }
     public IAsyncRelayCommand PreviousHistoryPageCommand { get; }
     public IAsyncRelayCommand NextHistoryPageCommand { get; }
+    public IRelayCommand ClearLogsCommand { get; }
 
     public void ReloadAccounts(IReadOnlyList<ShareAccountOption> accounts)
     {
@@ -764,6 +769,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         if (isClosed) return;
         isClosed = true;
         lifetime.Cancel();
+        ((INotifyCollectionChanged)Logs).CollectionChanged -= OnLogsChanged;
         OnPropertyChanged(nameof(IsClosed));
         NotifyCommandState();
     }
@@ -772,6 +778,20 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     {
         Close();
         lifetime.Dispose();
+    }
+
+    private void ClearLogs()
+    {
+        if (!CanClearLogs) return;
+        logBuffer.Clear();
+        if (SetProperty(ref statusMessage, "运行日志已清空。", nameof(StatusMessage)))
+            OnPropertyChanged(nameof(UserFacingStatusMessage));
+    }
+
+    private void OnLogsChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        OnPropertyChanged(nameof(CanClearLogs));
+        ClearLogsCommand.NotifyCanExecuteChanged();
     }
 
     private async Task LoadBatchOperationsAsync(Guid batchId, CancellationToken cancellationToken)
@@ -1226,6 +1246,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CanCancelSaveResults));
         OnPropertyChanged(nameof(CanLoadPreviousHistoryPage));
         OnPropertyChanged(nameof(CanLoadNextHistoryPage));
+        OnPropertyChanged(nameof(CanClearLogs));
         PickResourcesCommand?.NotifyCanExecuteChanged();
         ChooseResultDirectoryCommand?.NotifyCanExecuteChanged();
         StartCommand?.NotifyCanExecuteChanged();
@@ -1239,6 +1260,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         CancelSaveResultsCommand?.NotifyCanExecuteChanged();
         PreviousHistoryPageCommand?.NotifyCanExecuteChanged();
         NextHistoryPageCommand?.NotifyCanExecuteChanged();
+        ClearLogsCommand?.NotifyCanExecuteChanged();
     }
 }
 

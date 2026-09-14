@@ -86,6 +86,12 @@ public sealed class WorkspaceLogBuffer
 
     public ReadOnlyObservableCollection<WorkspaceLogEntry> Entries { get; }
 
+    public void Clear()
+    {
+        entries.Clear();
+        lastAppendedEntry = null;
+    }
+
     public void AppendSafe(
         string? message,
         WorkspaceLogLevel? level = null,

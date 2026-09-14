@@ -78,6 +78,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         this.acceptanceRunAsync = acceptanceRunAsync;
         this.licenseGate = licenseGate;
         StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
+        ClearLogsCommand = new RelayCommand(ClearLogs, () => CanClearLogs);
         SelectSingleAccountCommand = new AsyncRelayCommand(
             () => SelectAccountModeAsync(TransferAccountMode.SingleAccount),
             () => CanEditConfiguration);
@@ -102,6 +103,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         RunPanel.Results.PropertyChanged += OnStatusSourcePropertyChanged;
         RunPanel.Results.Items.CollectionChanged += OnResultItemsChanged;
         Import.Rows.CollectionChanged += OnPendingRowsChanged;
+        ((INotifyCollectionChanged)Logs).CollectionChanged += OnLogsChanged;
         AppendPresentationLog(StatusMessage);
         AppendPresentationLog(Import.StatusMessage);
         AppendPresentationLog(RunPanel.StatusMessage);
@@ -290,8 +292,10 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     }
     public bool CanStart =>
         !isClosed && !IsStarting && !Import.IsBusy && string.IsNullOrEmpty(EvaluateConfiguration());
+    public bool CanClearLogs => !isClosed && !IsStarting && !Import.IsBusy && Logs.Count > 0;
     public string ConfigurationMessage => EvaluateConfiguration();
     public IAsyncRelayCommand StartCommand { get; }
+    public IRelayCommand ClearLogsCommand { get; }
     public IAsyncRelayCommand SelectSingleAccountCommand { get; }
     public IAsyncRelayCommand SelectReplicationCommand { get; }
     public IAsyncRelayCommand SelectDistributionCommand { get; }
@@ -657,6 +661,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         RunPanel.Results.PropertyChanged -= OnStatusSourcePropertyChanged;
         RunPanel.Results.Items.CollectionChanged -= OnResultItemsChanged;
         Import.Rows.CollectionChanged -= OnPendingRowsChanged;
+        ((INotifyCollectionChanged)Logs).CollectionChanged -= OnLogsChanged;
         Import.Close();
         RunPanel.Close();
         OnPropertyChanged(nameof(IsClosed));
@@ -670,6 +675,14 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         RunPanel.Dispose();
         Import.Dispose();
         lifetime.Dispose();
+    }
+
+    private void ClearLogs()
+    {
+        if (!CanClearLogs) return;
+        logBuffer.Clear();
+        if (SetProperty(ref statusMessage, "运行日志已清空。", nameof(StatusMessage)))
+            OnPropertyChanged(nameof(UserFacingStatusMessage));
     }
 
     private string EvaluateConfiguration()
@@ -867,6 +880,12 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         if (ReferenceEquals(sender, Wizard)) SynchronizeAccountState();
         OnPropertyChanged(nameof(CanEditConfiguration));
         RaiseStartState();
+    }
+
+    private void OnLogsChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        OnPropertyChanged(nameof(CanClearLogs));
+        ClearLogsCommand.NotifyCanExecuteChanged();
     }
 
     private void OnBatchTerminal(object? sender, WorkspaceBatchTerminalEvent terminal)
@@ -1117,5 +1136,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(ConfigurationMessage));
         OnPropertyChanged(nameof(CanEditConfiguration));
         StartCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(CanClearLogs));
+        ClearLogsCommand.NotifyCanExecuteChanged();
     }
 }
