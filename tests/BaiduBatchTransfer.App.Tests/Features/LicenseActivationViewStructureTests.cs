@@ -56,8 +56,8 @@ public sealed class LicenseActivationViewStructureTests
         Assert.Contains("Text=\"{Binding Card, Mode=TwoWay", markup, StringComparison.Ordinal);
         Assert.Contains("Command=\"{Binding ActivateCommand}\"", markup, StringComparison.Ordinal);
         Assert.Contains("Command=\"{Binding CloseCommand}\"", markup, StringComparison.Ordinal);
-        Assert.Contains("Background=\"#0F9D8A\"", markup, StringComparison.Ordinal);
-        Assert.Contains("Background=\"White\"", markup, StringComparison.Ordinal);
+        Assert.Contains("#00796B", markup, StringComparison.Ordinal);
+        Assert.Contains("Property=\"Background\" Value=\"White\"", markup, StringComparison.Ordinal);
         Assert.DoesNotContain("续费", markup, StringComparison.Ordinal);
         Assert.DoesNotContain("支付", markup, StringComparison.Ordinal);
         Assert.DoesNotContain("购买", markup, StringComparison.Ordinal);
@@ -87,6 +87,44 @@ public sealed class LicenseActivationViewStructureTests
         Assert.Contains("卡密输入", automationNames);
         Assert.Contains("{Binding ActivateButtonText}", automationNames);
         Assert.Contains("暂不激活", automationNames);
+    }
+
+    [Fact]
+    public void BrandColorsMeetNormalTextContrastAndHighContrastUsesSystemBrushes()
+    {
+        var document = XDocument.Load(FindRepositoryFile(
+            "src",
+            "BaiduBatchTransfer.App",
+            "Features",
+            "Licensing",
+            "LicenseActivationWindow.xaml"));
+        var markup = document.ToString(SaveOptions.DisableFormatting);
+
+        Assert.Contains("SystemParameters.HighContrast", markup, StringComparison.Ordinal);
+        Assert.Contains("SystemColors.WindowBrushKey", markup, StringComparison.Ordinal);
+        Assert.Contains("SystemColors.WindowTextBrushKey", markup, StringComparison.Ordinal);
+        Assert.Contains("SystemColors.HighlightBrushKey", markup, StringComparison.Ordinal);
+        Assert.Contains("SystemColors.HighlightTextBrushKey", markup, StringComparison.Ordinal);
+
+        var headerBackground = StyleSetterValue(document, "ActivationHeaderStyle", "Background");
+        var titleForeground = StyleSetterValue(document, "ActivationHeaderTitleStyle", "Foreground");
+        var subtitleForeground = StyleSetterValue(document, "ActivationHeaderSubtitleStyle", "Foreground");
+        var buttonBackground = StyleSetterValue(document, "ActivationPrimaryButtonStyle", "Background");
+        var buttonForeground = StyleSetterValue(document, "ActivationPrimaryButtonStyle", "Foreground");
+        Assert.Equal("#00796B", headerBackground);
+        Assert.Equal(headerBackground, buttonBackground);
+        Assert.True(ContrastRatio(titleForeground, headerBackground) >= 4.5);
+        Assert.True(ContrastRatio(subtitleForeground, headerBackground) >= 4.5);
+        Assert.True(ContrastRatio(buttonForeground, buttonBackground) >= 4.5);
+
+        var header = Assert.Single(document.Descendants(), element =>
+            AttributeValue(element, XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml")) ==
+            "ActivationHeader");
+        var activateButton = Assert.Single(document.Descendants(), element =>
+            AttributeValue(element, XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml")) ==
+            "ActivateButton");
+        Assert.Equal("{StaticResource ActivationHeaderStyle}", (string?)header.Attribute("Style"));
+        Assert.Equal("{StaticResource ActivationPrimaryButtonStyle}", (string?)activateButton.Attribute("Style"));
     }
 
     [Fact]
@@ -236,6 +274,41 @@ public sealed class LicenseActivationViewStructureTests
 
     private static double ElementBottom(Visual ancestor, FrameworkElement element) =>
         element.TransformToAncestor(ancestor).Transform(new Point(0, element.ActualHeight)).Y;
+
+    private static string? AttributeValue(XElement element, XName name) =>
+        (string?)element.Attribute(name);
+
+    private static string StyleSetterValue(XDocument document, string styleKey, string property)
+    {
+        var xamlNamespace = XName.Get("Key", "http://schemas.microsoft.com/winfx/2006/xaml");
+        var style = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "Style" && AttributeValue(element, xamlNamespace) == styleKey);
+        var setter = Assert.Single(style.Elements(), element =>
+            element.Name.LocalName == "Setter" && (string?)element.Attribute("Property") == property);
+        return setter.Attribute("Value")!.Value;
+    }
+
+    private static double ContrastRatio(string foreground, string background)
+    {
+        var lighter = Math.Max(RelativeLuminance(foreground), RelativeLuminance(background));
+        var darker = Math.Min(RelativeLuminance(foreground), RelativeLuminance(background));
+        return (lighter + 0.05) / (darker + 0.05);
+    }
+
+    private static double RelativeLuminance(string color)
+    {
+        var parsed = Assert.IsType<Color>(ColorConverter.ConvertFromString(color));
+        Assert.Equal(byte.MaxValue, parsed.A);
+        var red = parsed.R / 255d;
+        var green = parsed.G / 255d;
+        var blue = parsed.B / 255d;
+        return 0.2126 * Linearize(red) + 0.7152 * Linearize(green) + 0.0722 * Linearize(blue);
+    }
+
+    private static double Linearize(double channel) =>
+        channel <= 0.04045
+            ? channel / 12.92
+            : Math.Pow((channel + 0.055) / 1.055, 2.4);
 
     private static void MeasureAndArrange(FrameworkElement element, Size size)
     {
