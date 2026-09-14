@@ -10,6 +10,37 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class WorkspaceRunPanelViewModelTests
 {
     [Fact]
+    public async Task CleanupKeepsNonterminalBatchButReportsFailedDetailsReloadWithoutOldStatistics()
+    {
+        var oldBatch = new WorkspaceBatchItem(Guid.NewGuid(), "可删除终态", "Completed");
+        var retained = new WorkspaceBatchItem(Guid.NewGuid(), "保留非终态", "Paused");
+        var history = new MutableHistorySource(oldBatch);
+        var workflow = new FakeResultsWorkflow { Page = new([Row("Failed", "失败")], 5, null) };
+        var results = CreateResults(workflow);
+        var runStore = new FakeRunControlStore();
+        using var panel = new WorkspaceRunPanelViewModel(results, new(runStore), new(runStore), new(runStore), historySource: history);
+        await panel.InitializeAsync();
+        Assert.Equal(5, results.OperationCount);
+        var cleanupStore = new CleanupStore { Preview = new(BaiduBatchTransfer.Core.Abstractions.LocalHistoryKind.Transfer, 1, false, "terminal") };
+        cleanupStore.OnDelete = () =>
+        {
+            history.Current = retained;
+            workflow.FailSummary = true;
+            cleanupStore.Preview = new(BaiduBatchTransfer.Core.Abstractions.LocalHistoryKind.Transfer, 0, false, null);
+        };
+        string? status = null;
+        using var cleanup = new LocalHistoryCleanupViewModel(new(cleanupStore), new CleanupInteraction(),
+            BaiduBatchTransfer.Core.Abstractions.LocalHistoryKind.Transfer, () => true, panel.ReloadHistoryAsync, text => status = text);
+        await cleanup.ClearAsync();
+        Assert.Single(cleanupStore.Deleted);
+        Assert.Equal(retained.BatchJobId, Assert.Single(panel.Batches).BatchJobId);
+        Assert.Equal(retained.BatchJobId, panel.SelectedBatch?.BatchJobId);
+        Assert.Empty(results.Items);
+        Assert.Equal(0, results.TotalCount + results.ResourceCount + results.OperationCount + results.FailedCount + results.CompleteSuccessCount);
+        Assert.Contains("本地历史已删除，但界面刷新失败，请稍后重试", status);
+        Assert.Contains("1", status);
+    }
+    [Fact]
     public async Task CancelledHistoryReloadRestoresAvailability()
     {
         var history = new DeferredHistorySource();

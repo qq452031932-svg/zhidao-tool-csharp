@@ -41,6 +41,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     private WorkspaceBatchItem? selectedBatch;
     private string statusMessage = "尚未开始转存。";
     private bool isBusy;
+    private bool isHistoryCleanupBusy;
     private bool isClosed;
     private readonly HashSet<Guid> notifiedTerminalBatches = [];
 
@@ -102,7 +103,17 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         }
     }
     public bool IsClosed => isClosed;
-    public bool CanUseBatchActions => !isClosed && !IsBusy && SelectedBatch is not null;
+    public bool IsHistoryCleanupBusy
+    {
+        get => isHistoryCleanupBusy;
+        set
+        {
+            if (!SetProperty(ref isHistoryCleanupBusy, value)) return;
+            Results.IsHistoryCleanupBusy = value;
+            NotifyCommandState();
+        }
+    }
+    public bool CanUseBatchActions => !isClosed && !IsBusy && !IsHistoryCleanupBusy && SelectedBatch is not null;
     public bool CanLoadSelectedBatch => CanUseBatchActions && !Results.IsBusy;
     public bool CanPause => CanUseBatchActions && SelectedBatch!.BatchStatus is "Queued" or "Active";
     public bool CanResume => CanUseBatchActions && SelectedBatch!.BatchStatus == "Paused";
@@ -128,7 +139,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
 
     private async Task InitializeCoreAsync(CancellationToken cancellationToken, bool propagateFailure)
     {
-        if (isClosed || IsBusy) return;
+        if (isClosed || IsBusy || (IsHistoryCleanupBusy && !propagateFailure)) return;
         var operation = BeginOperation(cancellationToken);
         if (operation is null) return;
         IsBusy = true;
@@ -137,12 +148,16 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
             var recent = await historySource.LoadRecentAsync(maximumRecentBatches, operation.Token)
                 .ConfigureAwait(true);
             if (!IsCurrent(operation)) return;
+            if (propagateFailure) Results.Reset();
             Batches.Clear();
             foreach (var item in recent.Take(maximumRecentBatches)) Batches.Add(item);
             SelectedBatch = Batches.FirstOrDefault();
             if (SelectedBatch is { } selected)
             {
-                await Results.InitializeAsync(selected.BatchJobId, operation.Token).ConfigureAwait(true);
+                if (propagateFailure)
+                    await Results.InitializeForHandoffAsync(selected.BatchJobId, operation.Token).ConfigureAwait(true);
+                else
+                    await Results.InitializeAsync(selected.BatchJobId, operation.Token).ConfigureAwait(true);
                 if (IsCurrent(operation)) StatusMessage = "已加载最近批次。";
             }
             else
@@ -279,7 +294,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
 
     private async Task LoadBatchAsync(Guid batchJobId, CancellationToken cancellationToken)
     {
-        if (isClosed || IsBusy || Results.IsBusy) return;
+        if (isClosed || IsBusy || IsHistoryCleanupBusy || Results.IsBusy) return;
         var operation = BeginOperation(cancellationToken);
         if (operation is null) return;
         IsBusy = true;
@@ -391,12 +406,14 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
                 await automaticRefreshDelay.DelayAsync(automaticRefreshInterval, refresh.Token)
                     .ConfigureAwait(true);
                 if (isClosed || SelectedBatch?.BatchJobId != expectedBatchJobId) return;
+                if (IsHistoryCleanupBusy) continue;
 
                 try
                 {
                     var recent = await historySource.LoadRecentAsync(maximumRecentBatches, refresh.Token)
                         .ConfigureAwait(true);
                     if (isClosed || refresh.IsCancellationRequested || SelectedBatch?.BatchJobId != expectedBatchJobId) return;
+                    if (IsHistoryCleanupBusy) continue;
                     var latest = recent.FirstOrDefault(item => item.BatchJobId == expectedBatchJobId);
                     var shouldFinalize = latest is not null && IsTerminal(latest.BatchStatus) &&
                         SelectedBatch is { } previous && !IsTerminal(previous.BatchStatus) &&

@@ -27,6 +27,47 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class TransferWorkspaceViewModelTests
 {
     [Fact]
+    public async Task AutomaticResultPollingDoesNotRescanHistoryButManualRefreshDoes()
+    {
+        using var fixture = Fixture.Create(historyCleanupStore: new CleanupStore(), cleanupInteraction: new CleanupInteraction());
+        await fixture.RunPanel.ActivateBatchAsync(Guid.NewGuid());
+        await fixture.ViewModel.RefreshHistoryPreviewAsync();
+        var previewChanges = 0;
+        fixture.ViewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(TransferWorkspaceViewModel.TransferHistoryPreview)) previewChanges++;
+        };
+        await fixture.RunPanel.Results.RefreshForLifecycleAsync();
+        Assert.Equal(0, previewChanges);
+        await fixture.RunPanel.Results.RefreshAsync();
+        Assert.True(previewChanges > 0);
+    }
+    [Fact]
+    public async Task CleanupLocksResultAndBatchCommandsUntilConfirmationCompletes()
+    {
+        var release = new TaskCompletionSource<bool>();
+        var interaction = new CleanupInteraction { Confirm = (_, _) => release.Task };
+        using var fixture = Fixture.Create(historyCleanupStore: new CleanupStore(), cleanupInteraction: interaction);
+        await fixture.RunPanel.ActivateBatchAsync(Guid.NewGuid());
+        var results = fixture.RunPanel.Results;
+        Assert.True(results.CanSaveAs);
+        Assert.True(fixture.RunPanel.CanPause);
+        var pending = fixture.ViewModel.ClearTransferHistoryAsync();
+        await interaction.Started.Task;
+        Assert.False(results.SaveAsCommand.CanExecute(null));
+        Assert.False(results.RefreshCommand.CanExecute(null));
+        Assert.False(results.LoadNextPageCommand.CanExecute(null));
+        Assert.False(fixture.RunPanel.LoadSelectedBatchCommand.CanExecute(null));
+        Assert.False(fixture.RunPanel.PauseCommand.CanExecute(null));
+        Assert.False(fixture.RunPanel.ResumeCommand.CanExecute(null));
+        Assert.False(fixture.ViewModel.CanStart);
+        Assert.False(fixture.ViewModel.CanEditConfiguration);
+        release.SetResult(false);
+        await pending;
+        Assert.True(results.CanSaveAs);
+        Assert.True(fixture.RunPanel.CanPause);
+    }
+    [Fact]
     public async Task CleanupReloadsEmptyTransferHistoryAndDisablesRepeat()
     {
         var cleanup = new CleanupStore();

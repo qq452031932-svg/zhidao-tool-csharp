@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -14,15 +15,22 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
     private readonly Func<bool> ownerAvailable;
     private readonly Func<CancellationToken, Task> reload;
     private readonly Action<string> report;
+    private readonly IBackgroundOperationRunner backgroundRunner;
+    private readonly IAsyncDelay conflictRetryDelay;
     private readonly CancellationTokenSource lifetime = new();
     private long previewGeneration;
     private bool closed;
     private bool busy;
+    private bool deferredPreviewRefresh;
     private LocalHistoryCleanupPreview? preview;
+    private Task? previewRefresh;
+    private CancellationTokenSource? conflictRetry;
 
     public LocalHistoryCleanupViewModel(LocalTerminalHistoryService? service,
         ILocalHistoryCleanupInteraction? interaction, LocalHistoryKind kind, Func<bool> ownerAvailable,
-        Func<CancellationToken, Task> reload, Action<string> report)
+        Func<CancellationToken, Task> reload, Action<string> report,
+        IBackgroundOperationRunner? backgroundRunner = null,
+        IAsyncDelay? conflictRetryDelay = null)
     {
         this.service = service;
         this.interaction = interaction;
@@ -30,6 +38,8 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
         this.ownerAvailable = ownerAvailable;
         this.reload = reload;
         this.report = report;
+        this.backgroundRunner = backgroundRunner ?? new BackgroundOperationRunner();
+        this.conflictRetryDelay = conflictRetryDelay ?? new TimeProviderDelay(TimeProvider.System);
         ClearCommand = new AsyncRelayCommand(ClearAsync, () => CanClear);
     }
 
@@ -45,24 +55,62 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
         ClearCommand.NotifyCanExecuteChanged();
     }
 
-    public async Task RefreshPreviewAsync(CancellationToken cancellationToken = default)
+    public Task RefreshPreviewAsync(CancellationToken cancellationToken = default)
     {
-        if (closed || service is null) return;
+        if (closed || cancellationToken.IsCancellationRequested) return Task.CompletedTask;
+        if (!busy) return StartOrJoinPreviewAsync(cancellationToken);
+        // Do not scan during confirmation/deletion, but preserve terminal events for the final scan.
+        deferredPreviewRefresh = true;
+        return Task.CompletedTask;
+    }
+
+    private Task StartOrJoinPreviewAsync(CancellationToken cancellationToken, bool reportFailure = true)
+    {
+        if (closed || service is null || cancellationToken.IsCancellationRequested) return Task.CompletedTask;
+        if (previewRefresh is { IsCompleted: false })
+        {
+            // Coalesce all intervening events into one fresh scan after the current scan.
+            ++previewGeneration;
+            return JoinPreviewAsync(previewRefresh, cancellationToken);
+        }
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        previewRefresh = completion.Task;
         var generation = ++previewGeneration;
         preview = null;
+        OnPropertyChanged(nameof(Preview));
         NotifyAvailabilityChanged();
-        using var operation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        _ = RunPreviewAsync(completion, generation, reportFailure);
+        return JoinPreviewAsync(completion.Task, cancellationToken);
+    }
+
+    private static async Task JoinPreviewAsync(Task task, CancellationToken cancellationToken)
+    {
+        try { await task.WaitAsync(cancellationToken).ConfigureAwait(true); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+    }
+
+    private async Task RunPreviewAsync(TaskCompletionSource completion, long generation, bool reportFailure)
+    {
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         try
         {
-            var value = await service.PreviewAsync(kind, operation.Token).ConfigureAwait(true);
-            if (closed || operation.IsCancellationRequested || generation != previewGeneration) return;
-            preview = value;
-        }
-        catch (OperationCanceledException) when (operation.IsCancellationRequested) { }
-        catch (Exception)
-        {
-            if (!closed && generation == previewGeneration)
-                report("暂时无法读取可清空的历史，请稍后重试。");
+            do
+            {
+                generation = previewGeneration;
+                try
+                {
+                    var value = await backgroundRunner.RunAsync(token => service!.PreviewAsync(kind, token), operation.Token).ConfigureAwait(true);
+                    if (closed || operation.IsCancellationRequested) return;
+                    if (generation == previewGeneration) preview = value;
+                }
+                catch (OperationCanceledException) when (operation.IsCancellationRequested) { return; }
+                catch (Exception)
+                {
+                    if (reportFailure && !closed && generation == previewGeneration)
+                        report("暂时无法读取可清空的历史，请稍后重试。");
+                }
+            }
+            while (!closed && generation != previewGeneration);
         }
         finally
         {
@@ -71,6 +119,8 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(Preview));
                 NotifyAvailabilityChanged();
             }
+            completion.TrySetResult();
+            ScheduleConflictRetry();
         }
     }
 
@@ -84,7 +134,9 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
         var deletedCount = 0;
         try
         {
-            await RefreshPreviewAsync(operation.Token).ConfigureAwait(true);
+            if (previewRefresh is { IsCompleted: false })
+                await JoinPreviewAsync(previewRefresh, operation.Token).ConfigureAwait(true);
+            await StartOrJoinPreviewAsync(operation.Token).ConfigureAwait(true);
             if (closed || operation.IsCancellationRequested || preview is not { } confirmedPreview) return;
             if (confirmedPreview.HasConflicts)
             {
@@ -109,7 +161,7 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
                 return;
             }
             // This exact object is what the user confirmed. Never replace its token after confirmation.
-            var result = await service.DeleteAsync(confirmedPreview, operation.Token).ConfigureAwait(true);
+            var result = await backgroundRunner.RunAsync(token => service.DeleteAsync(confirmedPreview, token), operation.Token).ConfigureAwait(true);
             if (closed || operation.IsCancellationRequested) return;
             if (result.Disposition == LocalHistoryCleanupDisposition.Conflict)
                 report("历史记录已变化或仍有任务在处理，未清空任何历史，请稍后重试。");
@@ -127,18 +179,57 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
         catch (Exception)
         {
             if (!closed) report(deletedCount > 0
-                ? $"已清空 {deletedCount} 个批次历史，但暂时无法刷新列表，请稍后重试。"
+                ? $"已清空 {deletedCount} 个批次。本地历史已删除，但界面刷新失败，请稍后重试。"
                 : "清空历史未能完成，请稍后重试。");
         }
         finally
         {
             if (!closed)
             {
-                await RefreshPreviewAsync(operation.Token).ConfigureAwait(true);
+                do
+                {
+                    deferredPreviewRefresh = false;
+                    // Keep the deletion outcome visible even when this follow-up preview fails.
+                    await StartOrJoinPreviewAsync(operation.Token, reportFailure: false).ConfigureAwait(true);
+                }
+                while (!closed && !operation.IsCancellationRequested && deferredPreviewRefresh);
                 busy = false;
                 OnPropertyChanged(nameof(IsBusy));
                 NotifyAvailabilityChanged();
+                ScheduleConflictRetry();
             }
+        }
+    }
+
+    private void ScheduleConflictRetry()
+    {
+        if (closed || busy || preview is not { HasConflicts: true } || conflictRetry is not null) return;
+        var retry = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        conflictRetry = retry;
+        _ = RetryConflictAsync(retry);
+    }
+
+    private async Task RetryConflictAsync(CancellationTokenSource retry)
+    {
+        try
+        {
+            while (!closed && !retry.IsCancellationRequested && preview is { HasConflicts: true })
+            {
+                await conflictRetryDelay.DelayAsync(TimeSpan.FromSeconds(5), retry.Token).ConfigureAwait(true);
+                if (closed || retry.IsCancellationRequested) return;
+                if (busy || !ownerAvailable()) continue;
+                await RefreshPreviewAsync(retry.Token).ConfigureAwait(true);
+            }
+        }
+        catch (OperationCanceledException) when (retry.IsCancellationRequested) { }
+        catch (Exception)
+        {
+            if (!closed) report("暂时无法重查历史状态，请稍后刷新重试。");
+        }
+        finally
+        {
+            if (ReferenceEquals(conflictRetry, retry)) conflictRetry = null;
+            retry.Dispose();
         }
     }
 

@@ -12,6 +12,29 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class JobResultsViewModelTests
 {
+    [Fact]
+    public async Task ExternalCleanupBusyDisablesEveryResultActionAndResetDoesNotReleaseLock()
+    {
+        var row = Row(1) with { CanResumeTransfer = true, CanResumeShare = true, CanReconcileTransfer = true, CanReconcileShare = true };
+        var workflow = new FakeWorkflow { Pages = [new([row], 2, 1)] };
+        var vm = Create(workflow, existingShareInteraction: new FakeExistingShareInteraction(Guid.NewGuid()));
+        await vm.InitializeAsync(Guid.NewGuid());
+        Assert.True(vm.CanLoadNextPage);
+        Assert.True(vm.CanRetryShareOnly);
+        vm.IsHistoryCleanupBusy = true;
+        Assert.False(vm.CanLoadNextPage);
+        Assert.False(vm.CanRetryShareOnly);
+        Assert.False(vm.CanResumeTransfer);
+        Assert.False(vm.CanResumeShare);
+        Assert.False(vm.CanReconcileTransfer);
+        Assert.False(vm.CanReconcileShare);
+        Assert.False(vm.CanResolveExistingShares);
+        Assert.False(vm.CanSaveAs);
+        Assert.False(vm.CanRefresh);
+        vm.Reset();
+        Assert.True(vm.IsHistoryCleanupBusy);
+        vm.IsHistoryCleanupBusy = false;
+    }
     [Theory]
     [InlineData("success")]
     [InlineData("failure")]

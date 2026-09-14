@@ -18,6 +18,33 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class ShareWorkspaceViewModelTests
 {
     [Fact]
+    public async Task CleanupLocksShareResultsNavigationAndConfigurationUntilConfirmationCompletes()
+    {
+        var store = new FakeStore();
+        store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 1);
+        var release = new TaskCompletionSource<bool>();
+        var interaction = new CleanupInteraction { Confirm = (_, _) => release.Task };
+        var cleanup = new CleanupStore { Preview = new(LocalHistoryKind.StandaloneShare, 1, false, "terminal") };
+        using var vm = Fixture(store: store, historyCleanupStore: cleanup, cleanupInteraction: interaction, exports: new FakeLocalResultExports());
+        await vm.InitializeAsync();
+        Assert.True(vm.CanSaveResults);
+        Assert.True(vm.CanUseBatchControls);
+        var pending = vm.ClearShareHistoryAsync();
+        await interaction.Started.Task;
+        Assert.False(vm.SaveResultsCommand.CanExecute(null));
+        Assert.False(vm.LoadSelectedBatchCommand.CanExecute(null));
+        Assert.False(vm.PreviousHistoryPageCommand.CanExecute(null));
+        Assert.False(vm.NextHistoryPageCommand.CanExecute(null));
+        Assert.False(vm.RetryFailedCommand.CanExecute(null));
+        Assert.False(vm.ResumeCommand.CanExecute(null));
+        Assert.False(vm.StartCommand.CanExecute(null));
+        Assert.False(vm.CanEditSelection);
+        release.SetResult(false);
+        await pending;
+        Assert.True(vm.CanSaveResults);
+        Assert.True(vm.CanUseBatchControls);
+    }
+    [Fact]
     public async Task TerminalShareSnapshotRefreshesCleanupPreview()
     {
         var store = new FakeStore();
@@ -27,7 +54,10 @@ public sealed class ShareWorkspaceViewModelTests
         await vm.InitializeAsync();
         Assert.False(vm.CanClearShareHistory);
         cleanup.Preview = new(LocalHistoryKind.StandaloneShare, 1, false, "terminal");
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        vm.PropertyChanged += (_, _) => { if (vm.CanClearShareHistory) ready.TrySetResult(); };
         vm.SelectedBatch = store.ReplaceBatch(vm.SelectedBatch!.Id, StandaloneShareBatchStatus.Completed);
+        await ready.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.True(vm.CanClearShareHistory);
     }
     [Fact]

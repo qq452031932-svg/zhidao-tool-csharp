@@ -21,6 +21,7 @@ public sealed class JobResultsViewModel : ObservableObject
     private long generation;
     private bool isBusy;
     private bool isSaving;
+    private bool isHistoryCleanupBusy;
     private long totalCount;
     private long resourceCount;
     private long operationCount;
@@ -71,6 +72,7 @@ public sealed class JobResultsViewModel : ObservableObject
     }
 
     public ObservableCollection<JobResultRow> Items { get; } = [];
+    public event EventHandler? ManualRefreshCompleted;
     public Guid BatchJobId => batchJobId;
     public long TotalCount { get => totalCount; private set => SetProperty(ref totalCount, value); }
     public long ResourceCount { get => resourceCount; private set => SetProperty(ref resourceCount, value); }
@@ -83,6 +85,15 @@ public sealed class JobResultsViewModel : ObservableObject
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
     public string TransferCapabilityMessage => capabilities.TransferStatusMessage;
     public string ShareCapabilityMessage => capabilities.ShareStatusMessage;
+    public bool IsHistoryCleanupBusy
+    {
+        get => isHistoryCleanupBusy;
+        set
+        {
+            if (SetProperty(ref isHistoryCleanupBusy, value)) NotifyCommandState();
+        }
+    }
+    private bool CanUseResultActions => !IsBusy && !IsSaving && !IsHistoryCleanupBusy;
     public bool IsBusy
     {
         get => isBusy;
@@ -110,22 +121,22 @@ public sealed class JobResultsViewModel : ObservableObject
             NotifyCommandState();
         }
     }
-    public bool CanLoadNextPage => batchJobId != Guid.Empty && nextCursor is not null && !IsBusy && !IsSaving;
-    public bool CanRetryShareOnly => !IsBusy && !IsSaving && capabilities.CanUseShareActions &&
+    public bool CanLoadNextPage => batchJobId != Guid.Empty && nextCursor is not null && CanUseResultActions;
+    public bool CanRetryShareOnly => CanUseResultActions && capabilities.CanUseShareActions &&
         SelectedItem is { ShareOperationId: not null, CanRetryShare: true };
-    public bool CanReconcileTransfer => !IsBusy && !IsSaving && capabilities.CanUseTransferActions &&
+    public bool CanReconcileTransfer => CanUseResultActions && capabilities.CanUseTransferActions &&
         SelectedItem is { CanReconcileTransfer: true };
-    public bool CanReconcileShare => !IsBusy && !IsSaving && capabilities.CanUseShareActions &&
+    public bool CanReconcileShare => CanUseResultActions && capabilities.CanUseShareActions &&
         SelectedItem is { ShareOperationId: not null, CanReconcileShare: true };
-    public bool CanResumeTransfer => !IsBusy && !IsSaving && capabilities.CanUseTransferActions &&
+    public bool CanResumeTransfer => CanUseResultActions && capabilities.CanUseTransferActions &&
         SelectedItem is { CanResumeTransfer: true };
-    public bool CanResumeShare => !IsBusy && !IsSaving && capabilities.CanUseShareActions &&
+    public bool CanResumeShare => CanUseResultActions && capabilities.CanUseShareActions &&
         SelectedItem is { ShareOperationId: not null, CanResumeShare: true };
-    public bool CanSaveAs => batchJobId != Guid.Empty && !IsBusy && !IsSaving;
+    public bool CanSaveAs => batchJobId != Guid.Empty && CanUseResultActions;
     public bool CanCopyGeneratedShare => CanCopyGeneratedShareRow(SelectedItem);
-    public bool CanRefresh => batchJobId != Guid.Empty && !IsBusy && !IsSaving &&
+    public bool CanRefresh => batchJobId != Guid.Empty && CanUseResultActions &&
         !finalizedLifecycleBatches.Contains(batchJobId);
-    public bool CanResolveExistingShares => batchJobId != Guid.Empty && !IsBusy && !IsSaving &&
+    public bool CanResolveExistingShares => batchJobId != Guid.Empty && CanUseResultActions &&
         capabilities.CanUseShareActions && existingShareInteraction is not null;
     public IAsyncRelayCommand LoadNextPageCommand { get; }
     public IAsyncRelayCommand RefreshCommand { get; }
@@ -176,6 +187,7 @@ public sealed class JobResultsViewModel : ObservableObject
         CancellationToken cancellationToken)
     {
         if (requestedBatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(requestedBatchJobId));
+        if (IsHistoryCleanupBusy && !propagateFailure) return;
         var capturedGeneration = Interlocked.Increment(ref generation);
         if (requestedBatchJobId != progressBatchJobId)
         {
@@ -249,8 +261,13 @@ public sealed class JobResultsViewModel : ObservableObject
         }
     }
 
-    public Task RefreshAsync(CancellationToken cancellationToken = default) =>
-        RefreshForLifecycleAsync(cancellationToken);
+    public async Task RefreshAsync(CancellationToken cancellationToken = default)
+    {
+        var capturedGeneration = generation;
+        await RefreshForLifecycleAsync(cancellationToken).ConfigureAwait(true);
+        if (capturedGeneration == generation && !IsHistoryCleanupBusy && !cancellationToken.IsCancellationRequested)
+            ManualRefreshCompleted?.Invoke(this, EventArgs.Empty);
+    }
 
     public async Task<bool> RefreshForLifecycleAsync(CancellationToken cancellationToken = default)
     {
@@ -278,7 +295,7 @@ public sealed class JobResultsViewModel : ObservableObject
         await lifecycleRefreshGate.WaitAsync(cancellationToken).ConfigureAwait(true);
         try
         {
-            if (requestedBatch == Guid.Empty || finalizedLifecycleBatches.Contains(requestedBatch) ||
+            if (IsHistoryCleanupBusy || requestedBatch == Guid.Empty || finalizedLifecycleBatches.Contains(requestedBatch) ||
                 cancellationToken.IsCancellationRequested || !isCurrent())
                 return false;
             if (requestedBatch != batchJobId)
@@ -356,7 +373,7 @@ public sealed class JobResultsViewModel : ObservableObject
     internal async Task<Guid?> FindPendingExistingShareBatchAsync(
         CancellationToken cancellationToken = default)
     {
-        if (!capabilities.CanUseShareActions || existingShareInteraction is null || IsBusy || IsSaving) return null;
+        if (!capabilities.CanUseShareActions || existingShareInteraction is null || !CanUseResultActions) return null;
         var capturedGeneration = generation;
         var capturedBatch = batchJobId;
         try
@@ -399,7 +416,7 @@ public sealed class JobResultsViewModel : ObservableObject
         var capturedGeneration = generation;
         var capturedBatch = batchJobId;
         var destination = await saveDialog.PickDestinationDirectoryAsync(cancellationToken).ConfigureAwait(true);
-        if (capturedGeneration != generation || capturedBatch != batchJobId || cancellationToken.IsCancellationRequested) return;
+        if (capturedGeneration != generation || capturedBatch != batchJobId || cancellationToken.IsCancellationRequested || !CanSaveAs) return;
         if (string.IsNullOrWhiteSpace(destination))
         {
             StatusMessage = "未选择保存目录。";
@@ -507,11 +524,12 @@ public sealed class JobResultsViewModel : ObservableObject
         string pendingText,
         CancellationToken cancellationToken)
     {
+        if (!CanUseResultActions) return;
         var capturedGeneration = generation;
         if (licenseGate is not null)
         {
             var authorization = await licenseGate.AuthorizeAsync(operation, cancellationToken).ConfigureAwait(true);
-            if (capturedGeneration != generation) return;
+            if (capturedGeneration != generation || !CanUseResultActions) return;
             if (!authorization.IsAuthorized)
             {
                 StatusMessage = "软件尚未激活，联网功能暂不可用。";
@@ -526,7 +544,7 @@ public sealed class JobResultsViewModel : ObservableObject
         string pendingText,
         CancellationToken cancellationToken)
     {
-        if (IsBusy || IsSaving) return;
+        if (!CanUseResultActions) return;
         var capturedGeneration = generation;
         IsBusy = true;
         StatusMessage = pendingText;
@@ -742,7 +760,7 @@ public sealed class JobResultsViewModel : ObservableObject
     private void CancelSave() => saveCancellation?.Cancel();
 
     private bool CanCopyGeneratedShareRow(JobResultRow? row) =>
-        batchJobId != Guid.Empty && !IsBusy && !IsSaving && clipboard is not null &&
+        batchJobId != Guid.Empty && CanUseResultActions && clipboard is not null &&
         row is { GeneratedShareUrl: { Length: > 0 }, GeneratedExtractionCode: { Length: > 0 } };
 
     private void NotifyCommandState()

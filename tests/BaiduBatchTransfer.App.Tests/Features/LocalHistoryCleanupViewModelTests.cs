@@ -6,13 +6,19 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class LocalHistoryCleanupViewModelTests
 {
-    [Fact]
-    public async Task SuccessfulDeleteWithReloadFailureReportsDeletedCountAndRefreshFailure()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SuccessfulDeleteWithReloadFailureReportsDeletedCountAndRefreshFailure(bool finalPreviewFails)
     {
         var store = new CleanupStore();
         string? status = null;
         using var vm = new LocalHistoryCleanupViewModel(new(store), new CleanupInteraction(), LocalHistoryKind.Transfer,
-            () => true, _ => throw new IOException("private path"), text => status = text);
+            () => true, _ =>
+            {
+                store.ThrowPreview = finalPreviewFails;
+                throw new IOException("private path");
+            }, text => status = text);
         await vm.ClearAsync();
         Assert.Single(store.Deleted);
         Assert.Contains("已清空 7", status);
@@ -20,21 +26,18 @@ public sealed class LocalHistoryCleanupViewModelTests
         Assert.DoesNotContain("private", status);
     }
     [Fact]
-    public async Task LatePreviewCannotReplaceNewerConflictAndClosedPreviewStaysInvalid()
+    public async Task CoalescedPreviewCannotApplyAfterClose()
     {
         var release = new TaskCompletionSource<LocalHistoryCleanupPreview>();
         var store = new CleanupStore { PreviewOverride = () => release.Task };
         using var vm = new LocalHistoryCleanupViewModel(new(store), new CleanupInteraction(), LocalHistoryKind.Transfer,
-            () => true, _ => Task.CompletedTask, _ => { });
+            () => true, _ => Task.CompletedTask, _ => { }, new InlineBackgroundOperationRunner());
         var pending = vm.RefreshPreviewAsync();
-        store.PreviewOverride = null;
-        store.Preview = new(LocalHistoryKind.Transfer, 3, true, "new");
-        await vm.RefreshPreviewAsync();
-        release.SetResult(new(LocalHistoryKind.Transfer, 7, false, "old"));
-        await pending;
-        Assert.True(vm.Preview!.HasConflicts);
-        Assert.False(vm.CanClear);
+        var repeated = vm.RefreshPreviewAsync();
         vm.Close();
+        release.SetResult(new(LocalHistoryKind.Transfer, 7, false, "old"));
+        await Task.WhenAll(pending, repeated);
+        Assert.False(vm.CanClear);
         await vm.RefreshPreviewAsync();
         Assert.Null(vm.Preview);
     }
@@ -55,6 +58,21 @@ public sealed class LocalHistoryCleanupViewModelTests
         Assert.Contains(button.Ancestors(), node => node.Name.LocalName == "TabItem" && (string?)node.Attribute("Header") == tab);
         Assert.NotNull(button.Attribute("ToolTip"));
         Assert.Contains("Danger", (string?)button.Attribute("Style"));
+        var x = System.Xml.Linq.XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml");
+        var style = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "Style" && (string?)element.Attribute(x + "Key") == "DangerHistoryButton");
+        var highContrast = Assert.Single(style.Descendants(), element => element.Name.LocalName == "DataTrigger" &&
+            ((string?)element.Attribute("Binding"))?.Contains("SystemParameters.HighContrast", StringComparison.Ordinal) == true);
+        Assert.Contains(highContrast.Elements(), element => (string?)element.Attribute("Property") == "Background" &&
+            (string?)element.Attribute("Value") == "{DynamicResource {x:Static SystemColors.HighlightBrushKey}}");
+        Assert.Contains(highContrast.Elements(), element => (string?)element.Attribute("Property") == "Foreground" &&
+            (string?)element.Attribute("Value") == "{DynamicResource {x:Static SystemColors.HighlightTextBrushKey}}");
+        Assert.Contains(style.Descendants(), element => element.Name.LocalName == "Trigger" &&
+            (string?)element.Attribute("Property") == "IsKeyboardFocused");
+        Assert.Contains(style.Descendants(), element => element.Name.LocalName == "Trigger" &&
+            (string?)element.Attribute("Property") == "IsEnabled");
+        Assert.Contains(style.Elements(), element => (string?)element.Attribute("Property") == "Height" &&
+            (string?)element.Attribute("Value") == "Auto");
         var interaction = File.ReadAllText(Path.Combine(root.FullName, "src", "BaiduBatchTransfer.App", "Features", "Common", "LocalHistoryCleanupInteraction.cs"));
         Assert.Contains("MessageBoxButton.YesNo", interaction);
         Assert.Contains("MessageBoxResult.No", interaction);
@@ -131,6 +149,7 @@ public sealed class LocalHistoryCleanupViewModelTests
         available = true;
         var pending = vm.ClearAsync();
         Assert.True(vm.IsBusy);
+        await interaction.Started.Task;
         await vm.ClearAsync();
         Assert.Single(interaction.Confirmed);
         vm.Close();
@@ -197,12 +216,19 @@ internal sealed class CleanupStore : ILocalTerminalHistoryStore
 
 internal sealed class CleanupInteraction : ILocalHistoryCleanupInteraction
 {
+    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public bool Accept { get; set; } = true;
     public List<LocalHistoryCleanupPreview> Confirmed { get; } = [];
     public Func<LocalHistoryCleanupPreview, CancellationToken, Task<bool>>? Confirm { get; set; }
     public Task<bool> ConfirmAsync(LocalHistoryCleanupPreview preview, CancellationToken cancellationToken = default)
     {
         Confirmed.Add(preview);
+        Started.TrySetResult();
         return Confirm?.Invoke(preview, cancellationToken) ?? Task.FromResult(Accept);
     }
+}
+
+internal sealed class InlineBackgroundOperationRunner : IBackgroundOperationRunner
+{
+    public Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken) => operation(cancellationToken);
 }

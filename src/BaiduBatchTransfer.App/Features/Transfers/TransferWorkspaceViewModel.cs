@@ -110,6 +110,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         RunPanel.PropertyChanged += OnStatusSourcePropertyChanged;
         RunPanel.BatchTerminal += OnBatchTerminal;
         RunPanel.Results.PropertyChanged += OnStatusSourcePropertyChanged;
+        RunPanel.Results.ManualRefreshCompleted += OnManualResultsRefreshCompleted;
         RunPanel.Results.Items.CollectionChanged += OnResultItemsChanged;
         Import.Rows.CollectionChanged += OnPendingRowsChanged;
         ((INotifyCollectionChanged)Logs).CollectionChanged += OnLogsChanged;
@@ -337,6 +338,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         if (e.PropertyName == nameof(LocalHistoryCleanupViewModel.Preview))
             OnPropertyChanged(nameof(TransferHistoryPreview));
         if (e.PropertyName != nameof(LocalHistoryCleanupViewModel.IsBusy)) return;
+        RunPanel.IsHistoryCleanupBusy = historyCleanup.IsBusy;
         RaiseStartState();
         SelectSingleAccountCommand.NotifyCanExecuteChanged();
         SelectReplicationCommand.NotifyCanExecuteChanged();
@@ -703,6 +705,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         RunPanel.PropertyChanged -= OnStatusSourcePropertyChanged;
         RunPanel.BatchTerminal -= OnBatchTerminal;
         RunPanel.Results.PropertyChanged -= OnStatusSourcePropertyChanged;
+        RunPanel.Results.ManualRefreshCompleted -= OnManualResultsRefreshCompleted;
         RunPanel.Results.Items.CollectionChanged -= OnResultItemsChanged;
         Import.Rows.CollectionChanged -= OnPendingRowsChanged;
         ((INotifyCollectionChanged)Logs).CollectionChanged -= OnLogsChanged;
@@ -993,7 +996,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         if (isClosed) return;
         historyCleanup.NotifyAvailabilityChanged();
         if ((ReferenceEquals(sender, RunPanel) && e.PropertyName == nameof(WorkspaceRunPanelViewModel.IsBusy) && !RunPanel.IsBusy) ||
-            (ReferenceEquals(sender, RunPanel.Results) && e.PropertyName == nameof(JobResultsViewModel.IsBusy) && !RunPanel.Results.IsBusy))
+            (ReferenceEquals(sender, RunPanel.Results) && e.PropertyName == nameof(JobResultsViewModel.IsSaving) && !RunPanel.Results.IsSaving))
             _ = RefreshHistoryPreviewAsync();
         if ((ReferenceEquals(sender, RunPanel) && e.PropertyName == nameof(WorkspaceRunPanelViewModel.IsBusy)) ||
             (ReferenceEquals(sender, RunPanel.Results) &&
@@ -1014,6 +1017,11 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 
     private void AppendPresentationLog(string? message) =>
         logBuffer.AppendSafe(MapPresentationLogMessage(message));
+
+    private void OnManualResultsRefreshCompleted(object? sender, EventArgs e)
+    {
+        if (!isClosed) _ = RefreshHistoryPreviewAsync();
+    }
 
     private static string? MapPresentationLogMessage(string? message)
     {
