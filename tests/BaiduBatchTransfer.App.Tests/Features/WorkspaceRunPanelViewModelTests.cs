@@ -10,6 +10,59 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class WorkspaceRunPanelViewModelTests
 {
     [Fact]
+    public async Task CancelledHistoryReloadRestoresAvailability()
+    {
+        var history = new DeferredHistorySource();
+        var store = new FakeRunControlStore();
+        using var vm = new WorkspaceRunPanelViewModel(CreateResults(new FakeResultsWorkflow()), new(store), new(store), new(store), historySource: history);
+        using var cancellation = new CancellationTokenSource();
+        var pending = vm.ReloadHistoryAsync(cancellation.Token);
+        cancellation.Cancel();
+        history.Release.SetResult([]);
+        await pending;
+        Assert.False(vm.IsBusy);
+    }
+
+    [Fact]
+    public async Task ForcedReloadRejectsLateHistoryFromPreviousRequest()
+    {
+        var history = new DeferredHistorySource();
+        var store = new FakeRunControlStore();
+        using var vm = new WorkspaceRunPanelViewModel(CreateResults(new FakeResultsWorkflow()), new(store), new(store), new(store), historySource: history);
+        var pending = vm.InitializeAsync();
+        history.Delay = false;
+        await vm.ReloadHistoryAsync();
+        history.Release.SetResult([new(Guid.NewGuid(), "已删除的旧批次", "Completed")]);
+        await pending;
+        Assert.Empty(vm.Batches);
+        Assert.Null(vm.SelectedBatch);
+        Assert.Equal(Guid.Empty, vm.Results.BatchJobId);
+        Assert.False(vm.IsBusy);
+    }
+
+    private sealed class DeferredHistorySource : IWorkspaceBatchHistorySource
+    {
+        public bool Delay { get; set; } = true;
+        public TaskCompletionSource<IReadOnlyList<WorkspaceBatchItem>> Release { get; } = new();
+        public Task<IReadOnlyList<WorkspaceBatchItem>> LoadRecentAsync(int maximumCount, CancellationToken cancellationToken = default) =>
+            Delay ? Release.Task : Task.FromResult<IReadOnlyList<WorkspaceBatchItem>>([]);
+    }
+    [Fact]
+    public async Task ReloadEmptyHistoryClearsPreviouslySelectedResults()
+    {
+        var results = CreateResults(new FakeResultsWorkflow { Page = new([Row("Failed", "失败")], 1, null) });
+        using var vm = Create(results, new FakeRunControlStore());
+        await vm.ActivateBatchAsync(Guid.NewGuid());
+        await vm.ReloadHistoryAsync();
+        Assert.Empty(vm.Batches);
+        Assert.Null(vm.SelectedBatch);
+        Assert.Empty(results.Items);
+        Assert.Equal(Guid.Empty, results.BatchJobId);
+        Assert.False(vm.PauseCommand.CanExecute(null));
+        Assert.Equal("尚未开始转存。", vm.StatusMessage);
+    }
+
+    [Fact]
     public async Task LicenseFailureStopsManualResumeBeforeDurableStateChanges()
     {
         var store = new FakeRunControlStore();

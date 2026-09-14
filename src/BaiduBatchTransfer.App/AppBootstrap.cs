@@ -240,6 +240,11 @@ public static class AppBootstrap
         services.AddSingleton<ILocalResultDestinationStore>(sp =>
             sp.GetRequiredService<SqliteLocalResultDestinationStore>());
         services.AddSingleton<SqliteLocalResultExportStore>();
+        services.AddSingleton<SqliteLocalTerminalHistoryStore>();
+        services.AddSingleton<ILocalTerminalHistoryStore>(sp =>
+            sp.GetRequiredService<SqliteLocalTerminalHistoryStore>());
+        services.AddSingleton<LocalTerminalHistoryService>();
+        services.AddSingleton<ILocalHistoryCleanupInteraction, WpfLocalHistoryCleanupInteraction>();
         services.AddSingleton<ILocalResultExportStore>(sp =>
             sp.GetRequiredService<SqliteLocalResultExportStore>());
         services.AddSingleton<PauseBatchService>();
@@ -901,7 +906,9 @@ public sealed class AppShellFactory(
     ApplicationBuildInfo buildInfo,
     AppRuntimeState runtimeState,
     LicenseRuntimeAuthorizationState licenseAuthorizationState,
-    ILicenseAuthorizationGate licenseGate) : IAppShellFactory
+    ILicenseAuthorizationGate licenseGate,
+    LocalTerminalHistoryService historyCleanupService,
+    ILocalHistoryCleanupInteraction historyCleanupInteraction) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
@@ -1020,7 +1027,9 @@ public sealed class AppShellFactory(
             new LocalResultDirectoryPreparer(),
             transferTargetDirectoryPicker,
             dialogService,
-            licenseGate);
+            licenseGate,
+            historyCleanupService,
+            historyCleanupInteraction);
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
         var homeWorkspace = new DeferredWorkspaceView(
             new DeferredWorkspaceViewModel("首页", "功能建设中"));
@@ -1064,7 +1073,9 @@ public sealed class AppShellFactory(
             localResultExports: localResultExports,
             resultProjectionRepository: standaloneShareResults,
             localResultExportStore: localResultExportStore,
-            licenseGate: licenseGate);
+            licenseGate: licenseGate,
+            historyCleanupService: historyCleanupService,
+            historyCleanupInteraction: historyCleanupInteraction);
         var shareWorkspace = new ShareWorkspaceView(shareViewModel);
         var accountRefresh = new AccountRefreshCoordinator(
             accountProvider,
@@ -1133,7 +1144,7 @@ public sealed class AppShellFactory(
         async Task HandleLoadedAsync()
         {
             await LoadedInitializationSequencer.RunAsync(
-                () => runPanelViewModel.InitializeAsync(shellLifetime.Token),
+                () => transferViewModel.InitializeAsync(shellLifetime.Token),
                 () => shareViewModel.InitializeAsync(shellLifetime.Token),
                 () => mainViewModel.ActivateInitialWorkspaceAsync(shellLifetime.Token),
                 handoff.RestorePendingAsync,

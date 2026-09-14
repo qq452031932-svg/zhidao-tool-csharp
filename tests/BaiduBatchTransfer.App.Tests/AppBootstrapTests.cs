@@ -40,6 +40,19 @@ public sealed class AppBootstrapTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), "BaiduBatchTransfer-AppBootstrapTests", Guid.NewGuid().ToString("N"));
 
     [Fact]
+    public void LocalHistoryCleanupUsesOneStoreInstanceAcrossScopes()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        var store = host.Services.GetRequiredService<SqliteLocalTerminalHistoryStore>();
+        using var scope = host.Services.CreateScope();
+        Assert.Same(store, host.Services.GetRequiredService<ILocalTerminalHistoryStore>());
+        Assert.Same(store, scope.ServiceProvider.GetRequiredService<ILocalTerminalHistoryStore>());
+        Assert.Same(host.Services.GetRequiredService<LocalTerminalHistoryService>(),
+            scope.ServiceProvider.GetRequiredService<LocalTerminalHistoryService>());
+        Assert.IsType<WpfLocalHistoryCleanupInteraction>(host.Services.GetRequiredService<ILocalHistoryCleanupInteraction>());
+    }
+
+    [Fact]
     public void BootstrapUsesTheApprovedUserFacingBrandAndDefaultExportName()
     {
         var repositoryRoot = FindRepositoryRoot();
@@ -182,8 +195,10 @@ public sealed class AppBootstrapTests : IDisposable
             instructions[index].Member is ConstructorInfo { DeclaringType: { } type } &&
             type == typeof(TransferWorkspaceViewModel));
         var constructor = (ConstructorInfo)instructions[constructorIndex].Member!;
-        Assert.Equal(typeof(IDialogService), constructor.GetParameters()[^2].ParameterType);
-        Assert.Equal(typeof(ILicenseAuthorizationGate), constructor.GetParameters()[^1].ParameterType);
+        Assert.Equal(typeof(IDialogService), constructor.GetParameters().Single(parameter => parameter.Name == "dialogService").ParameterType);
+        Assert.Equal(typeof(ILicenseAuthorizationGate), constructor.GetParameters().Single(parameter => parameter.Name == "licenseGate").ParameterType);
+        Assert.Equal(typeof(LocalTerminalHistoryService), constructor.GetParameters()[^2].ParameterType);
+        Assert.Equal(typeof(ILocalHistoryCleanupInteraction), constructor.GetParameters()[^1].ParameterType);
 
         // Verify the actual compiled composition call's final argument. Omitting the optional
         // dialog argument emits ldnull here, even though the factory still holds a dialog field.

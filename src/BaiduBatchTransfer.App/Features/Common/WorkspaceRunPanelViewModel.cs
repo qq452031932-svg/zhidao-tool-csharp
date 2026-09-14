@@ -36,6 +36,8 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     private readonly ILicenseAuthorizationGate? licenseGate;
     private readonly CancellationTokenSource lifetime = new();
     private CancellationTokenSource? automaticRefresh;
+    private CancellationTokenSource historyLifetime = new();
+    private CancellationTokenSource? currentOperation;
     private WorkspaceBatchItem? selectedBatch;
     private string statusMessage = "尚未开始转存。";
     private bool isBusy;
@@ -111,7 +113,20 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand ResumeCommand { get; }
     public IAsyncRelayCommand RetryFailedTransferCommand { get; }
 
-    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    public Task ReloadHistoryAsync(CancellationToken cancellationToken = default)
+    {
+        if (isClosed) return Task.CompletedTask;
+        automaticRefresh?.Cancel();
+        historyLifetime.Cancel();
+        historyLifetime.Dispose();
+        historyLifetime = new();
+        IsBusy = false;
+        return InitializeCoreAsync(cancellationToken, propagateFailure: true);
+    }
+
+    public Task InitializeAsync(CancellationToken cancellationToken = default) => InitializeCoreAsync(cancellationToken, propagateFailure: false);
+
+    private async Task InitializeCoreAsync(CancellationToken cancellationToken, bool propagateFailure)
     {
         if (isClosed || IsBusy) return;
         var operation = BeginOperation(cancellationToken);
@@ -130,15 +145,21 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
                 await Results.InitializeAsync(selected.BatchJobId, operation.Token).ConfigureAwait(true);
                 if (IsCurrent(operation)) StatusMessage = "已加载最近批次。";
             }
+            else
+            {
+                Results.Reset();
+                StatusMessage = "尚未开始转存。";
+            }
         }
         catch (OperationCanceledException) when (operation.IsCancellationRequested) { }
         catch (Exception)
         {
             if (IsCurrent(operation)) StatusMessage = "无法加载最近批次，请稍后重试。";
+            if (propagateFailure) throw;
         }
         finally
         {
-            if (!isClosed) IsBusy = false;
+            if (!isClosed && ReferenceEquals(currentOperation, operation)) IsBusy = false;
             operation.Dispose();
         }
     }
@@ -222,7 +243,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         }
         finally
         {
-            if (!isClosed) IsBusy = false;
+            if (!isClosed && ReferenceEquals(currentOperation, operation)) IsBusy = false;
             operation.Dispose();
         }
     }
@@ -252,6 +273,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     {
         Close();
         Results.PropertyChanged -= OnResultsPropertyChanged;
+        historyLifetime.Dispose();
         lifetime.Dispose();
     }
 
@@ -273,7 +295,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         }
         finally
         {
-            if (!isClosed) IsBusy = false;
+            if (!isClosed && ReferenceEquals(currentOperation, operation)) IsBusy = false;
             operation.Dispose();
         }
     }
@@ -303,7 +325,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         }
         finally
         {
-            if (!isClosed) IsBusy = false;
+            if (!isClosed && ReferenceEquals(currentOperation, operation)) IsBusy = false;
             operation.Dispose();
         }
     }
@@ -311,7 +333,8 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? BeginOperation(CancellationToken cancellationToken)
     {
         if (isClosed) return null;
-        return CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        currentOperation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, historyLifetime.Token, cancellationToken);
+        return currentOperation;
     }
 
     private bool IsCurrent(CancellationTokenSource operation) =>
@@ -373,7 +396,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
                 {
                     var recent = await historySource.LoadRecentAsync(maximumRecentBatches, refresh.Token)
                         .ConfigureAwait(true);
-                    if (isClosed || SelectedBatch?.BatchJobId != expectedBatchJobId) return;
+                    if (isClosed || refresh.IsCancellationRequested || SelectedBatch?.BatchJobId != expectedBatchJobId) return;
                     var latest = recent.FirstOrDefault(item => item.BatchJobId == expectedBatchJobId);
                     var shouldFinalize = latest is not null && IsTerminal(latest.BatchStatus) &&
                         SelectedBatch is { } previous && !IsTerminal(previous.BatchStatus) &&
@@ -392,7 +415,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
                     }
                     else if (Results.BatchJobId == expectedBatchJobId)
                         statisticsRead = await Results.RefreshForLifecycleAsync(refresh.Token).ConfigureAwait(true);
-                    if (shouldFinalize && !isClosed &&
+                    if (shouldFinalize && !isClosed && !refresh.IsCancellationRequested &&
                         SelectedBatch?.BatchJobId == expectedBatchJobId &&
                         Results.IsFinalizedForLifecycle(expectedBatchJobId) &&
                         notifiedTerminalBatches.Add(expectedBatchJobId))
@@ -410,7 +433,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
                 }
                 catch (Exception)
                 {
-                    if (!isClosed) StatusMessage = "自动刷新失败，稍后将再次尝试。";
+                    if (!isClosed && !refresh.IsCancellationRequested) StatusMessage = "自动刷新失败，稍后将再次尝试。";
                 }
             }
         }

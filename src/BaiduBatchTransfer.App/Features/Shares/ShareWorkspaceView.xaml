@@ -3,6 +3,12 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              AutomationProperties.Name="分享工作台">
     <Grid Margin="0,0,10,0">
+        <Grid.Resources>
+            <Style x:Key="DangerHistoryButton" TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}">
+                <Setter Property="Foreground" Value="#B42318" />
+                <Setter Property="BorderBrush" Value="#B42318" />
+            </Style>
+        </Grid.Resources>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
@@ -173,6 +179,10 @@
                                 <Button Content="取消保存" Command="{Binding CancelSaveResultsCommand}"
                                         Style="{StaticResource SecondaryButtonStyle}" Margin="0"
                                         AutomationProperties.Name="取消保存分享结果" />
+                                <Button Content="清空分享历史" Command="{Binding ClearShareHistoryCommand}"
+                                        AutomationProperties.Name="清空分享历史" Style="{StaticResource DangerHistoryButton}"
+                                        ToolTip="仅删除本地记录，不影响百度网盘文件和分享链接。任务处理或保存期间不可清空。"
+                                        ToolTipService.ShowOnDisabled="True" Margin="8,0,0,0" />
                             </WrapPanel>
 
                             <Grid Grid.Row="1">

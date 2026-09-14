@@ -13,6 +13,119 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class JobResultsViewModelTests
 {
     [Fact]
+    public async Task ResetRejectsLateClipboardStatus()
+    {
+        var clipboard = new DelayedClipboard();
+        var row = Row(1) with { GeneratedShareUrl = "https://pan.baidu.com/s/old", GeneratedExtractionCode = "abcd" };
+        var vm = Create(new FakeWorkflow { Pages = [new([row], 1, null)] }, clipboard: clipboard);
+        await vm.InitializeAsync(Guid.NewGuid());
+        var copying = vm.CopyGeneratedShareCommand.ExecuteAsync(null);
+        vm.Reset();
+        clipboard.Release.SetResult();
+        await copying;
+        Assert.Equal("请选择一个任务查看结果。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ResetRejectsRowActionWhoseLicenseCheckCompletesLate()
+    {
+        var gate = new DelayedLicenseGate();
+        var workflow = new FakeWorkflow();
+        var vm = Create(workflow, licenseGate: gate);
+        await vm.InitializeAsync(Guid.NewGuid());
+        var pending = vm.RetryShareOnlyCommand.ExecuteAsync(null);
+        vm.Reset();
+        gate.Release.SetResult(new(LicenseOperationKind.Share, true, false, LicenseCodes.Ok));
+        await pending;
+        Assert.Null(workflow.RetriedShareOperationId);
+        Assert.Equal("请选择一个任务查看结果。", vm.StatusMessage);
+    }
+
+    private sealed class DelayedClipboard : ITextClipboard
+    {
+        public TaskCompletionSource Release { get; } = new();
+        public Task SetTextAsync(string text, CancellationToken cancellationToken = default) => Release.Task;
+    }
+
+    private sealed class DelayedLicenseGate : ILicenseAuthorizationGate
+    {
+        public TaskCompletionSource<LicenseGateResult> Release { get; } = new();
+        public Task<LicenseGateResult> AuthorizeAsync(LicenseOperationKind operation, CancellationToken cancellationToken) => Release.Task;
+    }
+    [Fact]
+    public async Task ResetCancelsExportAndRejectsOldCopyParameter()
+    {
+        var workflow = new FakeWorkflow { BlockExport = true };
+        var vm = Create(workflow, saveDialog: new FakeSaveDialog("C:\\results"), clipboard: new FakeClipboard());
+        await vm.InitializeAsync(Guid.NewGuid());
+        var oldRow = vm.Items[0] with { GeneratedShareUrl = "https://pan.baidu.com/s/old", GeneratedExtractionCode = "abcd" };
+        var saving = vm.SaveAsAsync();
+        await workflow.ExportStarted.Task;
+        vm.Reset();
+        await saving;
+        Assert.False(vm.IsSaving);
+        Assert.False(vm.CancelSaveCommand.CanExecute(null));
+        Assert.False(vm.CopyGeneratedShareCommand.CanExecute(oldRow));
+        Assert.Equal("请选择一个任务查看结果。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ResetDuringSaveDialogNeverStartsExportForDeletedBatch()
+    {
+        var dialog = new DelayedSaveDialog();
+        var workflow = new FakeWorkflow();
+        var vm = Create(workflow, saveDialog: dialog);
+        await vm.InitializeAsync(Guid.NewGuid());
+        var saving = vm.SaveAsAsync();
+        vm.Reset();
+        dialog.Release.SetResult("C:\\results");
+        await saving;
+        Assert.False(workflow.ExportStarted.Task.IsCompleted);
+        Assert.Equal("请选择一个任务查看结果。", vm.StatusMessage);
+    }
+
+    private sealed class DelayedSaveDialog : IResultSaveDialog
+    {
+        public TaskCompletionSource<string?> Release { get; } = new();
+        public Task<string?> PickDestinationDirectoryAsync(CancellationToken cancellationToken = default) => Release.Task;
+    }
+    [Fact]
+    public async Task ResetClearsSnapshotStatisticsAndDisablesOldCommands()
+    {
+        var vm = Create(new FakeWorkflow { Summary = new(5, 8, 2, 1), Pages = [new([Row(1)], 8, 1)] });
+        await vm.InitializeAsync(Guid.NewGuid());
+        vm.Reset();
+        Assert.Equal(Guid.Empty, vm.BatchJobId);
+        Assert.Empty(vm.Items);
+        Assert.Null(vm.SelectedItem);
+        Assert.Equal(0, vm.TotalCount + vm.ResourceCount + vm.OperationCount + vm.FailedCount +
+            vm.PausedCount + vm.CompleteSuccessCount + vm.TerminalProblemCount + vm.ExportedRows);
+        Assert.False(vm.IsBusy);
+        Assert.False(vm.IsSaving);
+        Assert.False(vm.LoadNextPageCommand.CanExecute(null));
+        Assert.False(vm.SaveAsCommand.CanExecute(null));
+        Assert.False(vm.RefreshCommand.CanExecute(null));
+        Assert.False(vm.RetryShareOnlyCommand.CanExecute(null));
+        Assert.False(vm.ResolveExistingSharesCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ResetRejectsLatePageFromDeletedBatch()
+    {
+        var batch = Guid.NewGuid();
+        var workflow = new DelayedWorkflow(batch, Guid.NewGuid());
+        var vm = Create(workflow);
+        var pending = vm.InitializeAsync(batch);
+        await workflow.FirstStarted.Task;
+        vm.Reset();
+        workflow.ReleaseFirst();
+        await pending;
+        Assert.Empty(vm.Items);
+        Assert.Equal(Guid.Empty, vm.BatchJobId);
+        Assert.Equal("请选择一个任务查看结果。", vm.StatusMessage);
+    }
+
+    [Fact]
     public async Task LicenseFailureStopsManualShareRetryBeforeWorkflowMutation()
     {
         var workflow = new FakeWorkflow { Pages = [new([Row(1)], 1, null)] };

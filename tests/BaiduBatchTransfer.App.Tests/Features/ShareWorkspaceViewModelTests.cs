@@ -17,6 +17,76 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class ShareWorkspaceViewModelTests
 {
+    [Fact]
+    public async Task TerminalShareSnapshotRefreshesCleanupPreview()
+    {
+        var store = new FakeStore();
+        store.SeedBatch(StandaloneShareBatchStatus.Active);
+        var cleanup = new CleanupStore { Preview = new(LocalHistoryKind.StandaloneShare, 0, false, null) };
+        using var vm = Fixture(store: store, historyCleanupStore: cleanup, cleanupInteraction: new CleanupInteraction());
+        await vm.InitializeAsync();
+        Assert.False(vm.CanClearShareHistory);
+        cleanup.Preview = new(LocalHistoryKind.StandaloneShare, 1, false, "terminal");
+        vm.SelectedBatch = store.ReplaceBatch(vm.SelectedBatch!.Id, StandaloneShareBatchStatus.Completed);
+        Assert.True(vm.CanClearShareHistory);
+    }
+    [Fact]
+    public async Task CleanupReturnsToEmptyFirstPageAndDisablesAllOldResultCommands()
+    {
+        var store = new FakeStore();
+        var cleanup = new CleanupStore { Preview = new(LocalHistoryKind.StandaloneShare, 1, false, "share") };
+        store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 2);
+        var interaction = new CleanupInteraction();
+        using var vm = Fixture(store: store, historyCleanupStore: cleanup, cleanupInteraction: interaction);
+        cleanup.OnDelete = () =>
+        {
+            store.ClearHistory();
+            cleanup.Preview = new(LocalHistoryKind.StandaloneShare, 0, false, null);
+        };
+        await vm.InitializeAsync();
+        Assert.NotEmpty(vm.Operations);
+        Assert.NotEmpty(vm.ResultRows);
+        Assert.True(vm.CanClearShareHistory);
+        await vm.ClearShareHistoryCommand.ExecuteAsync(null);
+        Assert.Single(cleanup.Deleted);
+        Assert.Empty(vm.Batches);
+        Assert.Null(vm.SelectedBatch);
+        Assert.Empty(vm.Operations);
+        Assert.Empty(vm.ResultRows);
+        Assert.Null(vm.SelectedOperation);
+        Assert.Equal(1, vm.HistoryPageNumber);
+        Assert.False(vm.CanLoadNextHistoryPage);
+        Assert.False(vm.CanLoadPreviousHistoryPage);
+        Assert.False(vm.CanSaveResults);
+        Assert.False(vm.CanClearShareHistory);
+        Assert.Contains("已清空 1", vm.StatusMessage);
+        Assert.Equal(2, store.HistoryQueries.Count);
+    }
+
+    [Fact]
+    public async Task ShareBusyAndConflictAndClosedStateDisableCleanup()
+    {
+        var store = new FakeStore();
+        var cleanup = new CleanupStore { Preview = new(LocalHistoryKind.StandaloneShare, 1, true, "conflict") };
+        using var vm = Fixture(store: store, historyCleanupStore: cleanup, cleanupInteraction: new CleanupInteraction());
+        await vm.InitializeAsync();
+        Assert.False(vm.ClearShareHistoryCommand.CanExecute(null));
+        cleanup.Preview = new(LocalHistoryKind.StandaloneShare, 1, false, "ready");
+        await vm.RefreshHistoryPreviewAsync();
+        Assert.True(vm.CanClearShareHistory);
+        var commandChanges = 0;
+        vm.ClearShareHistoryCommand.CanExecuteChanged += (_, _) => commandChanges++;
+        var release = new TaskCompletionSource();
+        store.BeforeGetBatches = _ => release.Task;
+        var pending = vm.InitializeAsync();
+        Assert.False(vm.CanClearShareHistory);
+        Assert.True(commandChanges > 0);
+        release.SetResult();
+        await pending;
+        Assert.True(vm.CanClearShareHistory);
+        vm.Close();
+        Assert.False(vm.ClearShareHistoryCommand.CanExecute(null));
+    }
     private static readonly ShareAccountOption AccountA = new(
         Guid.Parse("11111111-1111-1111-1111-111111111111"), "账号甲");
     private static readonly ShareAccountOption AccountB = new(
@@ -1498,7 +1568,9 @@ public sealed class ShareWorkspaceViewModelTests
         ILocalResultExportCoordinator? exports = null,
         IStandaloneShareResultProjectionRepository? projectionRepository = null,
         ILocalResultExportStore? exportStore = null,
-        ILicenseAuthorizationGate? licenseGate = null)
+        ILicenseAuthorizationGate? licenseGate = null,
+        ILocalTerminalHistoryStore? historyCleanupStore = null,
+        ILocalHistoryCleanupInteraction? cleanupInteraction = null)
     {
         var vm = new ShareWorkspaceViewModel(
             [AccountA, AccountB],
@@ -1510,7 +1582,9 @@ public sealed class ShareWorkspaceViewModelTests
             localResultExports: exports,
             resultProjectionRepository: projectionRepository,
             localResultExportStore: exportStore,
-            licenseGate: licenseGate);
+            licenseGate: licenseGate,
+            historyCleanupService: historyCleanupStore is null ? null : new LocalTerminalHistoryService(historyCleanupStore),
+            historyCleanupInteraction: cleanupInteraction);
         vm.ActiveAccount = activeAccount;
         return vm;
     }
@@ -1736,6 +1810,12 @@ public sealed class ShareWorkspaceViewModelTests
     {
         private readonly List<StandaloneShareBatchRecord> batches = [];
         private readonly Dictionary<Guid, List<StandaloneShareOperationRecord>> operations = [];
+
+        public void ClearHistory()
+        {
+            batches.Clear();
+            operations.Clear();
+        }
 
         public Exception? CreateError { get; set; }
         public Action? AfterCreate { get; init; }

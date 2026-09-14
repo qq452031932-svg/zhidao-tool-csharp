@@ -3,6 +3,12 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              AutomationProperties.Name="转存工作台">
     <Grid Margin="0,0,10,0">
+        <Grid.Resources>
+            <Style x:Key="DangerHistoryButton" TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}">
+                <Setter Property="Foreground" Value="#B42318" />
+                <Setter Property="BorderBrush" Value="#B42318" />
+            </Style>
+        </Grid.Resources>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
@@ -185,9 +191,16 @@
                         </Grid>
                     </TabItem>
                     <TabItem Header="处理结果">
-                        <ContentControl x:Name="ResultsHost" Margin="4,8,4,4"
+                        <DockPanel>
+                            <Button DockPanel.Dock="Top" Content="清空转存历史" Command="{Binding ClearTransferHistoryCommand}"
+                                    AutomationProperties.Name="清空转存历史" Style="{StaticResource DangerHistoryButton}"
+                                    HorizontalAlignment="Right" Margin="4,8,4,0"
+                                    ToolTip="仅删除本地记录，不影响百度网盘文件和分享链接。任务处理或保存期间不可清空。"
+                                    ToolTipService.ShowOnDisabled="True" />
+                            <ContentControl x:Name="ResultsHost" Margin="4,8,4,4"
                                         HorizontalContentAlignment="Stretch"
                                         VerticalContentAlignment="Stretch" />
+                        </DockPanel>
                     </TabItem>
                     <TabItem Header="运行日志">
                         <Border Margin="4,8,4,4" Padding="0">

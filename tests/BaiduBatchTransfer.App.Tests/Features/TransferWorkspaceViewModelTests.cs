@@ -27,6 +27,42 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class TransferWorkspaceViewModelTests
 {
     [Fact]
+    public async Task CleanupReloadsEmptyTransferHistoryAndDisablesRepeat()
+    {
+        var cleanup = new CleanupStore();
+        var interaction = new CleanupInteraction();
+        using var fixture = Fixture.Create(historyCleanupStore: cleanup, cleanupInteraction: interaction);
+        var vm = fixture.ViewModel;
+        await fixture.RunPanel.ActivateBatchAsync(Guid.NewGuid());
+        await vm.RefreshHistoryPreviewAsync();
+        Assert.True(vm.CanClearTransferHistory);
+        cleanup.OnDelete = () => cleanup.Preview = new(LocalHistoryKind.Transfer, 0, false, null);
+        await vm.ClearTransferHistoryCommand.ExecuteAsync(null);
+        Assert.Single(cleanup.Deleted);
+        Assert.Same(interaction.Confirmed.Single(), cleanup.Deleted.Single());
+        Assert.Empty(fixture.RunPanel.Batches);
+        Assert.Null(fixture.RunPanel.SelectedBatch);
+        Assert.Equal(Guid.Empty, fixture.RunPanel.Results.BatchJobId);
+        Assert.False(vm.CanClearTransferHistory);
+        Assert.Contains("已清空 7", vm.StatusMessage);
+        await vm.ClearTransferHistoryAsync();
+        Assert.Single(cleanup.Deleted);
+    }
+
+    [Fact]
+    public async Task CleanupTransferConflictAndCloseDisableCommand()
+    {
+        var cleanup = new CleanupStore { Preview = new(LocalHistoryKind.Transfer, 2, true, "conflict") };
+        using var fixture = Fixture.Create(historyCleanupStore: cleanup, cleanupInteraction: new CleanupInteraction());
+        await fixture.ViewModel.InitializeAsync();
+        Assert.False(fixture.ViewModel.ClearTransferHistoryCommand.CanExecute(null));
+        cleanup.Preview = new(LocalHistoryKind.Transfer, 2, false, "ready");
+        await fixture.ViewModel.RefreshHistoryPreviewAsync();
+        Assert.True(fixture.ViewModel.ClearTransferHistoryCommand.CanExecute(null));
+        fixture.ViewModel.Close();
+        Assert.False(fixture.ViewModel.ClearTransferHistoryCommand.CanExecute(null));
+    }
+    [Fact]
     public async Task LicenseFailureStopsBeforeTransferJobCreationOrRemotePrecheck()
     {
         var gate = new RecordingLicenseGate(isAuthorized: false);
@@ -2933,7 +2969,9 @@ public sealed class TransferWorkspaceViewModelTests
             IJobResultsWorkflow? resultsWorkflow,
             IResultSaveDialog? resultsSaveDialog,
             ITransferTargetDirectoryPicker? targetDirectoryPicker,
-            ILicenseAuthorizationGate? licenseGate)
+            ILicenseAuthorizationGate? licenseGate,
+            ILocalTerminalHistoryStore? historyCleanupStore,
+            ILocalHistoryCleanupInteraction? cleanupInteraction)
         {
             Ready = ready;
             Events = [];
@@ -2974,7 +3012,8 @@ public sealed class TransferWorkspaceViewModelTests
                 Import, Wizard, RunPanel, new FakeResultSaveDialog(), DestinationSink, handoff,
                 availability, options, remoteWriteMode, acceptanceRunAsync,
                 resultDirectoryPreparer ?? new RecordingResultDirectoryPreparer(),
-                targetDirectoryPicker, Dialog, licenseGate);
+                targetDirectoryPicker, Dialog, licenseGate,
+                historyCleanupStore is null ? null : new LocalTerminalHistoryService(historyCleanupStore), cleanupInteraction);
         }
 
         public int Ready { get; }
@@ -3009,10 +3048,13 @@ public sealed class TransferWorkspaceViewModelTests
             IJobResultsWorkflow? resultsWorkflow = null,
             IResultSaveDialog? resultsSaveDialog = null,
             ITransferTargetDirectoryPicker? targetDirectoryPicker = null,
-            ILicenseAuthorizationGate? licenseGate = null) =>
+            ILicenseAuthorizationGate? licenseGate = null,
+            ILocalTerminalHistoryStore? historyCleanupStore = null,
+            ILocalHistoryCleanupInteraction? cleanupInteraction = null) =>
             new(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff, adapterAvailability,
                 remoteWriteMode, managedAccount, acceptanceRunAsync, resultDirectoryPreparer, historySource,
-                refreshDelay, resultsWorkflow, resultsSaveDialog, targetDirectoryPicker, licenseGate);
+                refreshDelay, resultsWorkflow, resultsSaveDialog, targetDirectoryPicker, licenseGate,
+                historyCleanupStore, cleanupInteraction);
 
         public static Fixture Valid(
             int accountCount = 1,

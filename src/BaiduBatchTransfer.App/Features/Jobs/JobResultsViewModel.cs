@@ -139,6 +139,31 @@ public sealed class JobResultsViewModel : ObservableObject
     public IAsyncRelayCommand CopyGeneratedShareCommand { get; }
     public IRelayCommand CancelSaveCommand { get; }
 
+    public void Reset()
+    {
+        Interlocked.Increment(ref generation);
+        var previousSave = saveCancellation;
+        saveCancellation = null;
+        batchJobId = Guid.Empty;
+        nextCursor = null;
+        selectedItem = null;
+        isBusy = false;
+        isSaving = false;
+        totalCount = resourceCount = operationCount = failedCount = pausedCount = 0;
+        completeSuccessCount = terminalProblemCount = exportedRows = 0;
+        progressBatchJobId = Guid.Empty;
+        lastProgressSnapshot = null;
+        refreshFailureActive = false;
+        loadedOperationIds.Clear();
+        autoPromptedExistingShareBatches.Clear();
+        finalizedLifecycleBatches.Clear();
+        statusMessage = "请选择一个任务查看结果。";
+        previousSave?.Cancel();
+        Items.Clear();
+        OnPropertyChanged(string.Empty);
+        NotifyCommandState();
+    }
+
     public Task InitializeAsync(Guid requestedBatchJobId, CancellationToken cancellationToken = default) =>
         InitializeCoreAsync(requestedBatchJobId, propagateFailure: false, cancellationToken);
 
@@ -356,14 +381,15 @@ public sealed class JobResultsViewModel : ObservableObject
     public async Task SaveAsAsync(CancellationToken cancellationToken = default)
     {
         if (!CanSaveAs) return;
+        var capturedGeneration = generation;
+        var capturedBatch = batchJobId;
         var destination = await saveDialog.PickDestinationDirectoryAsync(cancellationToken).ConfigureAwait(true);
+        if (capturedGeneration != generation || capturedBatch != batchJobId || cancellationToken.IsCancellationRequested) return;
         if (string.IsNullOrWhiteSpace(destination))
         {
             StatusMessage = "未选择保存目录。";
             return;
         }
-        var capturedGeneration = generation;
-        var capturedBatch = batchJobId;
         var currentSave = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         saveCancellation = currentSave;
         IsSaving = true;
@@ -414,20 +440,21 @@ public sealed class JobResultsViewModel : ObservableObject
     {
         var selected = commandRow ?? SelectedItem;
         if (!CanCopyGeneratedShareRow(selected) || clipboard is null || selected is null) return;
+        var capturedGeneration = generation;
         try
         {
             await clipboard.SetTextAsync(
                 $"分享链接：{selected.GeneratedShareUrl}\r\n提取码：{selected.GeneratedExtractionCode}",
                 cancellationToken).ConfigureAwait(true);
-            StatusMessage = "分享链接和提取码已复制。";
+            if (capturedGeneration == generation) StatusMessage = "分享链接和提取码已复制。";
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            StatusMessage = "复制已取消。";
+            if (capturedGeneration == generation) StatusMessage = "复制已取消。";
         }
         catch (Exception)
         {
-            StatusMessage = "复制失败，请稍后重试。";
+            if (capturedGeneration == generation) StatusMessage = "复制失败，请稍后重试。";
         }
     }
 
@@ -465,9 +492,11 @@ public sealed class JobResultsViewModel : ObservableObject
         string pendingText,
         CancellationToken cancellationToken)
     {
+        var capturedGeneration = generation;
         if (licenseGate is not null)
         {
             var authorization = await licenseGate.AuthorizeAsync(operation, cancellationToken).ConfigureAwait(true);
+            if (capturedGeneration != generation) return;
             if (!authorization.IsAuthorized)
             {
                 StatusMessage = "软件尚未激活，联网功能暂不可用。";
@@ -698,7 +727,7 @@ public sealed class JobResultsViewModel : ObservableObject
     private void CancelSave() => saveCancellation?.Cancel();
 
     private bool CanCopyGeneratedShareRow(JobResultRow? row) =>
-        !IsBusy && !IsSaving && clipboard is not null &&
+        batchJobId != Guid.Empty && !IsBusy && !IsSaving && clipboard is not null &&
         row is { GeneratedShareUrl: { Length: > 0 }, GeneratedExtractionCode: { Length: > 0 } };
 
     private void NotifyCommandState()

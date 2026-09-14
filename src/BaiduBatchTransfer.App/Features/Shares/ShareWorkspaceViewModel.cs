@@ -102,6 +102,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     private ShareExistingDecisionOption existingShareDecision;
     private int historyPageNumber = 1;
     private long historyTotalCount;
+    private readonly LocalHistoryCleanupViewModel historyCleanup;
 
     public ShareWorkspaceViewModel(
         IReadOnlyList<ShareAccountOption> accounts,
@@ -114,7 +115,9 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         ILocalResultExportCoordinator? localResultExports = null,
         IStandaloneShareResultProjectionRepository? resultProjectionRepository = null,
         ILocalResultExportStore? localResultExportStore = null,
-        ILicenseAuthorizationGate? licenseGate = null)
+        ILicenseAuthorizationGate? licenseGate = null,
+        LocalTerminalHistoryService? historyCleanupService = null,
+        ILocalHistoryCleanupInteraction? historyCleanupInteraction = null)
     {
         ArgumentNullException.ThrowIfNull(accounts);
         this.resourcePicker = resourcePicker ?? throw new ArgumentNullException(nameof(resourcePicker));
@@ -126,6 +129,9 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         this.resultProjectionRepository = resultProjectionRepository;
         this.localResultExportStore = localResultExportStore;
         this.licenseGate = licenseGate;
+        historyCleanup = new(historyCleanupService, historyCleanupInteraction, LocalHistoryKind.StandaloneShare,
+            () => !IsClosed && !isBusy && pendingBatch is null && saveResultsCancellation is null,
+            token => LoadHistoryPageAsync(1, token, cleanupReload: true), text => StatusMessage = text);
         if (historyPageSize is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(historyPageSize));
         this.historyPageSize = historyPageSize;
 
@@ -166,6 +172,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
             NextHistoryPageAsync, () => CanLoadNextHistoryPage);
         ((INotifyCollectionChanged)Logs).CollectionChanged += OnLogsChanged;
         logBuffer.AppendSafe(StatusMessage);
+        historyCleanup.PropertyChanged += OnHistoryCleanupPropertyChanged;
     }
 
     public ObservableCollection<ShareAccountOption> Accounts { get; }
@@ -251,12 +258,17 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         set
         {
             var previousBatchId = selectedBatch?.Id;
+            var previousStatus = selectedBatch?.Status;
             if (!SetProperty(ref selectedBatch, value)) return;
             if (previousBatchId != value?.Id) ClearLoadedDetails();
             Interlocked.Increment(ref batchSelectionGeneration);
             if (SelectedOperation is not null && SelectedOperation.BatchId != value?.Id)
                 SelectedOperation = null;
             NotifyCommandState();
+            if (value is { Status: StandaloneShareBatchStatus.Completed or
+                    StandaloneShareBatchStatus.CompletedWithFailures or StandaloneShareBatchStatus.Cancelled } &&
+                previousStatus != value.Status)
+                _ = RefreshHistoryPreviewAsync();
         }
     }
 
@@ -286,11 +298,12 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
 
     public bool IsBusy
     {
-        get => isBusy;
+        get => isBusy || historyCleanup.IsBusy;
         private set
         {
             if (!SetProperty(ref isBusy, value)) return;
             NotifyCommandState();
+            if (!value && !IsClosed) _ = RefreshHistoryPreviewAsync();
         }
     }
 
@@ -341,6 +354,20 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand PreviousHistoryPageCommand { get; }
     public IAsyncRelayCommand NextHistoryPageCommand { get; }
     public IRelayCommand ClearLogsCommand { get; }
+    public LocalHistoryCleanupPreview? ShareHistoryPreview => historyCleanup.Preview;
+    public bool CanClearShareHistory => historyCleanup.CanClear;
+    public IAsyncRelayCommand ClearShareHistoryCommand => historyCleanup.ClearCommand;
+    public Task ClearShareHistoryAsync(CancellationToken cancellationToken = default) => historyCleanup.ClearAsync(cancellationToken);
+    public Task RefreshHistoryPreviewAsync(CancellationToken cancellationToken = default) => historyCleanup.RefreshPreviewAsync(cancellationToken);
+
+    private void OnHistoryCleanupPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        OnPropertyChanged(nameof(CanClearShareHistory));
+        if (e.PropertyName == nameof(LocalHistoryCleanupViewModel.Preview)) OnPropertyChanged(nameof(ShareHistoryPreview));
+        if (e.PropertyName != nameof(LocalHistoryCleanupViewModel.IsBusy)) return;
+        OnPropertyChanged(nameof(IsBusy));
+        NotifyCommandState();
+    }
 
     public void ReloadAccounts(IReadOnlyList<ShareAccountOption> accounts)
     {
@@ -522,8 +549,11 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
 
-    public Task InitializeAsync(CancellationToken cancellationToken = default) =>
-        LoadHistoryPageAsync(1, cancellationToken);
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        await LoadHistoryPageAsync(1, cancellationToken).ConfigureAwait(true);
+        await RefreshHistoryPreviewAsync(cancellationToken).ConfigureAwait(true);
+    }
 
     public Task PreviousHistoryPageAsync(CancellationToken cancellationToken = default) =>
         !CanLoadPreviousHistoryPage
@@ -535,11 +565,11 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
             ? Task.CompletedTask
             : LoadHistoryPageAsync(HistoryPageNumber + 1, cancellationToken);
 
-    private async Task LoadHistoryPageAsync(int pageNumber, CancellationToken cancellationToken)
+    private async Task LoadHistoryPageAsync(int pageNumber, CancellationToken cancellationToken, bool cleanupReload = false)
     {
-        if (IsClosed || IsBusy) return;
+        if (IsClosed || (cleanupReload ? isBusy : IsBusy)) return;
         if (pageNumber < 1) throw new ArgumentOutOfRangeException(nameof(pageNumber));
-        var requestGeneration = Volatile.Read(ref batchSelectionGeneration);
+        var requestGeneration = Interlocked.Increment(ref batchSelectionGeneration);
         using var operation = CreateOperation(cancellationToken);
         IsBusy = true;
         try
@@ -585,6 +615,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         {
             if (IsHistoryRequestCurrent(requestGeneration))
                 StatusMessage = "暂时无法加载分享记录，请稍后重试。";
+            if (cleanupReload) throw;
         }
         finally
         {
@@ -767,6 +798,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public void Close()
     {
         if (isClosed) return;
+        historyCleanup.Close();
         isClosed = true;
         lifetime.Cancel();
         ((INotifyCollectionChanged)Logs).CollectionChanged -= OnLogsChanged;
@@ -777,6 +809,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         Close();
+        historyCleanup.PropertyChanged -= OnHistoryCleanupPropertyChanged;
+        historyCleanup.Dispose();
         lifetime.Dispose();
     }
 
@@ -792,6 +826,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     private void OnLogsChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
         OnPropertyChanged(nameof(CanClearLogs));
+        OnPropertyChanged(nameof(CanClearShareHistory));
+        ClearShareHistoryCommand?.NotifyCanExecuteChanged();
         ClearLogsCommand.NotifyCanExecuteChanged();
     }
 
@@ -1233,6 +1269,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
 
     private void NotifyCommandState()
     {
+        OnPropertyChanged(nameof(CanClearShareHistory));
+        ClearShareHistoryCommand.NotifyCanExecuteChanged();
         OnPropertyChanged(nameof(CanPickResources));
         OnPropertyChanged(nameof(CanEditSelection));
         OnPropertyChanged(nameof(CanResetPendingDraft));

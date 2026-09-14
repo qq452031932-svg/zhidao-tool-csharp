@@ -5,7 +5,9 @@ using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -46,6 +48,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private readonly HashSet<Guid> batchPendingRowIds = [];
     private int expectedOperationsPerResource;
     private bool createdBatchIsTerminal;
+    private readonly LocalHistoryCleanupViewModel historyCleanup;
 
     public TransferWorkspaceViewModel(
         ImportViewModel import,
@@ -61,7 +64,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         ILocalResultDirectoryPreparer? resultDirectoryPreparer = null,
         ITransferTargetDirectoryPicker? targetDirectoryPicker = null,
         IDialogService? dialogService = null,
-        ILicenseAuthorizationGate? licenseGate = null)
+        ILicenseAuthorizationGate? licenseGate = null,
+        LocalTerminalHistoryService? historyCleanupService = null,
+        ILocalHistoryCleanupInteraction? historyCleanupInteraction = null)
     {
         Import = import ?? throw new ArgumentNullException(nameof(import));
         Wizard = wizard ?? throw new ArgumentNullException(nameof(wizard));
@@ -77,6 +82,10 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         this.remoteWriteMode = remoteWriteMode;
         this.acceptanceRunAsync = acceptanceRunAsync;
         this.licenseGate = licenseGate;
+        historyCleanup = new(historyCleanupService, historyCleanupInteraction, LocalHistoryKind.Transfer,
+            () => !isClosed && !IsStarting && !Import.IsBusy && !Wizard.IsBusy &&
+                !RunPanel.IsClosed && !RunPanel.IsBusy && !RunPanel.Results.IsBusy && !RunPanel.Results.IsSaving,
+            RunPanel.ReloadHistoryAsync, text => StatusMessage = text);
         StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
         ClearLogsCommand = new RelayCommand(ClearLogs, () => CanClearLogs);
         SelectSingleAccountCommand = new AsyncRelayCommand(
@@ -104,6 +113,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         RunPanel.Results.Items.CollectionChanged += OnResultItemsChanged;
         Import.Rows.CollectionChanged += OnPendingRowsChanged;
         ((INotifyCollectionChanged)Logs).CollectionChanged += OnLogsChanged;
+        historyCleanup.PropertyChanged += OnHistoryCleanupPropertyChanged;
         AppendPresentationLog(StatusMessage);
         AppendPresentationLog(Import.StatusMessage);
         AppendPresentationLog(RunPanel.StatusMessage);
@@ -135,7 +145,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             ILocalResultDirectoryPreparer? resultDirectoryPreparer = null,
             ITransferTargetDirectoryPicker? targetDirectoryPicker = null,
             IDialogService? dialogService = null,
-            ILicenseAuthorizationGate? licenseGate = null)
+            ILicenseAuthorizationGate? licenseGate = null,
+            LocalTerminalHistoryService? historyCleanupService = null,
+            ILocalHistoryCleanupInteraction? historyCleanupInteraction = null)
         : this(
             import,
             wizard,
@@ -154,7 +166,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             resultDirectoryPreparer,
             targetDirectoryPicker,
             dialogService,
-            licenseGate)
+            licenseGate,
+            historyCleanupService,
+            historyCleanupInteraction)
     {
     }
 
@@ -279,7 +293,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
     public bool IsClosed => isClosed;
-    public bool CanEditConfiguration => !isClosed && !IsStarting;
+    public bool CanEditConfiguration => !isClosed && !IsStarting && !historyCleanup.IsBusy;
     public Guid? CreatedBatchJobId => createdBatchJobId;
     public int SelectedDataTabIndex
     {
@@ -291,7 +305,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
     public bool CanStart =>
-        !isClosed && !IsStarting && !Import.IsBusy && string.IsNullOrEmpty(EvaluateConfiguration());
+        !isClosed && !IsStarting && !historyCleanup.IsBusy && !Import.IsBusy && string.IsNullOrEmpty(EvaluateConfiguration());
     public bool CanClearLogs =>
         !isClosed && !IsStarting && !Import.IsBusy &&
         !RunPanel.IsBusy && !RunPanel.Results.IsBusy && !RunPanel.Results.IsSaving &&
@@ -304,6 +318,32 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand SelectDistributionCommand { get; }
     public IAsyncRelayCommand PickShareResultDirectoryCommand { get; }
     public IAsyncRelayCommand PickTargetDirectoryCommand { get; }
+    public LocalHistoryCleanupPreview? TransferHistoryPreview => historyCleanup.Preview;
+    public bool CanClearTransferHistory => historyCleanup.CanClear;
+    public IAsyncRelayCommand ClearTransferHistoryCommand => historyCleanup.ClearCommand;
+    public Task ClearTransferHistoryAsync(CancellationToken cancellationToken = default) => historyCleanup.ClearAsync(cancellationToken);
+    public Task RefreshHistoryPreviewAsync(CancellationToken cancellationToken = default) => historyCleanup.RefreshPreviewAsync(cancellationToken);
+
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        if (isClosed) return;
+        await RunPanel.InitializeAsync(cancellationToken).ConfigureAwait(true);
+        await RefreshHistoryPreviewAsync(cancellationToken).ConfigureAwait(true);
+    }
+
+    private void OnHistoryCleanupPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        OnPropertyChanged(nameof(CanClearTransferHistory));
+        if (e.PropertyName == nameof(LocalHistoryCleanupViewModel.Preview))
+            OnPropertyChanged(nameof(TransferHistoryPreview));
+        if (e.PropertyName != nameof(LocalHistoryCleanupViewModel.IsBusy)) return;
+        RaiseStartState();
+        SelectSingleAccountCommand.NotifyCanExecuteChanged();
+        SelectReplicationCommand.NotifyCanExecuteChanged();
+        SelectDistributionCommand.NotifyCanExecuteChanged();
+        PickShareResultDirectoryCommand.NotifyCanExecuteChanged();
+        PickTargetDirectoryCommand.NotifyCanExecuteChanged();
+    }
 
     public void ApplyImportedDraft(ImportDraftReady draft)
     {
@@ -651,6 +691,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public void Close()
     {
         if (isClosed) return;
+        historyCleanup.Close();
         isClosed = true;
         Interlocked.Increment(ref modeSelectionVersion);
         Interlocked.Exchange(ref modeSelectionCancellation, null)?.Cancel();
@@ -675,6 +716,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         Close();
+        historyCleanup.PropertyChanged -= OnHistoryCleanupPropertyChanged;
+        historyCleanup.Dispose();
         RunPanel.Dispose();
         Import.Dispose();
         lifetime.Dispose();
@@ -891,6 +934,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 
     private void NotifyClearLogsState()
     {
+        historyCleanup.NotifyAvailabilityChanged();
         OnPropertyChanged(nameof(CanClearLogs));
         ClearLogsCommand.NotifyCanExecuteChanged();
     }
@@ -898,6 +942,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private void OnBatchTerminal(object? sender, WorkspaceBatchTerminalEvent terminal)
     {
         if (isClosed) return;
+        _ = RefreshHistoryPreviewAsync();
         if (terminal.BatchJobId == createdBatchJobId)
         {
             createdBatchIsTerminal = true;
@@ -946,6 +991,10 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private void OnStatusSourcePropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (isClosed) return;
+        historyCleanup.NotifyAvailabilityChanged();
+        if ((ReferenceEquals(sender, RunPanel) && e.PropertyName == nameof(WorkspaceRunPanelViewModel.IsBusy) && !RunPanel.IsBusy) ||
+            (ReferenceEquals(sender, RunPanel.Results) && e.PropertyName == nameof(JobResultsViewModel.IsBusy) && !RunPanel.Results.IsBusy))
+            _ = RefreshHistoryPreviewAsync();
         if ((ReferenceEquals(sender, RunPanel) && e.PropertyName == nameof(WorkspaceRunPanelViewModel.IsBusy)) ||
             (ReferenceEquals(sender, RunPanel.Results) &&
              e.PropertyName is nameof(JobResultsViewModel.IsBusy) or nameof(JobResultsViewModel.IsSaving)))
