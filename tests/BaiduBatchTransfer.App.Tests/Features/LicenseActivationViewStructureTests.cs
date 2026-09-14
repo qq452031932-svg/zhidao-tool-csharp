@@ -128,6 +128,83 @@ public sealed class LicenseActivationViewStructureTests
     }
 
     [Fact]
+    public void EveryBodyElementUsesAnExplicitHighContrastAwareStyle()
+    {
+        var document = XDocument.Load(FindRepositoryFile(
+            "src",
+            "BaiduBatchTransfer.App",
+            "Features",
+            "Licensing",
+            "LicenseActivationWindow.xaml"));
+
+        AssertElementStyle(document, "CardLabel", "ActivationBodyLabelStyle");
+        AssertElementStyle(document, "CardInput", "ActivationTextBoxStyle");
+        AssertElementStyle(document, "CardBindingHint", "ActivationBodyHintStyle");
+        AssertElementStyle(document, "ActivationStatusRegion", "ActivationStatusRegionStyle");
+        AssertElementStyle(document, "ActivationStatusText", "ActivationStatusTextStyle");
+
+        AssertHighContrastSetter(document, "ActivationBodyLabelStyle", "Foreground", "SystemColors.WindowTextBrushKey");
+        AssertHighContrastSetter(document, "ActivationBodyHintStyle", "Foreground", "SystemColors.WindowTextBrushKey");
+        AssertHighContrastSetter(document, "ActivationTextBoxStyle", "Background", "SystemColors.WindowBrushKey");
+        AssertHighContrastSetter(document, "ActivationTextBoxStyle", "Foreground", "SystemColors.WindowTextBrushKey");
+        AssertHighContrastSetter(document, "ActivationTextBoxStyle", "BorderBrush", "SystemColors.HighlightBrushKey");
+        AssertHighContrastSetter(document, "ActivationStatusRegionStyle", "Background", "SystemColors.WindowBrushKey");
+        AssertHighContrastSetter(document, "ActivationStatusRegionStyle", "BorderBrush", "SystemColors.HighlightBrushKey");
+        AssertHighContrastSetter(document, "ActivationStatusTextStyle", "Foreground", "SystemColors.WindowTextBrushKey");
+    }
+
+    [Fact]
+    public void LocalStylesInheritTheApplicationThemeWithoutLosingControlBehavior()
+    {
+        var activation = XDocument.Load(FindRepositoryFile(
+            "src",
+            "BaiduBatchTransfer.App",
+            "Features",
+            "Licensing",
+            "LicenseActivationWindow.xaml"));
+        var theme = XDocument.Load(FindRepositoryFile(
+            "src",
+            "BaiduBatchTransfer.App",
+            "Styles",
+            "SuperPanTheme.xaml"));
+        var xamlKey = XName.Get("Key", "http://schemas.microsoft.com/winfx/2006/xaml");
+
+        AssertStyleBasedOn(activation, "ActivationPrimaryButtonStyle", "{StaticResource {x:Type Button}}");
+        AssertStyleBasedOn(activation, "ActivationSecondaryButtonStyle", "{StaticResource {x:Type Button}}");
+        AssertStyleBasedOn(activation, "ActivationTextBoxStyle", "{StaticResource {x:Type TextBox}}");
+        var windowStyle = Assert.Single(activation.Root!.Elements(), element =>
+            element.Name.LocalName == "Window.Style").Elements().Single();
+        Assert.Equal("{StaticResource {x:Type Window}}", (string?)windowStyle.Attribute("BasedOn"));
+
+        var implicitWindow = Assert.Single(theme.Descendants(), element =>
+            element.Name.LocalName == "Style" &&
+            element.Attribute(xamlKey) is null &&
+            (string?)element.Attribute("TargetType") == "Window");
+        Assert.Contains(implicitWindow.Elements(), element =>
+            element.Name.LocalName == "Setter" &&
+            (string?)element.Attribute("Property") == "FontFamily" &&
+            (string?)element.Attribute("Value") == "Microsoft YaHei UI");
+        var implicitButton = Assert.Single(theme.Descendants(), element =>
+            element.Name.LocalName == "Style" &&
+            element.Attribute(xamlKey) is null &&
+            (string?)element.Attribute("TargetType") == "Button");
+        Assert.Contains(implicitButton.Elements(), element =>
+            element.Name.LocalName == "Setter" &&
+            (string?)element.Attribute("Property") == "Cursor" &&
+            (string?)element.Attribute("Value") == "Hand");
+        Assert.Contains(implicitButton.Descendants(), element => element.Name.LocalName == "ControlTemplate");
+        Assert.Contains(implicitButton.Descendants(), element =>
+            element.Name.LocalName == "Trigger" &&
+            (string?)element.Attribute("Property") == "IsEnabled" &&
+            (string?)element.Attribute("Value") == "False");
+        var implicitTextBox = Assert.Single(theme.Descendants(), element =>
+            element.Name.LocalName == "Style" &&
+            element.Attribute(xamlKey) is null &&
+            (string?)element.Attribute("TargetType") == "TextBox");
+        Assert.Contains(implicitTextBox.Descendants(), element => element.Name.LocalName == "ControlTemplate");
+    }
+
+    [Fact]
     public async Task ActivationWindowKeepsActionsVisibleOrScrollAccessibleWhenSpaceShrinks()
     {
         await RunStaAsync(() =>
@@ -286,6 +363,40 @@ public sealed class LicenseActivationViewStructureTests
         var setter = Assert.Single(style.Elements(), element =>
             element.Name.LocalName == "Setter" && (string?)element.Attribute("Property") == property);
         return setter.Attribute("Value")!.Value;
+    }
+
+    private static void AssertElementStyle(XDocument document, string elementName, string styleKey)
+    {
+        var xamlName = XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml");
+        var element = Assert.Single(document.Descendants(), candidate =>
+            AttributeValue(candidate, xamlName) == elementName);
+        Assert.Equal($"{{StaticResource {styleKey}}}", (string?)element.Attribute("Style"));
+    }
+
+    private static void AssertHighContrastSetter(
+        XDocument document,
+        string styleKey,
+        string property,
+        string systemBrushKey)
+    {
+        var xamlKey = XName.Get("Key", "http://schemas.microsoft.com/winfx/2006/xaml");
+        var style = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "Style" && AttributeValue(element, xamlKey) == styleKey);
+        var trigger = Assert.Single(style.Descendants(), element =>
+            element.Name.LocalName == "DataTrigger" &&
+            ((string?)element.Attribute("Binding"))?.Contains(
+                "SystemParameters.HighContrast", StringComparison.Ordinal) == true);
+        var setter = Assert.Single(trigger.Elements(), element =>
+            element.Name.LocalName == "Setter" && (string?)element.Attribute("Property") == property);
+        Assert.Contains(systemBrushKey, setter.Attribute("Value")!.Value, StringComparison.Ordinal);
+    }
+
+    private static void AssertStyleBasedOn(XDocument document, string styleKey, string expectedBasedOn)
+    {
+        var xamlKey = XName.Get("Key", "http://schemas.microsoft.com/winfx/2006/xaml");
+        var style = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "Style" && AttributeValue(element, xamlKey) == styleKey);
+        Assert.Equal(expectedBasedOn, (string?)style.Attribute("BasedOn"));
     }
 
     private static double ContrastRatio(string foreground, string background)

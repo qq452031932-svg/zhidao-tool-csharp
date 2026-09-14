@@ -49,7 +49,9 @@
                 </DataTrigger>
             </Style.Triggers>
         </Style>
-        <Style x:Key="ActivationPrimaryButtonStyle" TargetType="{x:Type Button}">
+        <Style x:Key="ActivationPrimaryButtonStyle"
+               TargetType="{x:Type Button}"
+               BasedOn="{StaticResource {x:Type Button}}">
             <Setter Property="Background" Value="#00796B" />
             <Setter Property="BorderBrush" Value="#00796B" />
             <Setter Property="Foreground" Value="White" />
@@ -64,7 +66,9 @@
                 </DataTrigger>
             </Style.Triggers>
         </Style>
-        <Style x:Key="ActivationSecondaryButtonStyle" TargetType="{x:Type Button}">
+        <Style x:Key="ActivationSecondaryButtonStyle"
+               TargetType="{x:Type Button}"
+               BasedOn="{StaticResource {x:Type Button}}">
             <Setter Property="Background" Value="White" />
             <Setter Property="BorderBrush" Value="#9CB9B3" />
             <Setter Property="Foreground" Value="#365A53" />
@@ -79,9 +83,70 @@
                 </DataTrigger>
             </Style.Triggers>
         </Style>
+        <Style x:Key="ActivationBodyLabelStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="Foreground" Value="#173B36" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
+                    <Setter Property="Foreground"
+                            Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="ActivationBodyHintStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="Foreground" Value="#647773" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
+                    <Setter Property="Foreground"
+                            Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="ActivationTextBoxStyle"
+               TargetType="{x:Type TextBox}"
+               BasedOn="{StaticResource {x:Type TextBox}}">
+            <Setter Property="BorderBrush" Value="#AACBC4" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
+                    <Setter Property="Background"
+                            Value="{DynamicResource {x:Static SystemColors.WindowBrushKey}}" />
+                    <Setter Property="Foreground"
+                            Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}" />
+                    <Setter Property="BorderBrush"
+                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                    <Setter Property="CaretBrush"
+                            Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}" />
+                    <Setter Property="SelectionBrush"
+                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                    <Setter Property="SelectionTextBrush"
+                            Value="{DynamicResource {x:Static SystemColors.HighlightTextBrushKey}}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="ActivationStatusRegionStyle" TargetType="{x:Type Border}">
+            <Setter Property="Background" Value="#F3F8F7" />
+            <Setter Property="BorderBrush" Value="#D6E5E1" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
+                    <Setter Property="Background"
+                            Value="{DynamicResource {x:Static SystemColors.WindowBrushKey}}" />
+                    <Setter Property="BorderBrush"
+                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="ActivationStatusTextStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="Foreground" Value="#365A53" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
+                    <Setter Property="Foreground"
+                            Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
     </Window.Resources>
     <Window.Style>
-        <Style TargetType="{x:Type Window}">
+        <Style TargetType="{x:Type Window}"
+               BasedOn="{StaticResource {x:Type Window}}">
             <Setter Property="Background" Value="#EDF4F2" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
@@ -133,37 +198,41 @@
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
-                        <TextBlock Text="请输入卡密"
-                               Foreground="#173B36"
-                               FontSize="14"
-                               FontWeight="SemiBold" />
-                        <TextBox Grid.Row="1"
+                        <TextBlock x:Name="CardLabel"
+                                   Style="{StaticResource ActivationBodyLabelStyle}"
+                                   Text="请输入卡密"
+                                   FontSize="14"
+                                   FontWeight="SemiBold" />
+                        <TextBox x:Name="CardInput"
+                             Style="{StaticResource ActivationTextBoxStyle}"
+                             Grid.Row="1"
                              Height="48"
                              Margin="0,8,0,0"
                              Padding="12,10"
                              VerticalContentAlignment="Center"
-                             BorderBrush="#AACBC4"
                              BorderThickness="1"
                              FontSize="15"
                              Text="{Binding Card, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                              AutomationProperties.Name="卡密输入" />
-                        <TextBlock Grid.Row="2"
+                        <TextBlock x:Name="CardBindingHint"
+                               Style="{StaticResource ActivationBodyHintStyle}"
+                               Grid.Row="2"
                                Margin="0,8,0,0"
-                               Foreground="#647773"
                                FontSize="12"
                                Text="卡密将绑定当前电脑，请确认后激活"
                                TextWrapping="Wrap" />
-                        <Border Grid.Row="3"
+                        <Border x:Name="ActivationStatusRegion"
+                            Style="{StaticResource ActivationStatusRegionStyle}"
+                            Grid.Row="3"
                             MinHeight="44"
                             Margin="0,15,0,16"
                             Padding="12,10"
                             VerticalAlignment="Top"
-                            Background="#F3F8F7"
-                            BorderBrush="#D6E5E1"
                             BorderThickness="1"
                             CornerRadius="6">
-                        <TextBlock Text="{Binding StatusMessage}"
-                                   Foreground="#365A53"
+                        <TextBlock x:Name="ActivationStatusText"
+                                   Style="{StaticResource ActivationStatusTextStyle}"
+                                   Text="{Binding StatusMessage}"
                                    TextWrapping="Wrap"
                                    AutomationProperties.LiveSetting="Polite"
                                    AutomationProperties.Name="授权状态" />
