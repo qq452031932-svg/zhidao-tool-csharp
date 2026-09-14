@@ -368,6 +368,136 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
         Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM ShareOperationRemoteItems"));
     }
 
+    [Theory]
+    [InlineData("2099-01-01T00:00:00+00:00")]
+    [InlineData("invalid-time")]
+    [InlineData("now")]
+    [InlineData("2451545")]
+    [InlineData("2000-02-30T00:00:00Z")]
+    [InlineData("2000-01-01T00:00:00")]
+    public async Task ActiveOrUntrustedDiscoveryLeaseBlocksCleanup(string expiresAt)
+    {
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target");
+        await AddDiscoveryRunAsync(f, "target", expiresAt);
+        var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.True(preview.HasConflicts);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, (await store.DeleteAsync(preview)).Disposition);
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchJobs"));
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchShareDiscoveryRuns"));
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchShareDiscoveryRunExactSets"));
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchShareDiscoveryStaging"));
+    }
+
+    [Theory]
+    [InlineData("2000-01-01T00:00:00Z")]
+    [InlineData("2000-01-01T08:00:00.1234567+08:00")]
+    public async Task ExpiredDiscoveryRunAndChildrenAreDeletedWithoutAffectingOtherWork(string expiresAt)
+    {
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target");
+        await AddDiscoveryRunAsync(f, "target", expiresAt);
+        await AddEvidenceAsync(f, LocalHistoryKind.Transfer, "target");
+        await SeedAsync(f, LocalHistoryKind.Transfer, "active", "Active");
+        await AddDiscoveryRunAsync(f, "active", "2099-01-01T00:00:00Z");
+        var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.False(preview.HasConflicts);
+        var result = await store.DeleteAsync(preview);
+        Assert.Equal(LocalHistoryCleanupDisposition.Deleted, result.Disposition);
+        Assert.Equal(1, result.DeletedBatchCount);
+        foreach (var table in new[] { "BatchShareDiscoveryRuns", "BatchShareDiscoveryRunExactSets", "BatchShareDiscoveryStaging" })
+        {
+            Assert.Equal(0, await CountAsync(f, $"SELECT count(*) FROM {table} WHERE RunId='target-run'"));
+            Assert.Equal(1, await CountAsync(f, $"SELECT count(*) FROM {table} WHERE RunId='active-run'"));
+        }
+        Assert.Equal(0, await CountAsync(f, "SELECT count(*) FROM WebAutomationDirectoryMutations WHERE OperationId LIKE 'target-%'"));
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchJobs WHERE Id='active'"));
+        await AssertNoForeignKeyIssuesAsync(f);
+    }
+
+    [Theory]
+    [InlineData("2000-01-01T00:00:00Z", "2099-01-01T00:00:00Z")]
+    [InlineData("2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z")]
+    [InlineData("2000-01-01T00:00:00Z", "2001-01-01T00:00:00Z")]
+    public async Task DiscoveryLeaseChangeInvalidatesTheConfirmedSnapshot(string oldExpiry, string newExpiry)
+    {
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target");
+        await AddDiscoveryRunAsync(f, "target", oldExpiry);
+        var confirmed = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        await ExecuteAsync(f, "UPDATE BatchShareDiscoveryRuns SET ExpiresAt=$expires;", ("$expires", newExpiry));
+        var current = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.NotEqual(confirmed.SnapshotToken, current.SnapshotToken);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, (await store.DeleteAsync(confirmed)).Disposition);
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchShareDiscoveryRuns"));
+    }
+
+    [Fact]
+    public async Task DiscoveryExactSetChangeInvalidatesTheConfirmedSnapshot()
+    {
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target");
+        await AddDiscoveryRunAsync(f, "target", "2000-01-01T00:00:00Z");
+        var confirmed = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        await ExecuteAsync(f, "INSERT INTO BatchShareDiscoveryRunExactSets VALUES('target-run','account','additional-exact-set');");
+        var current = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.NotEqual(confirmed.SnapshotToken, current.SnapshotToken);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, (await store.DeleteAsync(confirmed)).Disposition);
+        Assert.Equal(2, await CountAsync(f, "SELECT count(*) FROM BatchShareDiscoveryRunExactSets"));
+    }
+
+    [Fact]
+    public async Task DiscoveryStagingOwnedByAnotherBatchCannotBeDeletedByCascade()
+    {
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target");
+        await AddDiscoveryRunAsync(f, "target", "2000-01-01T00:00:00Z");
+        await SeedAsync(f, LocalHistoryKind.Transfer, "active", "Active");
+        await ExecuteAsync(f, "UPDATE BatchShareDiscoveryStaging SET BatchJobId='active' WHERE RunId='target-run';");
+        var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.True(preview.HasConflicts);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, (await store.DeleteAsync(preview)).Disposition);
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchShareDiscoveryStaging WHERE BatchJobId='active'"));
+    }
+
+    [Theory]
+    [InlineData(-1, false)]
+    [InlineData(0, false)]
+    [InlineData(1, true)]
+    public async Task DiscoveryLeaseUsesTheInjectedUtcClockAndStrictExpiryBoundary(int secondsUntilExpiry, bool expectedConflict)
+    {
+        var (f, _) = await CreateAsync();
+        var clock = new MutableTimeProvider(new DateTimeOffset(2026, 9, 14, 10, 0, 0, TimeSpan.Zero));
+        var store = new SqliteLocalTerminalHistoryStore(f, clock);
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target");
+        await AddDiscoveryRunAsync(f, "target", clock.UtcNow.AddSeconds(secondsUntilExpiry).ToString("O"));
+        var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.Equal(expectedConflict, preview.HasConflicts);
+        Assert.Equal(expectedConflict ? LocalHistoryCleanupDisposition.Conflict : LocalHistoryCleanupDisposition.Deleted,
+            (await store.DeleteAsync(preview)).Disposition);
+        await AssertNoForeignKeyIssuesAsync(f);
+    }
+
+    [Theory]
+    [InlineData(-1, -2)]
+    [InlineData(1, 2)]
+    public async Task DiscoveryLeaseEffectiveStateChangeInvalidatesSnapshotWithoutAClockValueInTheToken(int secondsUntilExpiry, int clockAdvanceSeconds)
+    {
+        var (f, _) = await CreateAsync();
+        var clock = new MutableTimeProvider(new DateTimeOffset(2026, 9, 14, 10, 0, 0, TimeSpan.Zero));
+        var store = new SqliteLocalTerminalHistoryStore(f, clock);
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target");
+        await AddDiscoveryRunAsync(f, "target", clock.UtcNow.AddSeconds(secondsUntilExpiry).ToString("O"));
+        var confirmed = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.Equal(confirmed.SnapshotToken, (await store.PreviewAsync(LocalHistoryKind.Transfer)).SnapshotToken);
+        clock.UtcNow = clock.UtcNow.AddSeconds(clockAdvanceSeconds);
+        var current = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.NotEqual(confirmed.HasConflicts, current.HasConflicts);
+        Assert.NotEqual(confirmed.SnapshotToken, current.SnapshotToken);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, (await store.DeleteAsync(confirmed)).Disposition);
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchShareDiscoveryRuns"));
+    }
+
     [Fact]
     public async Task TransferDeletionCascadesFullConfirmedShareGraphAndPreservesPreferences()
     {
@@ -488,6 +618,16 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
         }
     }
 
+    private static Task AddDiscoveryRunAsync(SqliteConnectionFactory f, string batchId, string expiresAt) =>
+        ExecuteAsync(f, """
+            INSERT INTO BatchShareDiscoveryRuns(RunId,BatchJobId,AccountId,SettingsFingerprint,ExpectedWorkCount,CreatedAt,ExpiresAt)
+            VALUES($batch||'-run',$batch,'account','settings',1,$at,$expires);
+            INSERT INTO BatchShareDiscoveryRunExactSets(RunId,AccountId,ExactItemSetFingerprint)
+            VALUES($batch||'-run','account','exact-set');
+            INSERT INTO BatchShareDiscoveryStaging(RunId,BatchJobId,AccountId,SettingsFingerprint,ExactItemSetFingerprint,ShareId,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited,IsCompatible)
+            VALUES($batch||'-run',$batch,'account','settings','exact-set','share','https://example.test','code',1,1,1);
+            """, ("$batch", batchId), ("$expires", expiresAt), ("$at", At));
+
     private static string BatchTable(LocalHistoryKind kind) => kind == LocalHistoryKind.Transfer ? "BatchJobs" : "StandaloneShareBatches";
     private static LocalHistoryKind Other(LocalHistoryKind kind) => kind == LocalHistoryKind.Transfer ? LocalHistoryKind.StandaloneShare : LocalHistoryKind.Transfer;
     private static async Task ExecuteAsync(SqliteConnectionFactory f, string sql, params (string Name, object Value)[] parameters)
@@ -514,4 +654,10 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
         Assert.False(await reader.ReadAsync());
     }
     public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
+
+    private sealed class MutableTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        public DateTimeOffset UtcNow { get; set; } = utcNow;
+        public override DateTimeOffset GetUtcNow() => UtcNow;
+    }
 }
