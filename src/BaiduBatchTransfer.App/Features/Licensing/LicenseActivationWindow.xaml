@@ -4,10 +4,10 @@
         Title="{Binding ProductName}"
         Width="520"
         Height="430"
-        MinWidth="520"
-        MinHeight="430"
+        MinWidth="360"
+        MinHeight="280"
         Background="#EDF4F2"
-        ResizeMode="NoResize"
+        ResizeMode="CanResize"
         ShowInTaskbar="False"
         WindowStartupLocation="CenterOwner">
     <Grid Margin="28">
@@ -17,15 +17,16 @@
                 CornerRadius="12">
             <Grid>
                 <Grid.RowDefinitions>
-                    <RowDefinition Height="112" />
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
 
                 <Border Background="#0F9D8A"
+                        MinHeight="112"
                         CornerRadius="11,11,0,0"
                         Padding="30,22">
                     <StackPanel VerticalAlignment="Center">
-                        <TextBlock Text="知道综合工具"
+                        <TextBlock Text="{Binding ProductName}"
                                    Foreground="White"
                                    FontSize="25"
                                    FontWeight="SemiBold" />
@@ -36,20 +37,24 @@
                     </StackPanel>
                 </Border>
 
-                <Grid Grid.Row="1" Margin="30,24,30,26">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
+                <ScrollViewer x:Name="ActivationScrollViewer"
+                              Grid.Row="1"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Auto">
+                    <Grid x:Name="ActivationBody" Margin="30,24,30,26">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
 
-                    <TextBlock Text="请输入卡密"
+                        <TextBlock Text="请输入卡密"
                                Foreground="#173B36"
                                FontSize="14"
                                FontWeight="SemiBold" />
-                    <TextBox Grid.Row="1"
+                        <TextBox Grid.Row="1"
                              Height="48"
                              Margin="0,8,0,0"
                              Padding="12,10"
@@ -59,13 +64,13 @@
                              FontSize="15"
                              Text="{Binding Card, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                              AutomationProperties.Name="卡密输入" />
-                    <TextBlock Grid.Row="2"
+                        <TextBlock Grid.Row="2"
                                Margin="0,8,0,0"
                                Foreground="#647773"
                                FontSize="12"
                                Text="卡密将绑定当前电脑，请确认后激活"
                                TextWrapping="Wrap" />
-                    <Border Grid.Row="3"
+                        <Border Grid.Row="3"
                             MinHeight="44"
                             Margin="0,15,0,16"
                             Padding="12,10"
@@ -79,22 +84,26 @@
                                    TextWrapping="Wrap"
                                    AutomationProperties.LiveSetting="Polite"
                                    AutomationProperties.Name="授权状态" />
-                    </Border>
-                    <StackPanel Grid.Row="4"
+                        </Border>
+                        <StackPanel Grid.Row="4"
                                 HorizontalAlignment="Right"
                                 Orientation="Horizontal">
-                        <Button Content="暂不激活"
-                                Width="104"
-                                Height="40"
+                        <Button x:Name="CancelButton"
+                                Content="暂不激活"
+                                MinWidth="104"
+                                MinHeight="40"
+                                Padding="14,8"
                                 Background="White"
                                 BorderBrush="#9CB9B3"
                                 Foreground="#365A53"
                                 Command="{Binding CloseCommand}"
                                 IsCancel="True"
                                 AutomationProperties.Name="暂不激活" />
-                        <Button Content="{Binding ActivateButtonText}"
-                                Width="112"
-                                Height="40"
+                        <Button x:Name="ActivateButton"
+                                Content="{Binding ActivateButtonText}"
+                                MinWidth="112"
+                                MinHeight="40"
+                                Padding="14,8"
                                 Margin="12,0,0,0"
                                 Background="#0F9D8A"
                                 BorderBrush="#0F9D8A"
@@ -102,9 +111,10 @@
                                 FontWeight="SemiBold"
                                 Command="{Binding ActivateCommand}"
                                 IsDefault="True"
-                                AutomationProperties.Name="立即激活" />
-                    </StackPanel>
-                </Grid>
+                                AutomationProperties.Name="{Binding ActivateButtonText}" />
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
             </Grid>
         </Border>
     </Grid>

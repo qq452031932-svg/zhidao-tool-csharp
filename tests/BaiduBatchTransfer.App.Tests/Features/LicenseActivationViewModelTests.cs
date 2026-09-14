@@ -84,6 +84,7 @@ public sealed class LicenseActivationViewModelTests
         await started.Task;
 
         Assert.Equal("正在激活…", viewModel.ActivateButtonText);
+        Assert.Equal("正在激活…", viewModel.StatusMessage);
         Assert.Contains(nameof(LicenseActivationViewModel.ActivateButtonText), changes);
 
         changes.Clear();

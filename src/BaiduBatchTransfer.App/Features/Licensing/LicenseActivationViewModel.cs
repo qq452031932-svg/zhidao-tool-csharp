@@ -97,6 +97,7 @@ public sealed class LicenseActivationViewModel : ObservableObject
     {
         if (IsActivating) return;
         IsActivating = true;
+        StatusMessage = "正在激活…";
         try
         {
             var normalizedCard = Card.Normalize(NormalizationForm.FormKC).Trim();
