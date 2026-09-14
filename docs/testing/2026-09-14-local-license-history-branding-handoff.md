@@ -12,6 +12,7 @@
 - 转存与分享运行日志支持纯内存清空。
 - 转存与独立分享结果支持删除本地终态历史；不影响百度网盘文件和远端分享。
 - 转存顶部“选择 Excel”旁新增紧凑的“清空”按钮（无障碍名称“清空当前导入”），可清除当前本地待处理导入并恢复空白工作区；不会删除已结束任务历史。
+- 当前导入清理与文件选择、分页、编辑、预检和任务创建共用活动门禁；数据库返回成功后即使调用方随后取消，也会在窗口仍有效且会话仍匹配时完成界面复位，避免数据库已清空但屏幕仍保留旧草稿。
 - 删除使用确认快照、事务内复检、活动租约/未决操作冲突保护、完整本地证据闭包、回滚和外键校验。
 - 清理后完整重置或重载界面；冲突会自动重查，迟到异步请求不会恢复已删除的旧结果。
 
@@ -21,7 +22,7 @@
 - GREEN：同一结构测试加入按钮后为 1 passed、0 failed；同时 `TopConfigurationToolbarStaysOnOneLineAtTypicalWorkspaceWidthOnSta` 与结构测试合跑为 2 passed、0 failed，836px 工作区中 7 项保持单行。
 - `dotnet test tests/BaiduBatchTransfer.Application.Tests/BaiduBatchTransfer.Application.Tests.csproj --no-restore --filter FullyQualifiedName~LocalImportDraftCleanupServiceTests`：13 passed、0 failed。
 - `dotnet test tests/BaiduBatchTransfer.Infrastructure.Tests/BaiduBatchTransfer.Infrastructure.Tests.csproj --no-restore --filter FullyQualifiedName~SqliteLocalImportDraftCleanupStoreTests`：12 passed、0 failed。
-- `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --no-restore --filter "FullyQualifiedName~ImportViewModelTests|FullyQualifiedName~CreateJobWizardViewModelTests|FullyQualifiedName~TransferWorkspaceViewModelTests|FullyQualifiedName~CurrentImportCleanupInteractionTests|FullyQualifiedName~TransferWorkspaceViewStructureTests|FullyQualifiedName~LocalHistoryCleanup"`：302 passed、0 failed。
+- `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --no-restore --filter "FullyQualifiedName~ImportViewModelTests|FullyQualifiedName~CreateJobWizardViewModelTests|FullyQualifiedName~TransferWorkspaceViewModelTests|FullyQualifiedName~CurrentImportCleanupInteractionTests|FullyQualifiedName~TransferWorkspaceViewStructureTests|FullyQualifiedName~LocalHistoryCleanup"`：303 passed、0 failed。
 - Updates 聚焦验证命令：`dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --no-restore --filter "FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.ApplicationBuildInfoTests|FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.ApplicationUpdateServiceTests|FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.VelopackUpdateRuntimeTests|FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.VelopackStartupStructureTests|FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.UpdateShutdownIntegrationTests|FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.SignedFeedUpdateSourceTests|FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.SignedFeedStateStoreTests|FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.SignedFeedManifestTests|FullyQualifiedName~BaiduBatchTransfer.App.Tests.Updates.OtaPublisherTrustTests"`。覆盖 9 个类，202 passed、2 skipped、0 failed（总计 204）；跳过项为需要证书存储环境的 `OtaPublisherTrustTests` 用例。
 - `dotnet build src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj --no-restore --configuration Debug`：成功，0 warnings、0 errors。
 - `git diff --check`：通过。
@@ -34,7 +35,7 @@
 - `ManagedBrowserHelperClientTests` 出现辅助进程启动超时。
 - `TransferCoordinatorHostedServiceTests`、`VisibleWebAutomationQueueTests` 和 `OtaDeploymentStructureTests` 出现既有断言失败。
 
-这些失败不位于本次改动文件；本轮 Task 4 指定的 App 回归筛选已单独完成 302 项全绿，但不据此宣称完整 App 测试套件通过。完整 Release 构建仍需要生产授权信任参数（包括 ServiceUrl），本次本地 UI 调整未提供或猜测该参数。
+这些失败不位于本次改动文件；本轮指定的 App 回归筛选已单独完成 303 项全绿，但不据此宣称完整 App 测试套件通过。完整 Release 构建仍需要生产授权信任参数（包括 ServiceUrl），本次本地 UI 调整未提供或猜测该参数。
 
 ## 本地验收入口
 
@@ -57,4 +58,5 @@ Debug 可执行文件：
 
 - 分支：`codex/license-production-deploy`
 - 工作树：`C:\Users\45203\Documents\dakazhandian\.worktrees\license-production-deploy`
+- 最终独立审阅：READY YES，无 Critical / Important / Minor 遗留。
 - 保留该工作树供用户本地验收；未合并、未推送、未部署。
