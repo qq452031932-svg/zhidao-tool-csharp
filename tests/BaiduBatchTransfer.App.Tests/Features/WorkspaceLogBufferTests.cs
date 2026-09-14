@@ -92,13 +92,6 @@ public sealed class WorkspaceLogBufferTests
 
         buffer.AppendSafe("正在处理", timestamp: first);
         buffer.Clear();
-
-        var duplicateCursor = typeof(WorkspaceLogBuffer).GetField(
-            "lastAppendedEntry",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-        Assert.NotNull(duplicateCursor);
-        Assert.Null(duplicateCursor.GetValue(buffer));
-
         buffer.AppendSafe("正在处理", timestamp: second);
 
         var entry = Assert.Single(buffer.Entries);

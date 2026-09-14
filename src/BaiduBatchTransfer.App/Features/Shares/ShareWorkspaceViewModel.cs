@@ -784,8 +784,9 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     {
         if (!CanClearLogs) return;
         logBuffer.Clear();
-        if (SetProperty(ref statusMessage, "运行日志已清空。", nameof(StatusMessage)))
-            OnPropertyChanged(nameof(UserFacingStatusMessage));
+        if (!SetProperty(ref statusMessage, "运行日志已清空。", nameof(StatusMessage)))
+            OnPropertyChanged(nameof(StatusMessage));
+        OnPropertyChanged(nameof(UserFacingStatusMessage));
     }
 
     private void OnLogsChanged(object? sender, NotifyCollectionChangedEventArgs e)

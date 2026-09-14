@@ -292,7 +292,10 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     }
     public bool CanStart =>
         !isClosed && !IsStarting && !Import.IsBusy && string.IsNullOrEmpty(EvaluateConfiguration());
-    public bool CanClearLogs => !isClosed && !IsStarting && !Import.IsBusy && Logs.Count > 0;
+    public bool CanClearLogs =>
+        !isClosed && !IsStarting && !Import.IsBusy &&
+        !RunPanel.IsBusy && !RunPanel.Results.IsBusy && !RunPanel.Results.IsSaving &&
+        Logs.Count > 0;
     public string ConfigurationMessage => EvaluateConfiguration();
     public IAsyncRelayCommand StartCommand { get; }
     public IRelayCommand ClearLogsCommand { get; }
@@ -681,8 +684,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     {
         if (!CanClearLogs) return;
         logBuffer.Clear();
-        if (SetProperty(ref statusMessage, "运行日志已清空。", nameof(StatusMessage)))
-            OnPropertyChanged(nameof(UserFacingStatusMessage));
+        if (!SetProperty(ref statusMessage, "运行日志已清空。", nameof(StatusMessage)))
+            OnPropertyChanged(nameof(StatusMessage));
+        OnPropertyChanged(nameof(UserFacingStatusMessage));
     }
 
     private string EvaluateConfiguration()
@@ -883,6 +887,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     }
 
     private void OnLogsChanged(object? sender, NotifyCollectionChangedEventArgs e)
+        => NotifyClearLogsState();
+
+    private void NotifyClearLogsState()
     {
         OnPropertyChanged(nameof(CanClearLogs));
         ClearLogsCommand.NotifyCanExecuteChanged();
@@ -939,6 +946,10 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private void OnStatusSourcePropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (isClosed) return;
+        if ((ReferenceEquals(sender, RunPanel) && e.PropertyName == nameof(WorkspaceRunPanelViewModel.IsBusy)) ||
+            (ReferenceEquals(sender, RunPanel.Results) &&
+             e.PropertyName is nameof(JobResultsViewModel.IsBusy) or nameof(JobResultsViewModel.IsSaving)))
+            NotifyClearLogsState();
         if (ReferenceEquals(sender, RunPanel.Results) &&
             e.PropertyName == nameof(JobResultsViewModel.BatchJobId) &&
             RunPanel.Results.BatchJobId != Guid.Empty)
@@ -1136,7 +1147,6 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(ConfigurationMessage));
         OnPropertyChanged(nameof(CanEditConfiguration));
         StartCommand.NotifyCanExecuteChanged();
-        OnPropertyChanged(nameof(CanClearLogs));
-        ClearLogsCommand.NotifyCanExecuteChanged();
+        NotifyClearLogsState();
     }
 }

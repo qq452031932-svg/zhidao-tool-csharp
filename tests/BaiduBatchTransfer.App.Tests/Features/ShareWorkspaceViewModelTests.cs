@@ -128,6 +128,22 @@ public sealed class ShareWorkspaceViewModelTests
     }
 
     [Fact]
+    public void RepeatedClearLogsNotifiesLiveStatusEvenWhenTextDoesNotChange()
+    {
+        using var vm = Fixture(activeAccount: AccountA);
+        vm.ClearLogsCommand.Execute(null);
+        GetLogBuffer(vm).AppendSafe("后续运行消息");
+        var changed = new List<string?>();
+        vm.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+
+        vm.ClearLogsCommand.Execute(null);
+
+        Assert.Contains(nameof(ShareWorkspaceViewModel.StatusMessage), changed);
+        Assert.Contains(nameof(ShareWorkspaceViewModel.UserFacingStatusMessage), changed);
+        Assert.Empty(vm.Logs);
+    }
+
+    [Fact]
     public void RuntimeLogHeaderPlacesAccessibleClearButtonBesideRecentLimit()
     {
         var path = Path.Combine(FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Shares", "ShareWorkspaceView.xaml");
@@ -1595,6 +1611,11 @@ public sealed class ShareWorkspaceViewModelTests
         var target = field?.GetValue(group) ?? group.Selections;
         ((IList)target).Add(selection);
     }
+
+    private static WorkspaceLogBuffer GetLogBuffer(ShareWorkspaceViewModel viewModel) =>
+        Assert.IsType<WorkspaceLogBuffer>(typeof(ShareWorkspaceViewModel)
+            .GetField("logBuffer", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(viewModel));
 
     private sealed class FakePicker(
         Func<Guid, CancellationToken, IReadOnlyList<OwnedRemoteSelection>> pick) : IRemoteResourcePicker

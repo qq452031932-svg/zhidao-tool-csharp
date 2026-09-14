@@ -846,6 +846,85 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task ClearLogsCommandTracksRunPanelLoading()
+    {
+        var history = new BlockingHistorySource();
+        using var fixture = Fixture.Valid(historySource: history);
+
+        var loading = fixture.RunPanel.InitializeAsync();
+        await history.Started.Task;
+
+        Assert.True(fixture.RunPanel.IsBusy);
+        Assert.False(fixture.ViewModel.CanClearLogs);
+        Assert.False(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+
+        history.Release();
+        await loading;
+
+        Assert.True(fixture.ViewModel.CanClearLogs);
+        Assert.True(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ClearLogsCommandTracksResultSaving()
+    {
+        var workflow = new EmptyResultsWorkflow { BlockExport = true };
+        using var fixture = Fixture.Valid(
+            resultsWorkflow: workflow,
+            resultsSaveDialog: new FixedResultSaveDialog(@"C:\results"));
+        await fixture.RunPanel.Results.InitializeAsync(Guid.NewGuid());
+
+        var saving = fixture.RunPanel.Results.SaveAsAsync();
+        await workflow.ExportStarted.Task;
+
+        Assert.True(fixture.RunPanel.Results.IsSaving);
+        Assert.False(fixture.ViewModel.CanClearLogs);
+        Assert.False(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+
+        workflow.ReleaseExport();
+        await saving;
+
+        Assert.True(fixture.ViewModel.CanClearLogs);
+        Assert.True(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ClearLogsCommandTracksResultLoading()
+    {
+        var workflow = new EmptyResultsWorkflow { BlockLoad = true };
+        using var fixture = Fixture.Valid(resultsWorkflow: workflow);
+
+        var loading = fixture.RunPanel.Results.InitializeAsync(Guid.NewGuid());
+        await workflow.LoadStarted.Task;
+
+        Assert.True(fixture.RunPanel.Results.IsBusy);
+        Assert.False(fixture.ViewModel.CanClearLogs);
+        Assert.False(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+
+        workflow.ReleaseLoad();
+        await loading;
+
+        Assert.True(fixture.ViewModel.CanClearLogs);
+        Assert.True(fixture.ViewModel.ClearLogsCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public void RepeatedClearLogsNotifiesLiveStatusEvenWhenTextDoesNotChange()
+    {
+        using var fixture = Fixture.Valid();
+        fixture.ViewModel.ClearLogsCommand.Execute(null);
+        GetLogBuffer(fixture.ViewModel).AppendSafe("后续运行消息");
+        var changed = new List<string?>();
+        fixture.ViewModel.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+
+        fixture.ViewModel.ClearLogsCommand.Execute(null);
+
+        Assert.Contains(nameof(TransferWorkspaceViewModel.StatusMessage), changed);
+        Assert.Contains(nameof(TransferWorkspaceViewModel.UserFacingStatusMessage), changed);
+        Assert.Empty(fixture.ViewModel.Logs);
+    }
+
+    [Fact]
     public void RuntimeLogTabHeaderPlacesAccessibleClearButtonBesideRecentLimit()
     {
         var path = Path.Combine(FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Transfers", "TransferWorkspaceView.xaml");
@@ -2824,6 +2903,11 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.DoesNotContain("helper", entry.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static WorkspaceLogBuffer GetLogBuffer(TransferWorkspaceViewModel viewModel) =>
+        Assert.IsType<WorkspaceLogBuffer>(typeof(TransferWorkspaceViewModel)
+            .GetField("logBuffer", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(viewModel));
+
     private static WizardAccountOption AccountOption(string name) => new(
         Guid.NewGuid(), name, "Active", true, false, 1_000, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -2847,6 +2931,7 @@ public sealed class TransferWorkspaceViewModelTests
             IWorkspaceBatchHistorySource? historySource,
             IAsyncDelay? refreshDelay,
             IJobResultsWorkflow? resultsWorkflow,
+            IResultSaveDialog? resultsSaveDialog,
             ITransferTargetDirectoryPicker? targetDirectoryPicker,
             ILicenseAuthorizationGate? licenseGate)
         {
@@ -2870,7 +2955,7 @@ public sealed class TransferWorkspaceViewModelTests
                 precheckWorkflow ?? new FakePrecheckWorkflow(Events, precheck ?? new(WizardPrecheckStatus.Completed, ready)),
                 new AvailableCapabilities());
             var results = new JobResultsViewModel(
-                resultsWorkflow ?? new EmptyResultsWorkflow(), new FakeResultSaveDialog(), new AvailableCapabilities());
+                resultsWorkflow ?? new EmptyResultsWorkflow(), resultsSaveDialog ?? new FakeResultSaveDialog(), new AvailableCapabilities());
             RunPanel = new WorkspaceRunPanelViewModel(
                 results,
                 new PauseBatchService(new FakeRunControlStore()),
@@ -2922,11 +3007,12 @@ public sealed class TransferWorkspaceViewModelTests
             IWorkspaceBatchHistorySource? historySource = null,
             IAsyncDelay? refreshDelay = null,
             IJobResultsWorkflow? resultsWorkflow = null,
+            IResultSaveDialog? resultsSaveDialog = null,
             ITransferTargetDirectoryPicker? targetDirectoryPicker = null,
             ILicenseAuthorizationGate? licenseGate = null) =>
             new(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff, adapterAvailability,
                 remoteWriteMode, managedAccount, acceptanceRunAsync, resultDirectoryPreparer, historySource,
-                refreshDelay, resultsWorkflow, targetDirectoryPicker, licenseGate);
+                refreshDelay, resultsWorkflow, resultsSaveDialog, targetDirectoryPicker, licenseGate);
 
         public static Fixture Valid(
             int accountCount = 1,
@@ -2940,6 +3026,9 @@ public sealed class TransferWorkspaceViewModelTests
             bool managedAccount = false,
             Func<Guid, CancellationToken, Task<ManagedTransferAcceptanceRunOutcome>>? acceptanceRunAsync = null,
             ILocalResultDirectoryPreparer? resultDirectoryPreparer = null,
+            IWorkspaceBatchHistorySource? historySource = null,
+            IJobResultsWorkflow? resultsWorkflow = null,
+            IResultSaveDialog? resultsSaveDialog = null,
             ITransferTargetDirectoryPicker? targetDirectoryPicker = null,
             ILicenseAuthorizationGate? licenseGate = null)
         {
@@ -2955,6 +3044,9 @@ public sealed class TransferWorkspaceViewModelTests
                 managedAccount,
                 acceptanceRunAsync,
                 resultDirectoryPreparer,
+                historySource,
+                resultsWorkflow: resultsWorkflow,
+                resultsSaveDialog: resultsSaveDialog,
                 targetDirectoryPicker: targetDirectoryPicker,
                 licenseGate: licenseGate);
             fixture.ApplyReadyDraft();
@@ -3374,6 +3466,12 @@ public sealed class TransferWorkspaceViewModelTests
         public Task<string?> PickDestinationDirectoryAsync(CancellationToken cancellationToken = default) => Task.FromResult<string?>(null);
     }
 
+    private sealed class FixedResultSaveDialog(string destination) : IResultSaveDialog
+    {
+        public Task<string?> PickDestinationDirectoryAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult<string?>(destination);
+    }
+
     private sealed class AvailableAdapter : IAdapterAvailability
     {
         public bool CanStartTransfers => true;
@@ -3390,19 +3488,59 @@ public sealed class TransferWorkspaceViewModelTests
 
     private sealed class EmptyResultsWorkflow : IJobResultsWorkflow
     {
+        private readonly TaskCompletionSource exportRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource loadRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public IReadOnlyList<JobResultRow> PageItems { get; set; } = [];
         public bool FailSummary { get; set; }
+        public bool BlockExport { get; set; }
+        public bool BlockLoad { get; set; }
+        public TaskCompletionSource ExportStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource LoadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public long TerminalProblemCount { get; set; } = 2;
-        public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
-            FailSummary ? Task.FromException<JobResultsSummary>(new IOException("private statistics details")) :
-                Task.FromResult(new JobResultsSummary(5, 5, 1, 0, 3, TerminalProblemCount));
-        public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) => Task.FromResult(new JobResultsPage(PageItems, PageItems.Count, null));
+        public async Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+        {
+            if (FailSummary) throw new IOException("private statistics details");
+            await WaitForLoadAsync(cancellationToken);
+            return new JobResultsSummary(5, 5, 1, 0, 3, TerminalProblemCount);
+        }
+        public async Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default)
+        {
+            await WaitForLoadAsync(cancellationToken);
+            return new JobResultsPage(PageItems, PageItems.Count, null);
+        }
         public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-        public Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public async Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default)
+        {
+            if (!BlockExport) throw new NotSupportedException();
+            ExportStarted.TrySetResult();
+            await exportRelease.Task.WaitAsync(cancellationToken);
+            return 0;
+        }
+        public void ReleaseExport() => exportRelease.TrySetResult();
+        public void ReleaseLoad() => loadRelease.TrySetResult();
+        private async Task WaitForLoadAsync(CancellationToken cancellationToken)
+        {
+            if (!BlockLoad) return;
+            LoadStarted.TrySetResult();
+            await loadRelease.Task.WaitAsync(cancellationToken);
+        }
+    }
+
+    private sealed class BlockingHistorySource : IWorkspaceBatchHistorySource
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public async Task<IReadOnlyList<WorkspaceBatchItem>> LoadRecentAsync(int limit, CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+            return [];
+        }
+        public void Release() => release.TrySetResult();
     }
 
     private sealed class FakeRunControlStore : IBatchRunControlStore
