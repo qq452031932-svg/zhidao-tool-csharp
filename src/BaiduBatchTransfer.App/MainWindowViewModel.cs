@@ -302,8 +302,8 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
     internal static string FormatApplicationTitle(bool isOtaAcceptanceBuild) =>
         isOtaAcceptanceBuild
-            ? "百度批量转存 · OTA 本地验收版"
-            : "百度批量转存";
+            ? "知道综合工具 · OTA 本地验收版"
+            : "知道综合工具";
 
     internal void ConfigureOtaAcceptanceBuild(bool enabled)
     {

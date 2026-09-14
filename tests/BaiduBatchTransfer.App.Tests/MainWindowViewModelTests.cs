@@ -555,7 +555,7 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("分享数据", vm.CurrentWorkspaceTitle);
         Assert.Same(linkMonitor, vm.CurrentContent);
         Assert.Same(transfer, vm.BatchTransferWorkspace);
-        Assert.Equal("百度批量转存", vm.ApplicationTitle);
+        Assert.Equal("知道综合工具", vm.ApplicationTitle);
         Assert.False(vm.OpenAccountLoginCommand.CanExecute(null));
         Assert.Contains("尚不可用", vm.AdapterStatusMessage);
         Assert.False(vm.OpenAccountManagementCommand.CanExecute(null));
@@ -585,10 +585,21 @@ public sealed class MainWindowViewModelTests
     [Fact]
     public void AcceptanceBuildAddsAnExplicitProductTitleMarker()
     {
-        Assert.Equal("百度批量转存", MainWindowViewModel.FormatApplicationTitle(false));
+        Assert.Equal("知道综合工具", MainWindowViewModel.FormatApplicationTitle(false));
         Assert.Equal(
-            "百度批量转存 · OTA 本地验收版",
+            "知道综合工具 · OTA 本地验收版",
             MainWindowViewModel.FormatApplicationTitle(true));
+    }
+
+    [Fact]
+    public void ShellUsesTheApprovedProductSubtitle()
+    {
+        var xaml = File.ReadAllText(MainWindowXamlPath());
+
+        Assert.Contains("Title=\"{Binding ApplicationTitle}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Text=\"百度网盘批量管理工作台\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Title=\"百度批量转存\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("百度网盘批量工作台", xaml, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -40,6 +40,23 @@ public sealed class AppBootstrapTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), "BaiduBatchTransfer-AppBootstrapTests", Guid.NewGuid().ToString("N"));
 
     [Fact]
+    public void BootstrapUsesTheApprovedUserFacingBrandAndDefaultExportName()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var bootstrap = File.ReadAllText(Path.Combine(
+            repositoryRoot, "src", "BaiduBatchTransfer.App", "AppBootstrap.cs"));
+        var app = File.ReadAllText(Path.Combine(
+            repositoryRoot, "src", "BaiduBatchTransfer.App", "App.xaml.cs"));
+
+        Assert.Contains("\"知道综合工具\"", bootstrap, StringComparison.Ordinal);
+        Assert.Contains("\"知道综合工具结果\"", bootstrap, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"百度批量转存\"", bootstrap, StringComparison.Ordinal);
+        Assert.DoesNotContain("百度批量转存结果", bootstrap, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"百度批量转存\"", app, StringComparison.Ordinal);
+        Assert.Contains("\"知道综合工具\"", app, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void LicenseGateAndRuntimeStateAreSingleSharedBootstrapServices()
     {
         using var host = AppBootstrap.CreateHost(root);
@@ -1130,7 +1147,8 @@ public sealed class AppBootstrapTests : IDisposable
             FindRepositoryRoot(),
             "src",
             "BaiduBatchTransfer.App",
-            "AppBootstrap.cs"));
+            "AppBootstrap.cs"))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
 
         Assert.Contains("var transferWorkspace = new TransferWorkspaceView(transferViewModel)", bootstrap);
         Assert.Contains("var shareWorkspace = new ShareWorkspaceView(shareViewModel)", bootstrap);

@@ -123,7 +123,7 @@ public static class AppBootstrap
             services.AddSingleton<LicenseActivationService>();
             services.AddSingleton<ILicenseActivationPresenter>(sp =>
                 new WpfLicenseActivationPresenter(
-                    "百度批量转存",
+                    "知道综合工具",
                     sp.GetRequiredService<LicenseActivationService>().ActivateAsync));
         }
         services.AddSingleton(buildInfo);
@@ -936,7 +936,7 @@ public sealed class AppShellFactory(
         var transferOptions = new TransferWorkspaceOptions(
             DefaultResultDirectory: Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                "百度批量转存结果"),
+                "知道综合工具结果"),
             DefaultTargetDirectory: "/",
             SimplifiedDirectMode: true,
             DefaultMaxConcurrency: 2).Validate();

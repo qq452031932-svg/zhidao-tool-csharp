@@ -66,6 +66,7 @@ public sealed class LicenseActivationViewModel : ObservableObject
     public IAsyncRelayCommand ActivateCommand { get; }
     public IRelayCommand CloseCommand { get; }
     public string ProductName { get; }
+    public string ActivateButtonText => IsActivating ? "正在激活…" : "立即激活";
 
     public string Card
     {
@@ -85,6 +86,7 @@ public sealed class LicenseActivationViewModel : ObservableObject
         private set
         {
             if (!SetProperty(ref isActivating, value)) return;
+            OnPropertyChanged(nameof(ActivateButtonText));
             ActivateCommand.NotifyCanExecuteChanged();
         }
     }

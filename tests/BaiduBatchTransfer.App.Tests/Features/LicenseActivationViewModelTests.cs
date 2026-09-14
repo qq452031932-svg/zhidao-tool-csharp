@@ -59,6 +59,41 @@ public sealed class LicenseActivationViewModelTests
         Assert.True(viewModel.ActivateCommand.CanExecute(null));
     }
 
+    [Fact]
+    public async Task ActivateButtonTextTracksActivationAndRaisesChangeNotifications()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completion = new TaskCompletionSource<LicenseActivationResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var viewModel = new LicenseActivationViewModel(
+            "知道综合工具",
+            (_, _) =>
+            {
+                started.TrySetResult();
+                return completion.Task;
+            })
+        {
+            Card = "CARD"
+        };
+        var changes = new List<string?>();
+        viewModel.PropertyChanged += (_, args) => changes.Add(args.PropertyName);
+
+        Assert.Equal("立即激活", viewModel.ActivateButtonText);
+
+        var activation = viewModel.ActivateCommand.ExecuteAsync(null);
+        await started.Task;
+
+        Assert.Equal("正在激活…", viewModel.ActivateButtonText);
+        Assert.Contains(nameof(LicenseActivationViewModel.ActivateButtonText), changes);
+
+        changes.Clear();
+        completion.SetResult(new LicenseActivationResult(false, "license_not_found"));
+        await activation;
+
+        Assert.Equal("立即激活", viewModel.ActivateButtonText);
+        Assert.Contains(nameof(LicenseActivationViewModel.ActivateButtonText), changes);
+    }
+
     [Theory]
     [InlineData("invalid_request", "卡密无效")]
     [InlineData("unsupported_protocol", "卡密无效")]

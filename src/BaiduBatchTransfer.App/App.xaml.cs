@@ -51,7 +51,7 @@ public partial class App : System.Windows.Application
                 .StartAsync(token => host.StartAsync(token)).ConfigureAwait(true);
             if (!startup.CoordinatorMayStart)
             {
-                MessageBox.Show(startup.StatusMessage, "百度批量转存", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(startup.StatusMessage, "知道综合工具", MessageBoxButton.OK, MessageBoxImage.Information);
                 Shutdown();
                 return;
             }
@@ -111,7 +111,7 @@ public partial class App : System.Windows.Application
             }
             MessageBox.Show(
                 "应用启动失败，本机数据没有被删除。请关闭后重试；如果问题持续，请导出诊断信息。",
-                "百度批量转存",
+                "知道综合工具",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
             Shutdown(-1);
@@ -149,7 +149,7 @@ public partial class App : System.Windows.Application
                 {
                     MessageBox.Show(
                         "账号查看偏好尚未保存，请稍候后重试关闭。",
-                        "百度批量转存",
+                        "知道综合工具",
                         MessageBoxButton.OK,
                         MessageBoxImage.Information);
                     return false;
@@ -163,7 +163,7 @@ public partial class App : System.Windows.Application
             {
                 MessageBox.Show(
                     "浏览器任务仍在安全关闭，请稍候再试。账号和任务记录仍受保护。",
-                    "百度批量转存",
+                    "知道综合工具",
                     MessageBoxButton.OK,
                     MessageBoxImage.Information);
                 return false;
@@ -176,7 +176,7 @@ public partial class App : System.Windows.Application
         {
             MessageBox.Show(
                 "应用尚未安全关闭，请稍后重试。账号和任务记录仍受保护。",
-                "百度批量转存",
+                "知道综合工具",
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);
             return false;
