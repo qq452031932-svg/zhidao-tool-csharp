@@ -27,6 +27,190 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class TransferWorkspaceViewModelTests
 {
     [Fact]
+    public async Task ClearCurrentImportSuccessResetsBothChildrenAndReportsExactStatus()
+    {
+        var store = new CurrentImportCleanupStore();
+        var interaction = new CurrentImportCleanupInteraction();
+        using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: interaction);
+        fixture.ApplyReadyDraft();
+        var session = Assert.IsType<Guid>(fixture.Import.SessionId);
+
+        Assert.True(fixture.ViewModel.CanClearCurrentImport);
+        await fixture.ViewModel.ClearCurrentImportAsync();
+
+        Assert.Equal([session], store.Sessions);
+        Assert.Equal([0L], interaction.RowCounts);
+        Assert.Null(fixture.Import.SessionId);
+        Assert.Null(fixture.Wizard.CurrentImportSessionId);
+        Assert.Equal(0, fixture.Wizard.ReadyResourceCount);
+        Assert.False(fixture.ViewModel.CanStart);
+        Assert.False(fixture.ViewModel.CanClearCurrentImport);
+        Assert.Equal("已清空当前导入，可重新选择 Excel", fixture.ViewModel.StatusMessage);
+        Assert.Equal([session], fixture.ImportWorkflow.DiscardedSessions);
+    }
+
+    [Fact]
+    public async Task DeclinedCleanupAndMissingDependenciesNeverDelete()
+    {
+        var store = new CurrentImportCleanupStore();
+        using var fixture = Fixture.Create(
+            importCleanupStore: store,
+            importCleanupInteraction: new CurrentImportCleanupInteraction { Confirmation = Task.FromResult(false) });
+        fixture.ApplyReadyDraft();
+        var session = fixture.Import.SessionId;
+
+        await fixture.ViewModel.ClearCurrentImportAsync();
+
+        Assert.Empty(store.Sessions);
+        Assert.Equal(session, fixture.Import.SessionId);
+        Assert.Empty(fixture.ImportWorkflow.DiscardedSessions);
+        using var refusingFallback = Fixture.Create();
+        refusingFallback.ApplyReadyDraft();
+        Assert.False(refusingFallback.ViewModel.CanClearCurrentImport);
+    }
+
+    [Theory]
+    [InlineData(LocalImportDraftCleanupDisposition.BatchConflict, "当前导入已关联转存任务，请等待任务结束后使用“清空转存历史”。")]
+    [InlineData(LocalImportDraftCleanupDisposition.LocalDependencyConflict, "另一个本地导入依赖当前数据，请先检查并保留相关导入。")]
+    public async Task ClearCurrentImportConflictPreservesStateAndUsesDistinctGuidance(
+        LocalImportDraftCleanupDisposition disposition,
+        string expectedStatus)
+    {
+        var store = new CurrentImportCleanupStore { Result = new(disposition, 0) };
+        using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: new CurrentImportCleanupInteraction());
+        fixture.ApplyReadyDraft();
+        var session = fixture.Import.SessionId;
+
+        await fixture.ViewModel.ClearCurrentImportAsync();
+
+        Assert.Equal(session, fixture.Import.SessionId);
+        Assert.Equal(session, fixture.Wizard.CurrentImportSessionId);
+        Assert.Empty(fixture.ImportWorkflow.DiscardedSessions);
+        Assert.Equal(expectedStatus, fixture.ViewModel.StatusMessage);
+        if (disposition == LocalImportDraftCleanupDisposition.LocalDependencyConflict)
+            Assert.DoesNotContain("清空转存历史", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CleanupFenceRefusesCompetingChildAndStartOperationsWhileStoreIsBlocked()
+    {
+        var store = new CurrentImportCleanupStore { Block = true };
+        using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: new CurrentImportCleanupInteraction());
+        fixture.ApplyReadyDraft();
+        fixture.Wizard.UseBulkPrecheck = true;
+        var cleanup = fixture.ViewModel.ClearCurrentImportAsync();
+        await store.Started.Task;
+        var step = fixture.Wizard.CurrentStepIndex;
+        var pageCalls = fixture.PageSource.LoadCalls;
+        var previewCalls = fixture.BatchService.PreviewCalls;
+
+        await fixture.Import.LoadFirstPageAsync();
+        await fixture.Import.SetExcludedAsync(Guid.NewGuid(), true);
+        await fixture.Wizard.RunPrecheckAsync();
+        fixture.Wizard.NextStepCommand.Execute(null);
+        await fixture.Wizard.PrepareConfirmationAsync();
+        await fixture.Wizard.CreateJobAsync();
+        await fixture.ViewModel.StartAsync();
+
+        Assert.False(fixture.Import.CanEdit);
+        Assert.False(fixture.Wizard.CanEdit);
+        Assert.False(fixture.ViewModel.CanStart);
+        Assert.Equal(pageCalls, fixture.PageSource.LoadCalls);
+        Assert.Equal(previewCalls, fixture.BatchService.PreviewCalls);
+        Assert.Equal(step, fixture.Wizard.CurrentStepIndex);
+        store.Release();
+        await cleanup;
+        Assert.True(fixture.Import.CanEdit);
+        Assert.True(fixture.Wizard.CanEdit);
+    }
+
+    [Fact]
+    public async Task OperationStartedDuringDelayedConfirmationRefusesCleanupAndPreservesReplay()
+    {
+        var confirm = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = new CurrentImportCleanupStore();
+        var interaction = new CurrentImportCleanupInteraction { Confirmation = confirm.Task };
+        using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: interaction);
+        fixture.ApplyReadyDraft();
+        var session = fixture.Import.SessionId;
+        fixture.ImportWorkflow.BlockExclusions = true;
+        var cleanup = fixture.ViewModel.ClearCurrentImportAsync();
+        await interaction.Started.Task;
+        var competing = fixture.Import.SetExcludedAsync(Guid.NewGuid(), true);
+        await fixture.ImportWorkflow.ExclusionStarted.Task;
+        confirm.SetResult(true);
+        await cleanup;
+
+        Assert.Empty(store.Sessions);
+        Assert.Equal(session, fixture.Import.SessionId);
+        Assert.Equal("当前正在处理其他操作，请稍后重试", fixture.ViewModel.StatusMessage);
+        Assert.Empty(fixture.ImportWorkflow.DiscardedSessions);
+        fixture.ImportWorkflow.ReleaseExclusion();
+        await competing;
+    }
+
+    [Fact]
+    public async Task PageLoadStartedDuringDelayedConfirmationRefusesCleanup()
+    {
+        var confirm = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = new CurrentImportCleanupStore();
+        var interaction = new CurrentImportCleanupInteraction { Confirmation = confirm.Task };
+        using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: interaction);
+        fixture.ApplyReadyDraft();
+        fixture.PageSource.Block = true;
+        var cleanup = fixture.ViewModel.ClearCurrentImportAsync();
+        await interaction.Started.Task;
+        var page = fixture.Import.LoadFirstPageAsync();
+        await fixture.PageSource.Started.Task;
+        confirm.SetResult(true);
+        await cleanup;
+
+        Assert.Empty(store.Sessions);
+        Assert.Equal("当前正在处理其他操作，请稍后重试", fixture.ViewModel.StatusMessage);
+        fixture.PageSource.Release();
+        await page;
+    }
+
+    [Fact]
+    public async Task ServiceFailureAndCancellationPreserveStateAndReleaseFences()
+    {
+        foreach (var failure in new Exception[] { new IOException("private path"), new OperationCanceledException() })
+        {
+            var store = new CurrentImportCleanupStore { Exception = failure };
+            using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: new CurrentImportCleanupInteraction());
+            fixture.ApplyReadyDraft();
+            var session = fixture.Import.SessionId;
+
+            await fixture.ViewModel.ClearCurrentImportAsync();
+
+            Assert.Equal(session, fixture.Import.SessionId);
+            Assert.Empty(fixture.ImportWorkflow.DiscardedSessions);
+            Assert.True(fixture.Import.CanEdit);
+            Assert.True(fixture.Wizard.CanEdit);
+            Assert.DoesNotContain("private", fixture.ViewModel.StatusMessage, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
+    public async Task CleanupCompletionNeverResetsANewerImportedSession()
+    {
+        var store = new CurrentImportCleanupStore { Block = true };
+        using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: new CurrentImportCleanupInteraction());
+        fixture.ApplyReadyDraft();
+        var cleanup = fixture.ViewModel.ClearCurrentImportAsync();
+        await store.Started.Task;
+        fixture.ApplyDraft(new(7, 7, 0, 0, 0));
+        var newerSession = Assert.IsType<Guid>(fixture.Import.SessionId);
+        store.Release();
+
+        await cleanup;
+
+        Assert.Equal(newerSession, fixture.Import.SessionId);
+        Assert.Equal(newerSession, fixture.Wizard.CurrentImportSessionId);
+        Assert.Equal(7, fixture.Wizard.ReadyResourceCount);
+        Assert.Empty(fixture.ImportWorkflow.DiscardedSessions);
+    }
+    [Fact]
     public async Task AutomaticResultPollingDoesNotRescanHistoryButManualRefreshDoes()
     {
         using var fixture = Fixture.Create(historyCleanupStore: new CleanupStore(), cleanupInteraction: new CleanupInteraction());
@@ -3012,7 +3196,9 @@ public sealed class TransferWorkspaceViewModelTests
             ITransferTargetDirectoryPicker? targetDirectoryPicker,
             ILicenseAuthorizationGate? licenseGate,
             ILocalTerminalHistoryStore? historyCleanupStore,
-            ILocalHistoryCleanupInteraction? cleanupInteraction)
+            ILocalHistoryCleanupInteraction? cleanupInteraction,
+            ILocalImportDraftCleanupStore? importCleanupStore,
+            ICurrentImportCleanupInteraction? importCleanupInteraction)
         {
             Ready = ready;
             Events = [];
@@ -3054,7 +3240,8 @@ public sealed class TransferWorkspaceViewModelTests
                 availability, options, remoteWriteMode, acceptanceRunAsync,
                 resultDirectoryPreparer ?? new RecordingResultDirectoryPreparer(),
                 targetDirectoryPicker, Dialog, licenseGate,
-                historyCleanupStore is null ? null : new LocalTerminalHistoryService(historyCleanupStore), cleanupInteraction);
+                historyCleanupStore is null ? null : new LocalTerminalHistoryService(historyCleanupStore), cleanupInteraction,
+                importCleanupStore is null ? null : new LocalImportDraftCleanupService(importCleanupStore), importCleanupInteraction);
         }
 
         public int Ready { get; }
@@ -3091,11 +3278,13 @@ public sealed class TransferWorkspaceViewModelTests
             ITransferTargetDirectoryPicker? targetDirectoryPicker = null,
             ILicenseAuthorizationGate? licenseGate = null,
             ILocalTerminalHistoryStore? historyCleanupStore = null,
-            ILocalHistoryCleanupInteraction? cleanupInteraction = null) =>
+            ILocalHistoryCleanupInteraction? cleanupInteraction = null,
+            ILocalImportDraftCleanupStore? importCleanupStore = null,
+            ICurrentImportCleanupInteraction? importCleanupInteraction = null) =>
             new(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff, adapterAvailability,
                 remoteWriteMode, managedAccount, acceptanceRunAsync, resultDirectoryPreparer, historySource,
                 refreshDelay, resultsWorkflow, resultsSaveDialog, targetDirectoryPicker, licenseGate,
-                historyCleanupStore, cleanupInteraction);
+                historyCleanupStore, cleanupInteraction, importCleanupStore, importCleanupInteraction);
 
         public static Fixture Valid(
             int accountCount = 1,
@@ -3205,11 +3394,13 @@ public sealed class TransferWorkspaceViewModelTests
         public ImportWorkflowResult? NextMutation { get; set; }
         public Exception? UpdateLinkException { get; set; }
         public bool BlockExclusions { get; set; }
+        public List<Guid> DiscardedSessions { get; } = [];
         public TaskCompletionSource ExclusionStarted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public void DiscardReplaySource(Guid sessionId) => DiscardedSessions.Add(sessionId);
         public async Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken)
         {
             if (BlockExclusions)
@@ -3234,14 +3425,57 @@ public sealed class TransferWorkspaceViewModelTests
         }
     }
 
+    private sealed class CurrentImportCleanupStore : ILocalImportDraftCleanupStore
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<Guid> Sessions { get; } = [];
+        public LocalImportDraftCleanupResult Result { get; set; } =
+            new(LocalImportDraftCleanupDisposition.Deleted, 4);
+        public Exception? Exception { get; set; }
+        public bool Block { get; set; }
+
+        public async Task<LocalImportDraftCleanupResult> DeleteAsync(
+            Guid importSessionId,
+            CancellationToken cancellationToken = default)
+        {
+            Sessions.Add(importSessionId);
+            Started.TrySetResult();
+            if (Block) await release.Task.WaitAsync(cancellationToken);
+            if (Exception is not null) throw Exception;
+            return Result;
+        }
+
+        public void Release() => release.TrySetResult();
+    }
+
+    private sealed class CurrentImportCleanupInteraction : ICurrentImportCleanupInteraction
+    {
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<long> RowCounts { get; } = [];
+        public Task<bool>? Confirmation { get; set; }
+        public Task<bool> ConfirmAsync(long currentRowCount, CancellationToken cancellationToken = default)
+        {
+            RowCounts.Add(currentRowCount);
+            Started.TrySetResult();
+            return Confirmation ?? Task.FromResult(true);
+        }
+    }
+
     private sealed class FakePageSource : IImportPreviewPageSource
     {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int LoadCalls { get; private set; }
-        public Task<ImportPreviewPage> LoadAsync(ImportPreviewPageRequest request, CancellationToken cancellationToken)
+        public bool Block { get; set; }
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public async Task<ImportPreviewPage> LoadAsync(ImportPreviewPageRequest request, CancellationToken cancellationToken)
         {
             LoadCalls++;
-            return Task.FromResult(new ImportPreviewPage([], 0, null));
+            Started.TrySetResult();
+            if (Block) await release.Task.WaitAsync(cancellationToken);
+            return new ImportPreviewPage([], 0, null);
         }
+        public void Release() => release.TrySetResult();
     }
 
     private sealed class FakeBatchService(List<string> events) : IWizardBatchService

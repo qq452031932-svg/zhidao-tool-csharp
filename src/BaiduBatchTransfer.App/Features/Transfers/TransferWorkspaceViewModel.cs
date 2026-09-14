@@ -5,6 +5,7 @@ using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
@@ -49,6 +50,10 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private int expectedOperationsPerResource;
     private bool createdBatchIsTerminal;
     private readonly LocalHistoryCleanupViewModel historyCleanup;
+    private readonly LocalImportDraftCleanupService? importDraftCleanupService;
+    private readonly ICurrentImportCleanupInteraction currentImportCleanupInteraction;
+    private readonly object currentImportCleanupSync = new();
+    private bool currentImportCleanupBusy;
 
     public TransferWorkspaceViewModel(
         ImportViewModel import,
@@ -66,7 +71,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         IDialogService? dialogService = null,
         ILicenseAuthorizationGate? licenseGate = null,
         LocalTerminalHistoryService? historyCleanupService = null,
-        ILocalHistoryCleanupInteraction? historyCleanupInteraction = null)
+        ILocalHistoryCleanupInteraction? historyCleanupInteraction = null,
+        LocalImportDraftCleanupService? importDraftCleanupService = null,
+        ICurrentImportCleanupInteraction? currentImportCleanupInteraction = null)
     {
         Import = import ?? throw new ArgumentNullException(nameof(import));
         Wizard = wizard ?? throw new ArgumentNullException(nameof(wizard));
@@ -82,6 +89,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         this.remoteWriteMode = remoteWriteMode;
         this.acceptanceRunAsync = acceptanceRunAsync;
         this.licenseGate = licenseGate;
+        this.importDraftCleanupService = importDraftCleanupService;
+        this.currentImportCleanupInteraction = currentImportCleanupInteraction ?? RefusingCurrentImportCleanupInteraction.Instance;
         historyCleanup = new(historyCleanupService, historyCleanupInteraction, LocalHistoryKind.Transfer,
             () => !isClosed && !IsStarting && !Import.IsBusy && !Wizard.IsBusy &&
                 !RunPanel.IsClosed && !RunPanel.IsBusy && !RunPanel.Results.IsBusy && !RunPanel.Results.IsSaving,
@@ -103,6 +112,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         PickTargetDirectoryCommand = new AsyncRelayCommand(
             PickTargetDirectoryAsync,
             () => CanEditConfiguration);
+        ClearCurrentImportCommand = new AsyncRelayCommand(ClearCurrentImportAsync, () => CanClearCurrentImport);
         Import.DraftReady += OnDraftReady;
         Import.PropertyChanged += OnComposedPropertyChanged;
         Import.PropertyChanged += OnStatusSourcePropertyChanged;
@@ -148,7 +158,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             IDialogService? dialogService = null,
             ILicenseAuthorizationGate? licenseGate = null,
             LocalTerminalHistoryService? historyCleanupService = null,
-            ILocalHistoryCleanupInteraction? historyCleanupInteraction = null)
+            ILocalHistoryCleanupInteraction? historyCleanupInteraction = null,
+            LocalImportDraftCleanupService? importDraftCleanupService = null,
+            ICurrentImportCleanupInteraction? currentImportCleanupInteraction = null)
         : this(
             import,
             wizard,
@@ -169,7 +181,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             dialogService,
             licenseGate,
             historyCleanupService,
-            historyCleanupInteraction)
+            historyCleanupInteraction,
+            importDraftCleanupService,
+            currentImportCleanupInteraction)
     {
     }
 
@@ -294,7 +308,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
     public bool IsClosed => isClosed;
-    public bool CanEditConfiguration => !isClosed && !IsStarting && !historyCleanup.IsBusy;
+    public bool CanEditConfiguration => !isClosed && !IsStarting && !historyCleanup.IsBusy && !currentImportCleanupBusy;
     public Guid? CreatedBatchJobId => createdBatchJobId;
     public int SelectedDataTabIndex
     {
@@ -306,7 +320,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
     public bool CanStart =>
-        !isClosed && !IsStarting && !historyCleanup.IsBusy && !Import.IsBusy && string.IsNullOrEmpty(EvaluateConfiguration());
+        !isClosed && !IsStarting && !historyCleanup.IsBusy && !currentImportCleanupBusy &&
+        !Import.IsBusy && string.IsNullOrEmpty(EvaluateConfiguration());
     public bool CanClearLogs =>
         !isClosed && !IsStarting && !Import.IsBusy &&
         !RunPanel.IsBusy && !RunPanel.Results.IsBusy && !RunPanel.Results.IsSaving &&
@@ -319,11 +334,125 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand SelectDistributionCommand { get; }
     public IAsyncRelayCommand PickShareResultDirectoryCommand { get; }
     public IAsyncRelayCommand PickTargetDirectoryCommand { get; }
+    public IAsyncRelayCommand ClearCurrentImportCommand { get; }
     public LocalHistoryCleanupPreview? TransferHistoryPreview => historyCleanup.Preview;
     public bool CanClearTransferHistory => historyCleanup.CanClear;
     public IAsyncRelayCommand ClearTransferHistoryCommand => historyCleanup.ClearCommand;
     public Task ClearTransferHistoryAsync(CancellationToken cancellationToken = default) => historyCleanup.ClearAsync(cancellationToken);
     public Task RefreshHistoryPreviewAsync(CancellationToken cancellationToken = default) => historyCleanup.RefreshPreviewAsync(cancellationToken);
+    public bool CanClearCurrentImport =>
+        importDraftCleanupService is not null && Import.SessionId is { } session &&
+        Wizard.CurrentImportSessionId == session && !currentImportCleanupBusy &&
+        !isClosed && !IsStarting && !historyCleanup.IsBusy && Import.CanEdit && Wizard.CanEdit;
+
+    public async Task ClearCurrentImportAsync(CancellationToken cancellationToken = default)
+    {
+        if (!CanClearCurrentImport || Import.SessionId is not { } capturedSession) return;
+        var capturedRowCount = Import.TotalRows;
+        try
+        {
+            var confirmed = await currentImportCleanupInteraction
+                .ConfirmAsync(capturedRowCount, cancellationToken)
+                .ConfigureAwait(true);
+            if (!confirmed)
+            {
+                if (!isClosed) StatusMessage = "已取消清空当前导入。";
+                return;
+            }
+            if (!TryAcquireCurrentImportCleanup(capturedSession))
+            {
+                if (!isClosed) StatusMessage = "当前正在处理其他操作，请稍后重试";
+                return;
+            }
+            try
+            {
+                var result = await importDraftCleanupService!
+                    .DeleteAsync(capturedSession, cancellationToken)
+                    .ConfigureAwait(true);
+                if (result.Disposition is LocalImportDraftCleanupDisposition.Deleted or
+                    LocalImportDraftCleanupDisposition.AlreadyAbsent)
+                {
+                    if (Import.SessionId != capturedSession || Wizard.CurrentImportSessionId != capturedSession)
+                    {
+                        if (!isClosed) StatusMessage = "当前导入已变化，新的导入未受影响。";
+                        return;
+                    }
+                    if (!Import.TryResetAfterSuccessfulCleanup(capturedSession) ||
+                        !Wizard.TryDetachAfterSuccessfulCleanup(capturedSession))
+                    {
+                        if (!isClosed) StatusMessage = "当前导入已变化，新的导入未受影响。";
+                        return;
+                    }
+                    createdBatchJobId = null;
+                    createdBatchIsTerminal = false;
+                    batchPendingRowIds.Clear();
+                    expectedOperationsPerResource = 0;
+                    simplifiedSelectedAccountId = null;
+                    simplifiedSelectedAccountIds.Clear();
+                    OnPropertyChanged(nameof(CreatedBatchJobId));
+                    if (!isClosed) StatusMessage = "已清空当前导入，可重新选择 Excel";
+                    RaiseStartState();
+                    return;
+                }
+                StatusMessage = result.Disposition switch
+                {
+                    LocalImportDraftCleanupDisposition.BatchConflict =>
+                        "当前导入已关联转存任务，请等待任务结束后使用“清空转存历史”。",
+                    LocalImportDraftCleanupDisposition.LocalDependencyConflict =>
+                        "另一个本地导入依赖当前数据，请先检查并保留相关导入。",
+                    _ => "无法清空当前导入，请稍后重试。",
+                };
+            }
+            finally
+            {
+                ReleaseCurrentImportCleanup();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            if (!isClosed) StatusMessage = "清空当前导入已取消。";
+        }
+        catch
+        {
+            if (!isClosed) StatusMessage = "无法清空当前导入，请稍后重试。";
+        }
+    }
+
+    private bool TryAcquireCurrentImportCleanup(Guid capturedSession)
+    {
+        lock (currentImportCleanupSync)
+        {
+            if (currentImportCleanupBusy || isClosed || IsStarting || historyCleanup.IsBusy ||
+                Import.SessionId != capturedSession || Wizard.CurrentImportSessionId != capturedSession ||
+                Import.IsBusy || Wizard.IsBusy || !Import.CanEdit || !Wizard.CanEdit)
+                return false;
+            currentImportCleanupBusy = true;
+            Import.SetExternalCleanupBusy(true);
+            Wizard.SetExternalCleanupBusy(true);
+        }
+        NotifyCurrentImportCleanupState();
+        return true;
+    }
+
+    private void ReleaseCurrentImportCleanup()
+    {
+        lock (currentImportCleanupSync)
+        {
+            if (!currentImportCleanupBusy) return;
+            currentImportCleanupBusy = false;
+            Import.SetExternalCleanupBusy(false);
+            Wizard.SetExternalCleanupBusy(false);
+        }
+        NotifyCurrentImportCleanupState();
+    }
+
+    private void NotifyCurrentImportCleanupState()
+    {
+        OnPropertyChanged(nameof(CanClearCurrentImport));
+        OnPropertyChanged(nameof(CanEditConfiguration));
+        ClearCurrentImportCommand.NotifyCanExecuteChanged();
+        RaiseStartState();
+    }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
@@ -537,7 +666,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (isClosed || IsStarting || createdBatchJobId is not null || Import.IsBusy) return;
+        if (isClosed || IsStarting || currentImportCleanupBusy || createdBatchJobId is not null || Import.IsBusy) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         IsStarting = true;
         StatusMessage = "正在准备转存任务……";
@@ -1203,7 +1332,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CanStart));
         OnPropertyChanged(nameof(ConfigurationMessage));
         OnPropertyChanged(nameof(CanEditConfiguration));
+        OnPropertyChanged(nameof(CanClearCurrentImport));
         StartCommand.NotifyCanExecuteChanged();
+        ClearCurrentImportCommand.NotifyCanExecuteChanged();
         NotifyClearLogsState();
     }
 }

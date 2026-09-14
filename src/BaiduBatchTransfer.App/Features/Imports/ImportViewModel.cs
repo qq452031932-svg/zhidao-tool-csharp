@@ -113,6 +113,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     private long pageGeneration;
     private long mutationGeneration;
     private int mutationRequests;
+    private int pageRequests;
+    private bool externalCleanupBusy;
 
     public ImportViewModel(
         IImportWorkflow workflow,
@@ -127,12 +129,12 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         Rows = new();
         ImportTextCommand = new AsyncRelayCommand(ImportTextAsync, () => CanImportText);
         SelectAndImportExcelCommand = new AsyncRelayCommand(SelectAndImportExcelAsync, () => CanImport);
-        ResumeImportCommand = new AsyncRelayCommand(ResumeImportAsync, () => !isClosed && CanResumeImport && !IsBusy);
+        ResumeImportCommand = new AsyncRelayCommand(ResumeImportAsync, () => CanEdit && CanResumeImport);
         CancelCommand = new RelayCommand(Cancel, () => IsBusy);
-        LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => !isClosed && sessionId is not null && !IsBusy);
-        LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => !isClosed && nextCursor is not null && !IsBusy);
-        SaveSelectedRowCommand = new AsyncRelayCommand(SaveSelectedRowAsync, () => !isClosed && SelectedRow is not null && !IsBusy);
-        ToggleSelectedExclusionCommand = new AsyncRelayCommand(ToggleSelectedExclusionAsync, () => !isClosed && SelectedRow is not null && !IsBusy);
+        LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => CanEdit && sessionId is not null);
+        LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => CanEdit && nextCursor is not null);
+        SaveSelectedRowCommand = new AsyncRelayCommand(SaveSelectedRowAsync, () => CanEdit && SelectedRow is not null);
+        ToggleSelectedExclusionCommand = new AsyncRelayCommand(ToggleSelectedExclusionAsync, () => CanEdit && SelectedRow is not null);
     }
 
     public ObservableCollection<ImportPreviewRow> Rows { get; }
@@ -150,9 +152,9 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
     public string StatisticsText { get => statisticsText; private set => SetProperty(ref statisticsText, value); }
     public bool IsBusy { get => isBusy; private set { if (SetProperty(ref isBusy, value)) { OnPropertyChanged(nameof(CanEdit)); RaiseCommands(); } } }
-    public bool CanEdit => !isClosed && !IsBusy;
+    public bool CanEdit => !isClosed && !IsBusy && !externalCleanupBusy && Volatile.Read(ref pageRequests) == 0;
     public bool CanResumeImport { get => canResumeImport; private set { if (SetProperty(ref canResumeImport, value)) RaiseCommands(); } }
-    public bool CanImport => !isClosed && workflow.IsAvailable && !IsBusy;
+    public bool CanImport => CanEdit && workflow.IsAvailable;
     public bool CanImportText => CanImport && !string.IsNullOrWhiteSpace(TextContent);
     public string AdapterStatusMessage => !workflow.IsAvailable
         ? workflow.StatusMessage
@@ -190,6 +192,37 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         RaiseCommands();
     }
 
+    internal void SetExternalCleanupBusy(bool value)
+    {
+        if (externalCleanupBusy == value) return;
+        externalCleanupBusy = value;
+        OnPropertyChanged(nameof(CanEdit));
+        RaiseCommands();
+    }
+
+    public bool TryResetAfterSuccessfulCleanup(Guid expectedSessionId)
+    {
+        if (expectedSessionId == Guid.Empty || sessionId != expectedSessionId) return false;
+        pageGeneration++;
+        Interlocked.Increment(ref mutationGeneration);
+        Rows.Clear();
+        SelectedRow = null;
+        SelectedShareUrl = string.Empty;
+        SelectedExtractionCode = string.Empty;
+        selectedRowIsExcluded = false;
+        nextCursor = null;
+        TotalRows = 0;
+        StatisticsText = "尚未导入数据";
+        CanResumeImport = false;
+        durableSessionObserved = false;
+        sessionId = null;
+        workflow.DiscardReplaySource(expectedSessionId);
+        OnPropertyChanged(nameof(SessionId));
+        OnPropertyChanged(nameof(SelectedExclusionActionText));
+        RaiseCommands();
+        return true;
+    }
+
     public void ApplyStatistics(ImportDraftStatistics statistics)
     {
         StatisticsText = $"总计 {statistics.Total:N0} · 就绪 {statistics.Ready:N0} · 重复 {statistics.Duplicate:N0} · 异常 {statistics.Invalid:N0} · 已排除 {statistics.Excluded:N0} · 冲突 {statistics.Conflict:N0} · 待解析 {statistics.NeedsResolution:N0}";
@@ -209,7 +242,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
 
     public async Task ImportTextAsync(CancellationToken cancellationToken = default)
     {
-        if (isClosed || IsBusy) return;
+        if (!CanEdit) return;
         var newSessionId = Guid.NewGuid();
         BeginNewImport();
         await RunImportAsync(
@@ -221,7 +254,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
 
     public async Task ImportExcelAsync(string filePath, CancellationToken cancellationToken = default)
     {
-        if (isClosed || string.IsNullOrWhiteSpace(filePath) || IsBusy) return;
+        if (!CanEdit || string.IsNullOrWhiteSpace(filePath)) return;
         var newSessionId = Guid.NewGuid();
         BeginNewImport();
         await RunImportAsync(
@@ -233,7 +266,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
 
     public async Task SelectAndImportExcelAsync(CancellationToken cancellationToken = default)
     {
-        if (isClosed) return;
+        if (!CanEdit) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         StatusMessage = "请选择 Excel 文件";
         var path = await dialogService.PickExcelFileAsync(linked.Token);
@@ -250,7 +283,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
 
     public async Task ResumeImportAsync(CancellationToken cancellationToken = default)
     {
-        if (isClosed || sessionId is null || IsBusy) return;
+        if (!CanEdit || sessionId is null) return;
         await RunImportAsync(
             sessionId.Value,
             isResume: true,
@@ -260,13 +293,14 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
 
     public async Task LoadFirstPageAsync(CancellationToken cancellationToken = default)
     {
+        if (!CanEdit) return;
         nextCursor = null;
         await LoadPageAsync(null, cancellationToken);
     }
 
     public async Task LoadNextPageAsync(CancellationToken cancellationToken = default)
     {
-        if (nextCursor is null) return;
+        if (!CanEdit || nextCursor is null) return;
         await LoadPageAsync(nextCursor, cancellationToken);
     }
 
@@ -290,7 +324,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
 
     public async Task<bool> SaveCurrentRowEditAsync(CancellationToken cancellationToken = default)
     {
-        if (isClosed) return false;
+        if (isClosed || externalCleanupBusy) return false;
         if (SelectedRow is not { } selectedRow) return true;
         var shareUrl = SelectedShareUrl;
         var extractionCode = NormalizeSubmittedExtractionCode(SelectedExtractionCode);
@@ -341,7 +375,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         string failureMessage,
         CancellationToken cancellationToken)
     {
-        if (isClosed) return false;
+        if (isClosed || externalCleanupBusy) return false;
         var generation = Interlocked.Increment(ref mutationGeneration);
         if (Interlocked.Increment(ref mutationRequests) == 1) IsBusy = true;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
@@ -447,6 +481,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         long? expectedMutationGeneration = null)
     {
         if (isClosed || sessionId is null) return;
+        BeginPageRequest();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         var expectedSession = sessionId.Value;
         var generation = pageGeneration;
@@ -473,6 +508,21 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
         catch (Exception) { if (!isClosed) StatusMessage = "无法加载导入记录，请稍后重试。"; }
+        finally { EndPageRequest(); }
+    }
+
+    private void BeginPageRequest()
+    {
+        if (Interlocked.Increment(ref pageRequests) != 1) return;
+        OnPropertyChanged(nameof(CanEdit));
+        RaiseCommands();
+    }
+
+    private void EndPageRequest()
+    {
+        if (Interlocked.Decrement(ref pageRequests) != 0 || isClosed) return;
+        OnPropertyChanged(nameof(CanEdit));
+        RaiseCommands();
     }
 
     private void Cancel() => operationCancellation?.Cancel();

@@ -72,6 +72,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private int maxConcurrency = 2;
     private string resultDirectory = string.Empty;
     private string existingSharePolicy = "Ask";
+    private bool externalCleanupBusy;
 
     public event EventHandler<Guid>? JobCreated;
 
@@ -105,31 +106,31 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             new(WizardStepKind.Confirmation, "转存确认"),
         ]);
         PreviewRows = new();
-        PrepareConfirmationCommand = new AsyncRelayCommand(PrepareConfirmationAsync, () => !IsBusy);
-        CreateJobCommand = new AsyncRelayCommand(CreateJobAsync, () => CanCreateJob && !IsBusy);
-        LoadFirstPreviewPageCommand = new AsyncRelayCommand(LoadFirstPreviewPageAsync, () => !IsBusy);
-        LoadNextPreviewPageCommand = new AsyncRelayCommand(LoadNextPreviewPageAsync, () => nextPreviewCursor is not null && !IsBusy);
+        PrepareConfirmationCommand = new AsyncRelayCommand(PrepareConfirmationAsync, () => CanEdit);
+        CreateJobCommand = new AsyncRelayCommand(CreateJobAsync, () => CanCreateJob);
+        LoadFirstPreviewPageCommand = new AsyncRelayCommand(LoadFirstPreviewPageAsync, () => CanEdit && importSessionId != Guid.Empty);
+        LoadNextPreviewPageCommand = new AsyncRelayCommand(LoadNextPreviewPageAsync, () => CanEdit && nextPreviewCursor is not null);
         NextStepCommand = new RelayCommand(MoveNext, () => CanMoveNext);
-        PreviousStepCommand = new RelayCommand(MovePrevious, () => !IsBusy && currentStepIndex > 0);
-        SelectReplicationCommand = new AsyncRelayCommand(() => SelectModeAsync(Core.Domain.TransferMode.Replication));
-        SelectDistributionCommand = new AsyncRelayCommand(() => SelectModeAsync(Core.Domain.TransferMode.Distribution));
-        UseTaskQuotaCommand = new RelayCommand(() => QuotaBasis = Core.Domain.QuotaBasis.TaskCount);
-        UseSuccessTargetCommand = new RelayCommand(() => QuotaBasis = Core.Domain.QuotaBasis.SuccessTarget);
-        UseProportionalReductionCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.ProportionalReduction);
-        UseAccountPriorityCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.AccountPriority);
-        UseWaitForCandidatesCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.WaitForCandidates);
-        KeepExcelMappingsCommand = new RelayCommand(() => ExcelAccountHandling = ExcelAccountHandling.KeepMappings);
-        AutoMapUniqueExcelAccountsCommand = new AsyncRelayCommand(AutoMapUniqueExcelAccountsAsync);
-        OverrideExcelMappingsCommand = new AsyncRelayCommand(OverrideAllExcelAccountsAsync);
-        IgnoreExcelAccountColumnCommand = new AsyncRelayCommand(IgnoreExcelAccountsAsync);
-        ApplyOneTwoOneCommand = new RelayCommand(() => TryApplyOneTwoOne());
-        ApplyEqualAllocationCommand = new RelayCommand(() => TryApplyEqualAllocation());
-        ApplyCapacityAllocationCommand = new RelayCommand(() => TryApplyCapacityAllocation());
-        PreserveStructureCommand = new RelayCommand(() => FolderCreationMode = "None");
-        CreateOuterFolderCommand = new RelayCommand(() => FolderCreationMode = "OuterFolder");
-        SkipDuplicateCommand = new RelayCommand(() => DuplicatePolicy = Core.Domain.DuplicatePolicy.Skip);
-        RenameDuplicateCommand = new RelayCommand(() => DuplicatePolicy = Core.Domain.DuplicatePolicy.Rename);
-        RunPrecheckCommand = new AsyncRelayCommand(RunPrecheckAsync, () => UseBulkPrecheck && PrecheckAccountId is not null && !IsBusy);
+        PreviousStepCommand = new RelayCommand(MovePrevious, () => CanEdit && currentStepIndex > 0);
+        SelectReplicationCommand = new AsyncRelayCommand(() => SelectModeAsync(Core.Domain.TransferMode.Replication), () => CanEdit);
+        SelectDistributionCommand = new AsyncRelayCommand(() => SelectModeAsync(Core.Domain.TransferMode.Distribution), () => CanEdit);
+        UseTaskQuotaCommand = new RelayCommand(() => QuotaBasis = Core.Domain.QuotaBasis.TaskCount, () => CanEdit);
+        UseSuccessTargetCommand = new RelayCommand(() => QuotaBasis = Core.Domain.QuotaBasis.SuccessTarget, () => CanEdit);
+        UseProportionalReductionCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.ProportionalReduction, () => CanEdit);
+        UseAccountPriorityCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.AccountPriority, () => CanEdit);
+        UseWaitForCandidatesCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.WaitForCandidates, () => CanEdit);
+        KeepExcelMappingsCommand = new RelayCommand(() => ExcelAccountHandling = ExcelAccountHandling.KeepMappings, () => CanEdit);
+        AutoMapUniqueExcelAccountsCommand = new AsyncRelayCommand(AutoMapUniqueExcelAccountsAsync, () => CanEdit);
+        OverrideExcelMappingsCommand = new AsyncRelayCommand(OverrideAllExcelAccountsAsync, () => CanEdit);
+        IgnoreExcelAccountColumnCommand = new AsyncRelayCommand(IgnoreExcelAccountsAsync, () => CanEdit);
+        ApplyOneTwoOneCommand = new RelayCommand(() => TryApplyOneTwoOne(), () => CanEdit);
+        ApplyEqualAllocationCommand = new RelayCommand(() => TryApplyEqualAllocation(), () => CanEdit);
+        ApplyCapacityAllocationCommand = new RelayCommand(() => TryApplyCapacityAllocation(), () => CanEdit);
+        PreserveStructureCommand = new RelayCommand(() => FolderCreationMode = "None", () => CanEdit);
+        CreateOuterFolderCommand = new RelayCommand(() => FolderCreationMode = "OuterFolder", () => CanEdit);
+        SkipDuplicateCommand = new RelayCommand(() => DuplicatePolicy = Core.Domain.DuplicatePolicy.Skip, () => CanEdit);
+        RenameDuplicateCommand = new RelayCommand(() => DuplicatePolicy = Core.Domain.DuplicatePolicy.Rename, () => CanEdit);
+        RunPrecheckCommand = new AsyncRelayCommand(RunPrecheckAsync, () => CanEdit && UseBulkPrecheck && PrecheckAccountId is not null);
     }
 
     public ObservableCollection<AccountAllocationRowViewModel> Accounts { get; }
@@ -271,7 +272,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             RaiseDerived();
         }
     }
-    public bool CanEdit => !IsBusy;
+    public bool CanEdit => !IsBusy && !externalCleanupBusy;
     public int ReadyResourceCount => readyResourceCount;
     public Guid? CurrentImportSessionId => importSessionId == Guid.Empty ? null : importSessionId;
     public long ResourceCount => readyResourceCount;
@@ -289,7 +290,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public bool IsDestinationStepVisible => currentStepIndex == 2;
     public bool IsAllocationStepVisible => currentStepIndex == 3;
     public bool IsConfirmationStepVisible => currentStepIndex == 4;
-    public bool CanMoveNext => !IsBusy && Accounts.Count > 0 && (currentStepIndex switch
+    public bool CanMoveNext => CanEdit && Accounts.Count > 0 && (currentStepIndex switch
     {
         0 => importSessionId != Guid.Empty && readyResourceCount > 0 && conflictRowCount + needsResolutionRowCount == 0,
         1 => !UseBulkPrecheck || PrecheckAccountId is not null,
@@ -376,7 +377,88 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public bool CanContinue => string.IsNullOrEmpty(EvaluateValidation());
     public bool CanStartTransfers => adapterAvailability.CanStartTransfers;
     public bool CanCreateJob => adapterAvailability.CanStartTransfers && ConfirmationToken is not null &&
-        IsFinalConfirmationChecked && CanContinue && !IsBusy;
+        IsFinalConfirmationChecked && CanContinue && CanEdit;
+
+    internal void SetExternalCleanupBusy(bool value)
+    {
+        if (externalCleanupBusy == value) return;
+        externalCleanupBusy = value;
+        OnPropertyChanged(nameof(CanEdit));
+        RaiseDerived();
+        NotifyEditCommands();
+    }
+
+    public bool TryDetachAfterSuccessfulCleanup(Guid expectedSessionId)
+    {
+        if (expectedSessionId == Guid.Empty || importSessionId != expectedSessionId) return false;
+        draftGeneration++;
+        busyGeneration++;
+        importSessionId = Guid.Empty;
+        batchJobId = Guid.Empty;
+        readyResourceCount = 0;
+        conflictRowCount = 0;
+        needsResolutionRowCount = 0;
+        hasExcelAccountColumn = false;
+        unresolvedAccountMappingCount = 0;
+        mappedAccountIds.Clear();
+        precheckAccountId = null;
+        lastPrecheckResult = null;
+        precheckStatusMessage = string.Empty;
+        previewTotalCount = 0;
+        nextPreviewCursor = null;
+        PreviewRows.Clear();
+        confirmationToken = null;
+        requiredFreeBytes = 0;
+        availableFreeBytes = 0;
+        confirmedResourceCount = 0;
+        confirmedOperationCount = 0;
+        transferCount = 0;
+        shareCount = 0;
+        totalActionCount = 0;
+        resultColumnCount = 0;
+        isFinalConfirmationChecked = false;
+        lastConfirmationWasDeclined = false;
+        useBulkPrecheck = false;
+        transferMode = null;
+        excelAccountHandling = ExcelAccountHandling.Unresolved;
+        excelOverrideAccountId = null;
+        validationMessage = EvaluateValidation();
+        statusMessage = string.Empty;
+        suppressInvalidation = true;
+        try
+        {
+            foreach (var account in Accounts)
+            {
+                account.IsSelected = false;
+                account.TargetItemCount = 0;
+                account.ClearConfirmation();
+            }
+        }
+        finally { suppressInvalidation = false; }
+        foreach (var step in Steps)
+        {
+            step.IsCurrent = step.Kind == WizardStepKind.Import;
+            if (step.Kind == WizardStepKind.Precheck) step.IsSkipped = true;
+        }
+        currentStepIndex = 0;
+        OnPropertyChanged(nameof(CurrentImportSessionId));
+        OnPropertyChanged(nameof(MappedAccountIds));
+        OnPropertyChanged(nameof(PrecheckAccountId));
+        OnPropertyChanged(nameof(LastPrecheckResult));
+        OnPropertyChanged(nameof(PrecheckStatusMessage));
+        OnPropertyChanged(nameof(PreviewTotalCount));
+        OnPropertyChanged(nameof(ConfirmationToken));
+        OnPropertyChanged(nameof(IsFinalConfirmationChecked));
+        OnPropertyChanged(nameof(CurrentStepIndex));
+        OnPropertyChanged(nameof(IsImportStepVisible));
+        OnPropertyChanged(nameof(IsPrecheckStepVisible));
+        OnPropertyChanged(nameof(IsDestinationStepVisible));
+        OnPropertyChanged(nameof(IsAllocationStepVisible));
+        OnPropertyChanged(nameof(IsConfirmationStepVisible));
+        RaiseAll();
+        NotifyEditCommands();
+        return true;
+    }
 
     public void Initialize(ImportWizardContext context)
     {
@@ -531,6 +613,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public void SelectMode(TransferMode mode)
     {
+        if (externalCleanupBusy) return;
         if (transferMode == mode) return;
         transferMode = mode;
         if (mode == Core.Domain.TransferMode.Replication) quotaBasis = Core.Domain.QuotaBasis.TaskCount;
@@ -541,6 +624,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public async Task SelectModeAsync(TransferMode mode, CancellationToken cancellationToken = default)
     {
+        if (externalCleanupBusy) return;
         if (importSessionId == Guid.Empty) { SelectMode(mode); return; }
         var session = importSessionId;
         var generation = draftGeneration;
@@ -563,7 +647,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public async Task IgnoreExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
-        if (importSessionId == Guid.Empty || transferMode is null) return;
+        if (externalCleanupBusy || importSessionId == Guid.Empty || transferMode is null) return;
         var session = importSessionId;
         var generation = draftGeneration;
         var mode = transferMode.Value;
@@ -586,7 +670,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public async Task AutoMapUniqueExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
-        if (importSessionId == Guid.Empty || transferMode != Core.Domain.TransferMode.Distribution) return;
+        if (externalCleanupBusy || importSessionId == Guid.Empty || transferMode != Core.Domain.TransferMode.Distribution) return;
         var session = importSessionId;
         var generation = draftGeneration;
         var mode = transferMode.Value;
@@ -613,7 +697,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public async Task OverrideAllExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
-        if (importSessionId == Guid.Empty || transferMode is null) return;
+        if (externalCleanupBusy || importSessionId == Guid.Empty || transferMode is null) return;
         var account = ExcelOverrideAccountId is { } accountId
             ? Accounts.FirstOrDefault(x => x.AccountId == accountId && x.IsSelected)
             : null;
@@ -646,7 +730,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task<WizardPrecheckResult> RunBackgroundPrecheckAsync(
         CancellationToken cancellationToken = default)
     {
-        if (!UseBulkPrecheck || importSessionId == Guid.Empty || PrecheckAccountId is not Guid accountId)
+        if (externalCleanupBusy || !UseBulkPrecheck || importSessionId == Guid.Empty || PrecheckAccountId is not Guid accountId)
             return new(WizardPrecheckStatus.Unavailable, 0);
         if (Accounts.All(x => x.AccountId != accountId))
         {
@@ -697,6 +781,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public bool TryApplyOneTwoOne()
     {
+        if (externalCleanupBusy) return false;
         var selected = Accounts.Where(x => x.IsSelected).ToArray();
         if (selected.Length != 3 || transferMode != Core.Domain.TransferMode.Distribution) return false;
         suppressInvalidation = true;
@@ -717,6 +802,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public bool TryApplyEqualAllocation()
     {
+        if (externalCleanupBusy) return false;
         var selected = Accounts.Where(x => x.IsSelected).ToArray();
         if (selected.Length == 0 || transferMode != Core.Domain.TransferMode.Distribution) return false;
         var perAccount = readyResourceCount / selected.Length;
@@ -727,6 +813,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public bool TryApplyCapacityAllocation()
     {
+        if (externalCleanupBusy) return false;
         var selected = Accounts.Where(x => x.IsSelected).ToArray();
         if (selected.Length == 0 || transferMode != Core.Domain.TransferMode.Distribution) return false;
         var weights = selected.Select(x => new BigInteger(Math.Max(0, x.RemainingCapacity ?? 0))).ToArray();
@@ -763,18 +850,20 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public async Task LoadFirstPreviewPageAsync(CancellationToken cancellationToken = default)
     {
+        if (externalCleanupBusy) return;
         nextPreviewCursor = null;
         await LoadPreviewPageAsync(null, replace: true, cancellationToken);
     }
 
     public async Task LoadNextPreviewPageAsync(CancellationToken cancellationToken = default)
     {
-        if (nextPreviewCursor is null) return;
+        if (externalCleanupBusy || nextPreviewCursor is null) return;
         await LoadPreviewPageAsync(nextPreviewCursor, replace: true, cancellationToken);
     }
 
     public async Task PrepareConfirmationAsync(CancellationToken cancellationToken = default)
     {
+        if (externalCleanupBusy) return;
         var validation = EvaluateValidation();
         ValidationMessage = validation;
         if (validation.Length != 0) return;
@@ -832,6 +921,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public async Task CreateJobAsync(CancellationToken cancellationToken = default)
     {
+        if (externalCleanupBusy) return;
         _ = await ConfirmPreparedCoreAsync(requireFinalCheck: true, cancellationToken);
     }
 
@@ -844,7 +934,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     {
         LastConfirmationWasDeclined = false;
         var mayConfirm = adapterAvailability.CanStartTransfers && ConfirmationToken is not null &&
-            CanContinue && !IsBusy && (!requireFinalCheck || IsFinalConfirmationChecked);
+            CanContinue && CanEdit && (!requireFinalCheck || IsFinalConfirmationChecked);
         if (!mayConfirm || ConfirmationToken is null) return null;
         var token = ConfirmationToken;
         var draft = BuildDraft();
@@ -1287,10 +1377,34 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         LoadFirstPreviewPageCommand?.NotifyCanExecuteChanged();
         LoadNextPreviewPageCommand?.NotifyCanExecuteChanged();
         RunPrecheckCommand?.NotifyCanExecuteChanged();
+        NotifyEditCommands();
+    }
+
+    private void NotifyEditCommands()
+    {
+        SelectReplicationCommand?.NotifyCanExecuteChanged();
+        SelectDistributionCommand?.NotifyCanExecuteChanged();
+        UseTaskQuotaCommand?.NotifyCanExecuteChanged();
+        UseSuccessTargetCommand?.NotifyCanExecuteChanged();
+        UseProportionalReductionCommand?.NotifyCanExecuteChanged();
+        UseAccountPriorityCommand?.NotifyCanExecuteChanged();
+        UseWaitForCandidatesCommand?.NotifyCanExecuteChanged();
+        KeepExcelMappingsCommand?.NotifyCanExecuteChanged();
+        AutoMapUniqueExcelAccountsCommand?.NotifyCanExecuteChanged();
+        OverrideExcelMappingsCommand?.NotifyCanExecuteChanged();
+        IgnoreExcelAccountColumnCommand?.NotifyCanExecuteChanged();
+        ApplyOneTwoOneCommand?.NotifyCanExecuteChanged();
+        ApplyEqualAllocationCommand?.NotifyCanExecuteChanged();
+        ApplyCapacityAllocationCommand?.NotifyCanExecuteChanged();
+        PreserveStructureCommand?.NotifyCanExecuteChanged();
+        CreateOuterFolderCommand?.NotifyCanExecuteChanged();
+        SkipDuplicateCommand?.NotifyCanExecuteChanged();
+        RenameDuplicateCommand?.NotifyCanExecuteChanged();
     }
 
     private void MoveNext()
     {
+        if (!CanEdit) return;
         var next = currentStepIndex + 1;
         while (next < Steps.Count && Steps[next].IsSkipped) next++;
         if (next >= Steps.Count) return;
@@ -1299,6 +1413,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     private void MovePrevious()
     {
+        if (!CanEdit) return;
         var previous = currentStepIndex - 1;
         while (previous >= 0 && Steps[previous].IsSkipped) previous--;
         if (previous < 0) return;

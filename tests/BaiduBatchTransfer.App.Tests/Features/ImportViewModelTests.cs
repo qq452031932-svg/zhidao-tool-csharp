@@ -14,6 +14,66 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class ImportViewModelTests
 {
     [Fact]
+    public async Task SuccessfulCleanupResetClearsSessionUiAndReplayOnlyForExpectedSession()
+    {
+        var workflow = new ReplayTrackingWorkflow();
+        var row = new ImportPreviewRow(Guid.NewGuid(), 1, "https://pan.baidu.com/s/id", "a1b2", null, "就绪", null);
+        var vm = Create(workflow, new FakePageSource([row], 1, 2));
+        var session = Guid.NewGuid();
+        vm.AttachSession(session);
+        vm.ApplyStatistics(new(1, 1, 0, 0, 0));
+        await vm.LoadFirstPageAsync();
+        vm.SelectedRow = row;
+        vm.SelectedShareUrl = "edited";
+        vm.SelectedExtractionCode = "zzzz";
+
+        Assert.False(vm.TryResetAfterSuccessfulCleanup(Guid.NewGuid()));
+        Assert.Equal(session, vm.SessionId);
+        Assert.Empty(workflow.Discarded);
+
+        Assert.True(vm.TryResetAfterSuccessfulCleanup(session));
+        Assert.Null(vm.SessionId);
+        Assert.Empty(vm.Rows);
+        Assert.Null(vm.SelectedRow);
+        Assert.Empty(vm.SelectedShareUrl);
+        Assert.Empty(vm.SelectedExtractionCode);
+        Assert.Equal("排除所选记录", vm.SelectedExclusionActionText);
+        Assert.Equal(0, vm.TotalRows);
+        Assert.Equal("尚未导入数据", vm.StatisticsText);
+        Assert.False(vm.CanResumeImport);
+        Assert.Equal([session], workflow.Discarded);
+        Assert.False(vm.LoadNextPageCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ExternalCleanupFenceRefusesImportEditAndPageOperations()
+    {
+        var workflow = new FakeImportWorkflow();
+        var row = new ImportPreviewRow(Guid.NewGuid(), 1, "https://pan.baidu.com/s/id", null, null, "就绪", null);
+        var source = new FakePageSource([row], 1, null);
+        var vm = Create(workflow, source);
+        var session = Guid.NewGuid();
+        workflow.MutationSessionId = session;
+        vm.AttachSession(session);
+        vm.TextContent = "https://pan.baidu.com/s/new";
+        vm.SelectedRow = row;
+        vm.SetExternalCleanupBusy(true);
+
+        await vm.ImportTextAsync();
+        await vm.SaveCurrentRowEditAsync();
+        await vm.LoadFirstPageAsync();
+
+        Assert.False(vm.CanEdit);
+        Assert.False(vm.ImportTextCommand.CanExecute(null));
+        Assert.False(vm.SaveSelectedRowCommand.CanExecute(null));
+        Assert.False(vm.LoadFirstPageCommand.CanExecute(null));
+        Assert.Equal(0, workflow.UpdateLinkCalls);
+        Assert.Null(source.LastRequest);
+
+        vm.SetExternalCleanupBusy(false);
+        Assert.True(vm.CanEdit);
+    }
+    [Fact]
     public void ImportWorkflowExceptionToStringDoesNotExposeInnerPathOrContent()
     {
         var error = new ImportWorkflowException(
@@ -689,6 +749,17 @@ public sealed class ImportViewModelTests
             if (Error is { } error) throw new ImportWorkflowException(error);
             return Task.FromResult(new ImportWorkflowResult(Guid.NewGuid(), new(1, 1, 0, 0, 0)));
         }
+    }
+
+    private sealed class ReplayTrackingWorkflow : IImportWorkflow
+    {
+        public List<Guid> Discarded { get; } = [];
+        public void DiscardReplaySource(Guid sessionId) => Discarded.Add(sessionId);
+        public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
     private sealed class FakePageSource(

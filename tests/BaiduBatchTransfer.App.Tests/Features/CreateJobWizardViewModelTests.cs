@@ -7,6 +7,57 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class CreateJobWizardViewModelTests
 {
+    [Fact]
+    public async Task ExpectedSessionDetachClearsCreationPrecheckPreviewAndStepState()
+    {
+        var vm = Create(Accounts(1), ready: 2);
+        var session = Assert.IsType<Guid>(vm.CurrentImportSessionId);
+        vm.UseBulkPrecheck = true;
+        await vm.LoadFirstPreviewPageAsync();
+        vm.NextStepCommand.Execute(null);
+
+        Assert.False(vm.TryDetachAfterSuccessfulCleanup(Guid.NewGuid()));
+        Assert.Equal(session, vm.CurrentImportSessionId);
+
+        Assert.True(vm.TryDetachAfterSuccessfulCleanup(session));
+        Assert.Null(vm.CurrentImportSessionId);
+        Assert.Equal(0, vm.ReadyResourceCount);
+        Assert.Equal(0, vm.PreviewTotalCount);
+        Assert.Empty(vm.PreviewRows);
+        Assert.Null(vm.LastPrecheckResult);
+        Assert.Null(vm.PrecheckAccountId);
+        Assert.Empty(vm.MappedAccountIds);
+        Assert.Null(vm.ConfirmationToken);
+        Assert.False(vm.IsFinalConfirmationChecked);
+        Assert.Equal(0, vm.CurrentStepIndex);
+        Assert.False(vm.CanCreateJob);
+        Assert.False(vm.CanMoveNext);
+    }
+
+    [Fact]
+    public async Task ExternalCleanupFenceRefusesNavigationPrecheckPreviewAndCreation()
+    {
+        var gateway = new FakeBatchGateway();
+        var vm = Create(Accounts(1), ready: 1, gateway: gateway);
+        vm.UseBulkPrecheck = true;
+        vm.SetExternalCleanupBusy(true);
+
+        var step = vm.CurrentStepIndex;
+        vm.NextStepCommand.Execute(null);
+        await vm.RunPrecheckAsync();
+        await vm.LoadFirstPreviewPageAsync();
+        await vm.PrepareConfirmationAsync();
+        await vm.CreateJobAsync();
+
+        Assert.False(vm.CanEdit);
+        Assert.Equal(step, vm.CurrentStepIndex);
+        Assert.False(vm.NextStepCommand.CanExecute(null));
+        Assert.False(vm.RunPrecheckCommand.CanExecute(null));
+        Assert.False(vm.LoadFirstPreviewPageCommand.CanExecute(null));
+        Assert.False(vm.PrepareConfirmationCommand.CanExecute(null));
+        Assert.False(vm.CreateJobCommand.CanExecute(null));
+        Assert.Null(gateway.LastPreviewDraft);
+    }
     [Theory]
     [InlineData(BatchAccountSelectionDecision.Unspecified)]
     [InlineData((BatchAccountSelectionDecision)99)]

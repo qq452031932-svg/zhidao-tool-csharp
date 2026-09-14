@@ -64,9 +64,13 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.Same(concreteStore, scope.ServiceProvider.GetRequiredService<ILocalImportDraftCleanupStore>());
         Assert.Same(service, scope.ServiceProvider.GetRequiredService<LocalImportDraftCleanupService>());
         Assert.Same(concreteStore, PrivateField<ILocalImportDraftCleanupStore>(service, "store"));
+        Assert.IsType<WpfCurrentImportCleanupInteraction>(
+            host.Services.GetRequiredService<ICurrentImportCleanupInteraction>());
         var shellConstructorParameters = Assert.Single(typeof(AppShellFactory).GetConstructors()).GetParameters();
         Assert.Contains(shellConstructorParameters, parameter =>
             parameter.ParameterType == typeof(LocalImportDraftCleanupService));
+        Assert.Contains(shellConstructorParameters, parameter =>
+            parameter.ParameterType == typeof(ICurrentImportCleanupInteraction));
     }
 
     [Fact]
@@ -214,8 +218,10 @@ public sealed class AppBootstrapTests : IDisposable
         var constructor = (ConstructorInfo)instructions[constructorIndex].Member!;
         Assert.Equal(typeof(IDialogService), constructor.GetParameters().Single(parameter => parameter.Name == "dialogService").ParameterType);
         Assert.Equal(typeof(ILicenseAuthorizationGate), constructor.GetParameters().Single(parameter => parameter.Name == "licenseGate").ParameterType);
-        Assert.Equal(typeof(LocalTerminalHistoryService), constructor.GetParameters()[^2].ParameterType);
-        Assert.Equal(typeof(ILocalHistoryCleanupInteraction), constructor.GetParameters()[^1].ParameterType);
+        Assert.Equal(typeof(LocalTerminalHistoryService), constructor.GetParameters().Single(parameter => parameter.Name == "historyCleanupService").ParameterType);
+        Assert.Equal(typeof(ILocalHistoryCleanupInteraction), constructor.GetParameters().Single(parameter => parameter.Name == "historyCleanupInteraction").ParameterType);
+        Assert.Equal(typeof(LocalImportDraftCleanupService), constructor.GetParameters().Single(parameter => parameter.Name == "importDraftCleanupService").ParameterType);
+        Assert.Equal(typeof(ICurrentImportCleanupInteraction), constructor.GetParameters().Single(parameter => parameter.Name == "currentImportCleanupInteraction").ParameterType);
 
         // Verify the actual compiled composition call's final argument. Omitting the optional
         // dialog argument emits ldnull here, even though the factory still holds a dialog field.

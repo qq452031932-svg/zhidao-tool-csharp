@@ -245,6 +245,7 @@ public static class AppBootstrap
             sp.GetRequiredService<SqliteLocalTerminalHistoryStore>());
         services.AddSingleton<LocalTerminalHistoryService>();
         services.AddSingleton<ILocalHistoryCleanupInteraction, WpfLocalHistoryCleanupInteraction>();
+        services.AddSingleton<ICurrentImportCleanupInteraction, WpfCurrentImportCleanupInteraction>();
         services.AddSingleton<SqliteLocalImportDraftCleanupStore>();
         services.AddSingleton<ILocalImportDraftCleanupStore>(sp =>
             sp.GetRequiredService<SqliteLocalImportDraftCleanupStore>());
@@ -913,11 +914,11 @@ public sealed class AppShellFactory(
     ILicenseAuthorizationGate licenseGate,
     LocalImportDraftCleanupService importDraftCleanupService,
     LocalTerminalHistoryService historyCleanupService,
-    ILocalHistoryCleanupInteraction historyCleanupInteraction) : IAppShellFactory
+    ILocalHistoryCleanupInteraction historyCleanupInteraction,
+    ICurrentImportCleanupInteraction currentImportCleanupInteraction) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
-        _ = importDraftCleanupService;
         var accounts = runtimeState.CoordinatorMayStart
             ? await accountProvider.LoadEligibleAsync(cancellationToken).ConfigureAwait(true)
             : [];
@@ -1035,7 +1036,9 @@ public sealed class AppShellFactory(
             dialogService,
             licenseGate,
             historyCleanupService,
-            historyCleanupInteraction);
+            historyCleanupInteraction,
+            importDraftCleanupService,
+            currentImportCleanupInteraction);
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
         var homeWorkspace = new DeferredWorkspaceView(
             new DeferredWorkspaceViewModel("首页", "功能建设中"));
