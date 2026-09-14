@@ -245,6 +245,10 @@ public static class AppBootstrap
             sp.GetRequiredService<SqliteLocalTerminalHistoryStore>());
         services.AddSingleton<LocalTerminalHistoryService>();
         services.AddSingleton<ILocalHistoryCleanupInteraction, WpfLocalHistoryCleanupInteraction>();
+        services.AddSingleton<SqliteLocalImportDraftCleanupStore>();
+        services.AddSingleton<ILocalImportDraftCleanupStore>(sp =>
+            sp.GetRequiredService<SqliteLocalImportDraftCleanupStore>());
+        services.AddSingleton<LocalImportDraftCleanupService>();
         services.AddSingleton<ILocalResultExportStore>(sp =>
             sp.GetRequiredService<SqliteLocalResultExportStore>());
         services.AddSingleton<PauseBatchService>();
@@ -907,11 +911,13 @@ public sealed class AppShellFactory(
     AppRuntimeState runtimeState,
     LicenseRuntimeAuthorizationState licenseAuthorizationState,
     ILicenseAuthorizationGate licenseGate,
+    LocalImportDraftCleanupService importDraftCleanupService,
     LocalTerminalHistoryService historyCleanupService,
     ILocalHistoryCleanupInteraction historyCleanupInteraction) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
+        _ = importDraftCleanupService;
         var accounts = runtimeState.CoordinatorMayStart
             ? await accountProvider.LoadEligibleAsync(cancellationToken).ConfigureAwait(true)
             : [];

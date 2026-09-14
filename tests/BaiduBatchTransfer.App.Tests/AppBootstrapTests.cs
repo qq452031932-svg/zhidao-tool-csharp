@@ -53,6 +53,23 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
+    public void LocalImportDraftCleanupUsesOneStoreAndServiceInstanceAcrossScopes()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        var concreteStore = host.Services.GetRequiredService<SqliteLocalImportDraftCleanupStore>();
+        var service = host.Services.GetRequiredService<LocalImportDraftCleanupService>();
+        using var scope = host.Services.CreateScope();
+
+        Assert.Same(concreteStore, host.Services.GetRequiredService<ILocalImportDraftCleanupStore>());
+        Assert.Same(concreteStore, scope.ServiceProvider.GetRequiredService<ILocalImportDraftCleanupStore>());
+        Assert.Same(service, scope.ServiceProvider.GetRequiredService<LocalImportDraftCleanupService>());
+        Assert.Same(concreteStore, PrivateField<ILocalImportDraftCleanupStore>(service, "store"));
+        var shellConstructorParameters = Assert.Single(typeof(AppShellFactory).GetConstructors()).GetParameters();
+        Assert.Contains(shellConstructorParameters, parameter =>
+            parameter.ParameterType == typeof(LocalImportDraftCleanupService));
+    }
+
+    [Fact]
     public void BootstrapUsesTheApprovedUserFacingBrandAndDefaultExportName()
     {
         var repositoryRoot = FindRepositoryRoot();
