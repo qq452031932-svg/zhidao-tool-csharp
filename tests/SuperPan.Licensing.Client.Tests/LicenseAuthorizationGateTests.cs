@@ -348,50 +348,57 @@ public sealed class LicenseAuthorizationGateTests
     }
 
     [Fact]
-    public async Task NewerAuthorizationKeepsItsSummaryAndLeaseWhenOlderActivationRejectionFinishesLater()
+    public async Task DefinitiveRejectionClearsLeaseBeforeQueuedTemporaryFailureChecksCache()
     {
         var olderResponse = new TaskCompletionSource<LicenseApiResult>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        var expiry = Now.AddDays(11);
-        var store = new MemoryStore([Credential()]);
+        var store = StoreWithLease(Lease());
         var summaries = new List<AuthorizedLicenseSummary?>();
         var gate = CreateGate(
-            new FakeService(olderResponse.Task, Authorized("最新套餐", expiry)),
-            store,
-            publishSummary: summaries.Add);
-
-        var older = gate.ActivateAsync("CARD-SECRET", CancellationToken.None);
-        var newer = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
-        olderResponse.SetResult(Rejected(LicenseCodes.LicenseExpired));
-        var olderResult = await older;
-
-        Assert.True(newer.IsAuthorized);
-        Assert.False(olderResult.IsAuthorized);
-        Assert.Equal(new AuthorizedLicenseSummary("最新套餐", expiry), Assert.Single(summaries));
-        Assert.Single(Assert.Single(store.Snapshot.Credentials).Leases);
-    }
-
-    [Fact]
-    public async Task OlderAuthorizationSuccessPersistsWithoutOverwritingTheNewerActivationFailureSummary()
-    {
-        var olderResponse = new TaskCompletionSource<LicenseApiResult>(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        var expiry = Now.AddDays(12);
-        var store = new MemoryStore([Credential()]);
-        var summaries = new List<AuthorizedLicenseSummary?>();
-        var gate = CreateGate(
-            new FakeService(olderResponse.Task, Rejected(LicenseCodes.LicenseExpired)),
+            new FakeService(
+                olderResponse.Task,
+                new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null)),
             store,
             publishSummary: summaries.Add);
 
         var older = gate.AuthorizeAsync(LicenseOperationKind.Startup, CancellationToken.None);
-        var newer = await gate.ActivateAsync("CARD-SECRET", CancellationToken.None);
+        var newer = gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+        olderResponse.SetResult(Rejected(LicenseCodes.LicenseExpired));
+        var results = await Task.WhenAll(older, newer);
+
+        Assert.All(results, result => Assert.False(result.IsAuthorized));
+        Assert.All(summaries, Assert.Null);
+        Assert.Empty(Assert.Single(store.Snapshot.Credentials).Leases);
+    }
+
+    [Fact]
+    public async Task NewerCallCanceledWhileWaitingDoesNotSuppressOlderSuccessSummary()
+    {
+        var olderResponse = new TaskCompletionSource<LicenseApiResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var canceledResponse = new TaskCompletionSource<LicenseApiResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var expiry = Now.AddDays(12);
+        var store = new MemoryStore([Credential()]);
+        var summaries = new List<AuthorizedLicenseSummary?>();
+        var service = new FakeService(olderResponse.Task, canceledResponse.Task);
+        var gate = CreateGate(
+            service,
+            store,
+            publishSummary: summaries.Add);
+        using var cancellation = new CancellationTokenSource();
+
+        var older = gate.AuthorizeAsync(LicenseOperationKind.Startup, CancellationToken.None);
+        var newer = gate.ActivateAsync("CARD-SECRET", cancellation.Token);
+        cancellation.Cancel();
+        canceledResponse.TrySetResult(Rejected(LicenseCodes.LicenseExpired));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => newer);
         olderResponse.SetResult(Authorized("旧请求套餐", expiry));
         var olderResult = await older;
 
-        Assert.False(newer.IsAuthorized);
         Assert.True(olderResult.IsAuthorized);
-        Assert.Null(Assert.Single(summaries));
+        Assert.Equal(new AuthorizedLicenseSummary("旧请求套餐", expiry), Assert.Single(summaries));
+        Assert.Single(service.Calls);
         Assert.Equal("旧请求套餐", Assert.Single(Assert.Single(store.Snapshot.Credentials).Leases).PackageName);
     }
 
