@@ -17,21 +17,22 @@ public sealed class LocalTerminalHistoryService(ILocalTerminalHistoryStore store
 
     public async Task<LocalHistoryCleanupResult> DeleteAsync(
         LocalHistoryKind kind,
+        LocalHistoryCleanupPreview confirmedPreview,
         CancellationToken cancellationToken = default)
     {
         ValidateKind(kind);
-        var preview = await store.PreviewAsync(kind, cancellationToken).ConfigureAwait(false);
-        if (preview.HasConflicts)
+        ArgumentNullException.ThrowIfNull(confirmedPreview);
+        if (confirmedPreview.HasConflicts)
             return new(0, LocalHistoryCleanupDisposition.Conflict);
-        if (preview.TerminalBatchCount == 0)
+        if (confirmedPreview.TerminalBatchCount == 0)
             return new(0, LocalHistoryCleanupDisposition.NothingToDelete);
 
-        return await store.DeleteAsync(kind, cancellationToken).ConfigureAwait(false);
+        return await store.DeleteAsync(kind, confirmedPreview.SnapshotToken!, cancellationToken).ConfigureAwait(false);
     }
 
     private static void ValidateKind(LocalHistoryKind kind)
     {
-        if (!Enum.IsDefined(kind))
+        if (!Enum.IsDefined(kind) || kind == LocalHistoryKind.Unspecified)
             throw new ArgumentOutOfRangeException(nameof(kind), kind, "A known local history kind is required.");
     }
 }
