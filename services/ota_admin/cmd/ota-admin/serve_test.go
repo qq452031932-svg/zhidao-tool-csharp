@@ -20,6 +20,7 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/config"
 	"fanfh.cn/superpan/ota-admin/internal/deploy"
+	"fanfh.cn/superpan/ota-admin/internal/security"
 	"fanfh.cn/superpan/ota-admin/internal/store"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
@@ -106,6 +107,39 @@ func TestPublishBundleWithComponentsRevokesTemporarySession(t *testing.T) {
 	persisted, err := database.Session(context.Background(), acceptor.sessionID)
 	if err != nil || persisted.State != store.SessionRevoked {
 		t.Fatalf("temporary session=%+v err=%v, want revoked", persisted, err)
+	}
+}
+
+func TestResetAdminPasswordRevokesExistingSessions(t *testing.T) {
+	stateRoot := t.TempDir()
+	if err := os.Chmod(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(stateRoot, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	oldHash, err := security.HashPassword("old administrator password", bytes.NewReader(bytes.Repeat([]byte{0x11}, 32)))
+	if err != nil || database.InitializeAdmin(context.Background(), oldHash) != nil {
+		t.Fatalf("initialize admin: %v", err)
+	}
+	now := time.Unix(1_800_000_000, 0).UTC()
+	existingID := strings.Repeat("a", 64)
+	if err := database.CreateSession(context.Background(), store.Session{IDHash: existingID, State: store.SessionActive, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(time.Hour), AbsoluteExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	newPassword := "new administrator password"
+	if err := resetAdminPassword(context.Background(), database, newPassword, bytes.NewReader(bytes.Repeat([]byte{0x42}, 128)), func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := database.Admin(context.Background())
+	if err != nil || !security.VerifyPassword(newPassword, admin.PasswordHash) || security.VerifyPassword("old administrator password", admin.PasswordHash) {
+		t.Fatalf("admin password was not replaced safely: %+v, %v", admin, err)
+	}
+	existing, err := database.Session(context.Background(), existingID)
+	if err != nil || existing.State != store.SessionRevoked {
+		t.Fatalf("existing session=%+v err=%v, want revoked", existing, err)
 	}
 }
 

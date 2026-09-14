@@ -37,6 +37,8 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return runInitAdmin(arguments[1:], stdout, stderr)
 	case "publish-bundle":
 		return runPublishBundle(arguments[1:], stdout, stderr)
+	case "reset-admin":
+		return runResetAdmin(arguments[1:], stdout, stderr)
 	case "serve":
 		return runServe(arguments[1:], stdout, stderr)
 	default:
