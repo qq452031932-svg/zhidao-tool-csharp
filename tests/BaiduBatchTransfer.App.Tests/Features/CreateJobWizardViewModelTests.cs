@@ -30,6 +30,7 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Null(vm.ConfirmationToken);
         Assert.False(vm.IsFinalConfirmationChecked);
         Assert.Equal(0, vm.CurrentStepIndex);
+        Assert.Empty(vm.AccountSelectionNotice);
         Assert.False(vm.CanCreateJob);
         Assert.False(vm.CanMoveNext);
     }

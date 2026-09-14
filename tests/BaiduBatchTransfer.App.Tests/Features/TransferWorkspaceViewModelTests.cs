@@ -340,6 +340,34 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task ClosingWorkspaceCancelsBlockedCleanupWithoutResetOrReplayDiscard()
+    {
+        var store = new CurrentImportCleanupStore { Block = true };
+        using var fixture = Fixture.Create(
+            importCleanupStore: store,
+            importCleanupInteraction: new CurrentImportCleanupInteraction());
+        fixture.ApplyReadyDraft();
+        var session = fixture.Import.SessionId;
+        var cleanup = fixture.ViewModel.ClearCurrentImportAsync();
+        await store.Started.Task;
+
+        fixture.ViewModel.Close();
+        var completedOnClose = await Task.WhenAny(cleanup, Task.Delay(250)) == cleanup;
+        if (!completedOnClose) store.Release();
+        await cleanup;
+
+        Assert.True(completedOnClose);
+        Assert.True(store.CancellationObserved);
+        Assert.False(store.ReturnedResult);
+        Assert.Equal(session, fixture.Import.SessionId);
+        Assert.Empty(fixture.ImportWorkflow.DiscardedSessions);
+        Assert.True(fixture.ViewModel.IsClosed);
+        Assert.True(fixture.Import.IsClosed);
+        Assert.False(fixture.Import.CanEdit);
+        Assert.False(fixture.ViewModel.CanClearCurrentImport);
+    }
+
+    [Fact]
     public async Task CleanupCompletionNeverResetsANewerImportedSession()
     {
         var store = new CurrentImportCleanupStore { Block = true };
@@ -3586,6 +3614,8 @@ public sealed class TransferWorkspaceViewModelTests
             new(LocalImportDraftCleanupDisposition.Deleted, 4);
         public Exception? Exception { get; set; }
         public bool Block { get; set; }
+        public bool CancellationObserved { get; private set; }
+        public bool ReturnedResult { get; private set; }
 
         public async Task<LocalImportDraftCleanupResult> DeleteAsync(
             Guid importSessionId,
@@ -3593,8 +3623,17 @@ public sealed class TransferWorkspaceViewModelTests
         {
             Sessions.Add(importSessionId);
             Started.TrySetResult();
-            if (Block) await release.Task.WaitAsync(cancellationToken);
+            try
+            {
+                if (Block) await release.Task.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                CancellationObserved = true;
+                throw;
+            }
             if (Exception is not null) throw Exception;
+            ReturnedResult = true;
             return Result;
         }
 

@@ -434,6 +434,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         excelOverrideAccountId = null;
         validationMessage = EvaluateValidation();
         statusMessage = string.Empty;
+        AccountSelectionNotice = string.Empty;
         suppressInvalidation = true;
         try
         {
@@ -452,6 +453,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         }
         currentStepIndex = 0;
         OnPropertyChanged(nameof(CurrentImportSessionId));
+        OnPropertyChanged(nameof(AccountSelectionNotice));
         OnPropertyChanged(nameof(MappedAccountIds));
         OnPropertyChanged(nameof(PrecheckAccountId));
         OnPropertyChanged(nameof(LastPrecheckResult));

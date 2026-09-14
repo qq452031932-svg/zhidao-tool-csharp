@@ -356,10 +356,11 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         if (!CanClearCurrentImport || Import.SessionId is not { } capturedSession) return;
         var capturedRowCount = Import.TotalRows;
         var cleanupAcquired = false;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         try
         {
             var confirmed = await currentImportCleanupInteraction
-                .ConfirmAsync(capturedRowCount, cancellationToken)
+                .ConfirmAsync(capturedRowCount, linked.Token)
                 .ConfigureAwait(true);
             if (!confirmed)
             {
@@ -374,8 +375,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             try
             {
                 var result = await importDraftCleanupService!
-                    .DeleteAsync(capturedSession, cancellationToken)
+                    .DeleteAsync(capturedSession, linked.Token)
                     .ConfigureAwait(true);
+                if (isClosed || linked.IsCancellationRequested) return;
                 if (result.Disposition is LocalImportDraftCleanupDisposition.Deleted or
                     LocalImportDraftCleanupDisposition.AlreadyAbsent)
                 {
