@@ -194,6 +194,7 @@
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
                             <RowDefinition Height="*" />
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
@@ -214,16 +215,23 @@
                              FontSize="15"
                              Text="{Binding Card, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                              AutomationProperties.Name="卡密输入" />
-                        <TextBlock x:Name="CardBindingHint"
+                        <TextBlock x:Name="CardExampleHint"
                                Style="{StaticResource ActivationBodyHintStyle}"
                                Grid.Row="2"
                                Margin="0,8,0,0"
+                               FontSize="12"
+                               Text="示例：XXXX-XXXX-XXXX"
+                               AutomationProperties.Name="卡密格式示例：XXXX-XXXX-XXXX" />
+                        <TextBlock x:Name="CardBindingHint"
+                               Style="{StaticResource ActivationBodyHintStyle}"
+                               Grid.Row="3"
+                               Margin="0,5,0,0"
                                FontSize="12"
                                Text="卡密将绑定当前电脑，请确认后激活"
                                TextWrapping="Wrap" />
                         <Border x:Name="ActivationStatusRegion"
                             Style="{StaticResource ActivationStatusRegionStyle}"
-                            Grid.Row="3"
+                            Grid.Row="4"
                             MinHeight="44"
                             Margin="0,15,0,16"
                             Padding="12,10"
@@ -237,7 +245,7 @@
                                    AutomationProperties.LiveSetting="Polite"
                                    AutomationProperties.Name="授权状态" />
                         </Border>
-                        <StackPanel Grid.Row="4"
+                        <StackPanel Grid.Row="5"
                                 HorizontalAlignment="Right"
                                 Orientation="Horizontal">
                         <Button x:Name="CancelButton"

@@ -117,7 +117,7 @@ public sealed class LicenseActivationViewModel : ObservableObject
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                throw;
+                return;
             }
             catch
             {

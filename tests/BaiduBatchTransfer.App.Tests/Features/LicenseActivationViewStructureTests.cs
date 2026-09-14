@@ -33,6 +33,7 @@ public sealed class LicenseActivationViewStructureTests
             .ToArray();
         Assert.Contains("软件授权", textBindings);
         Assert.Contains("请输入卡密", textBindings);
+        Assert.Contains("示例：XXXX-XXXX-XXXX", textBindings);
         Assert.Contains("卡密将绑定当前电脑，请确认后激活", textBindings);
         Assert.Contains("{Binding StatusMessage}", textBindings);
         Assert.Contains("{Binding ProductName}", textBindings);
@@ -85,6 +86,7 @@ public sealed class LicenseActivationViewStructureTests
             value.Contains("StatusMessage", StringComparison.Ordinal));
         Assert.Contains("授权状态", automationNames);
         Assert.Contains("卡密输入", automationNames);
+        Assert.Contains("卡密格式示例：XXXX-XXXX-XXXX", automationNames);
         Assert.Contains("{Binding ActivateButtonText}", automationNames);
         Assert.Contains("暂不激活", automationNames);
     }
@@ -139,6 +141,7 @@ public sealed class LicenseActivationViewStructureTests
 
         AssertElementStyle(document, "CardLabel", "ActivationBodyLabelStyle");
         AssertElementStyle(document, "CardInput", "ActivationTextBoxStyle");
+        AssertElementStyle(document, "CardExampleHint", "ActivationBodyHintStyle");
         AssertElementStyle(document, "CardBindingHint", "ActivationBodyHintStyle");
         AssertElementStyle(document, "ActivationStatusRegion", "ActivationStatusRegionStyle");
         AssertElementStyle(document, "ActivationStatusText", "ActivationStatusTextStyle");
@@ -291,7 +294,7 @@ public sealed class LicenseActivationViewStructureTests
     }
 
     [Fact]
-    public async Task ControlledCancellationCancelsTheAttemptBeforeClosingTheWindow()
+    public async Task ControlledCancellationCompletesTheRealCommandWithoutAnUnhandledDispatcherException()
     {
         await RunStaAsync(async () =>
         {
@@ -317,15 +320,49 @@ public sealed class LicenseActivationViewStructureTests
                 Card = "CARD"
             };
             var window = new LicenseActivationWindow(viewModel);
+            var dispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+            var unhandledExceptions = new List<Exception>();
+            System.Windows.Threading.DispatcherUnhandledExceptionEventHandler handler = (_, args) =>
+            {
+                unhandledExceptions.Add(args.Exception);
+                args.Handled = true;
+            };
+            dispatcher.UnhandledException += handler;
             window.Show();
-            var activation = viewModel.ActivateCommand.ExecuteAsync(null);
+            System.Windows.Input.ICommand command = viewModel.ActivateCommand;
+            command.Execute(null);
             await started.Task;
 
             window.CancelActivationAndClose();
 
             await cancellationObserved.Task;
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => activation);
-            Assert.False(window.IsVisible);
+            var execution = Assert.IsAssignableFrom<Task>(viewModel.ActivateCommand.ExecutionTask);
+            try
+            {
+                Exception? executionException = null;
+                try
+                {
+                    await execution;
+                }
+                catch (Exception error)
+                {
+                    executionException = error;
+                }
+                await dispatcher.InvokeAsync(
+                    () => { },
+                    System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+
+                Assert.Null(executionException);
+                Assert.Equal(TaskStatus.RanToCompletion, execution.Status);
+                Assert.False(viewModel.ActivateCommand.IsRunning);
+                Assert.False(viewModel.IsActivating);
+                Assert.False(window.IsVisible);
+                Assert.Empty(unhandledExceptions);
+            }
+            finally
+            {
+                dispatcher.UnhandledException -= handler;
+            }
         });
     }
 
