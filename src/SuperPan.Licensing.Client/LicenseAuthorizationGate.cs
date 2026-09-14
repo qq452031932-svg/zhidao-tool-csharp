@@ -52,6 +52,9 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
     private readonly IMachineFingerprintProvider fingerprintProvider;
     private readonly Action<string>? log;
     private readonly Action<AuthorizedLicenseSummary?>? publishSummary;
+    private readonly SemaphoreSlim leaseMutation = new(1, 1);
+    private readonly object publicationGate = new();
+    private long authorizationGeneration;
 
     public LicenseAuthorizationGate(
         string softwareId,
@@ -59,8 +62,19 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         ILicenseStateStore store,
         IMachineFingerprintProvider fingerprintProvider,
         TimeProvider? timeProvider = null,
-        Action<string>? log = null,
-        Action<AuthorizedLicenseSummary?>? publishSummary = null)
+        Action<string>? log = null)
+        : this(softwareId, service, store, fingerprintProvider, timeProvider, log, null)
+    {
+    }
+
+    public LicenseAuthorizationGate(
+        string softwareId,
+        ILicenseServiceClient service,
+        ILicenseStateStore store,
+        IMachineFingerprintProvider fingerprintProvider,
+        TimeProvider? timeProvider,
+        Action<string>? log,
+        Action<AuthorizedLicenseSummary?>? publishSummary)
     {
         if (string.IsNullOrWhiteSpace(softwareId) || softwareId != softwareId.Trim())
             throw new ArgumentException("The software identifier is invalid.", nameof(softwareId));
@@ -79,8 +93,19 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         ILicenseStateStore store,
         IMachineFingerprintProvider fingerprintProvider,
         TimeProvider? timeProvider = null,
-        Action<string>? log = null,
-        Action<AuthorizedLicenseSummary?>? publishSummary = null)
+        Action<string>? log = null)
+        : this(softwareId, new LicenseApiClientAdapter(service), store, fingerprintProvider, timeProvider, log, null)
+    {
+    }
+
+    public LicenseAuthorizationGate(
+        string softwareId,
+        LicenseApiClient service,
+        ILicenseStateStore store,
+        IMachineFingerprintProvider fingerprintProvider,
+        TimeProvider? timeProvider,
+        Action<string>? log,
+        Action<AuthorizedLicenseSummary?>? publishSummary)
         : this(softwareId, new LicenseApiClientAdapter(service), store, fingerprintProvider, timeProvider, log, publishSummary)
     {
     }
@@ -92,6 +117,7 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         CancellationToken cancellationToken)
     {
         if (!Enum.IsDefined(operation)) throw new ArgumentOutOfRangeException(nameof(operation));
+        var generation = BeginAuthorization();
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -99,7 +125,7 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
             var snapshot = await store.ReadAsync(cancellationToken).ConfigureAwait(false);
             if (snapshot.Credentials.Count == 0)
             {
-                return Publish(new LicenseGateResult(operation, false, false, ActivationRequired));
+                return Publish(new LicenseGateResult(operation, false, false, ActivationRequired), generation);
             }
 
             var candidates = snapshot.Credentials
@@ -112,12 +138,12 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
                 var response = await ValidateCredentialAsync(candidate.Credential, machineHash, cancellationToken).ConfigureAwait(false);
                 if (response.Kind == LicenseApiResultKind.Authorized)
                 {
-                    return await PersistAuthorizedAsync(operation, candidate.Credential, machineHash, response, cancellationToken)
+                    return await PersistAuthorizedAsync(operation, candidate.Credential, machineHash, response, generation, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 if (response.Kind == LicenseApiResultKind.Rejected)
                 {
-                    await store.RemoveLeaseAsync(candidate.Credential.Card, softwareId, machineHash, cancellationToken)
+                    await RemoveLeaseIfCurrentAsync(candidate.Credential.Card, machineHash, generation, cancellationToken)
                         .ConfigureAwait(false);
                     lastRejection = new LicenseGateResult(operation, false, false, SafeCode(response.Code));
                     continue;
@@ -127,11 +153,12 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
                     return Publish(candidate.CachedClaims is not null
                         ? new LicenseGateResult(operation, true, true, SafeCode(response.Code))
                         : new LicenseGateResult(operation, false, false, SafeCode(response.Code)),
+                        generation,
                         candidate.CachedClaims is not null ? CreateSummary(candidate.CachedClaims) : null);
                 }
-                return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable));
+                return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable), generation);
             }
-            return Publish(lastRejection ?? new LicenseGateResult(operation, false, false, ActivationRequired));
+            return Publish(lastRejection ?? new LicenseGateResult(operation, false, false, ActivationRequired), generation);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -139,12 +166,13 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         }
         catch
         {
-            return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable));
+            return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable), generation);
         }
     }
 
     public async Task<LicenseGateResult> ActivateAsync(string card, CancellationToken cancellationToken)
     {
+        var generation = BeginAuthorization();
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -155,22 +183,23 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
             if (response.Kind == LicenseApiResultKind.Authorized)
             {
                 return await PersistAuthorizedAsync(
-                    LicenseOperationKind.Startup, credential, machineHash, response, cancellationToken).ConfigureAwait(false);
+                    LicenseOperationKind.Startup, credential, machineHash, response, generation, cancellationToken).ConfigureAwait(false);
             }
             if (response.Kind == LicenseApiResultKind.Rejected)
             {
-                await store.RemoveLeaseAsync(credential.Card, softwareId, machineHash, cancellationToken).ConfigureAwait(false);
-                return Publish(new LicenseGateResult(LicenseOperationKind.Startup, false, false, SafeCode(response.Code)));
+                await RemoveLeaseIfCurrentAsync(credential.Card, machineHash, generation, cancellationToken).ConfigureAwait(false);
+                return Publish(new LicenseGateResult(LicenseOperationKind.Startup, false, false, SafeCode(response.Code)), generation);
             }
             if (response.Kind == LicenseApiResultKind.TemporaryFailure &&
                 FindVerifiedCachedClaims(credential, machineHash) is { } cachedClaims)
             {
                 return Publish(
                     new LicenseGateResult(LicenseOperationKind.Startup, true, true, SafeCode(response.Code)),
+                    generation,
                     CreateSummary(cachedClaims));
             }
             return Publish(new LicenseGateResult(LicenseOperationKind.Startup, false, false,
-                response.Kind == LicenseApiResultKind.TemporaryFailure ? SafeCode(response.Code) : AuthorizationUnavailable));
+                response.Kind == LicenseApiResultKind.TemporaryFailure ? SafeCode(response.Code) : AuthorizationUnavailable), generation);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -178,7 +207,7 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         }
         catch
         {
-            return Publish(new LicenseGateResult(LicenseOperationKind.Startup, false, false, AuthorizationUnavailable));
+            return Publish(new LicenseGateResult(LicenseOperationKind.Startup, false, false, AuthorizationUnavailable), generation);
         }
     }
 
@@ -189,27 +218,29 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         StoredLicenseCredential credential,
         string machineHash,
         LicenseApiResult response,
+        long generation,
         CancellationToken cancellationToken)
     {
         var signedEnvelope = response.SignedEnvelope;
         if (signedEnvelope is null || signedEnvelope.Length == 0)
         {
-            return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable));
+            return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable), generation);
         }
         try
         {
             var claims = service.VerifyCached(signedEnvelope, softwareId, machineHash);
             var lease = new StoredLicenseLease(claims.CardId!, claims.SoftwareId!, claims.MachineHash!, claims.PackageName!,
                 claims.ExpiresAt!.Value, claims.LeaseUntil!.Value, Convert.ToBase64String(signedEnvelope));
-            await store.SaveLeaseAsync(credential.Card, credential.ActivationRequestId, lease, cancellationToken)
+            await SaveLeaseAsync(credential.Card, credential.ActivationRequestId, lease, cancellationToken)
                 .ConfigureAwait(false);
             return Publish(
                 new LicenseGateResult(operation, true, false, LicenseCodes.Ok),
+                generation,
                 CreateSummary(claims));
         }
         catch (Exception exception) when (exception is LicenseEnvelopeVerificationException or FormatException or ArgumentException)
         {
-            return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable));
+            return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable), generation);
         }
     }
 
@@ -250,9 +281,16 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
 
     private LicenseGateResult Publish(
         LicenseGateResult result,
+        long generation,
         AuthorizedLicenseSummary? summary = null)
     {
-        try { publishSummary?.Invoke(summary); } catch { }
+        lock (publicationGate)
+        {
+            if (generation == authorizationGeneration)
+            {
+                try { publishSummary?.Invoke(summary); } catch { }
+            }
+        }
         var status = new LicenseGateStatusEventArgs(result);
         try { StatusChanged?.Invoke(this, status); } catch { }
         try { log?.Invoke(status.ToString()); } catch { }
@@ -265,6 +303,54 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
 
     private static AuthorizedLicenseSummary CreateSummary(LicenseClaims claims) =>
         new(claims.PackageName!, claims.ExpiresAt!.Value);
+
+    private long BeginAuthorization()
+    {
+        lock (publicationGate) return ++authorizationGeneration;
+    }
+
+    private bool IsCurrentGeneration(long generation)
+    {
+        lock (publicationGate) return generation == authorizationGeneration;
+    }
+
+    private async Task SaveLeaseAsync(
+        string card,
+        string activationRequestId,
+        StoredLicenseLease lease,
+        CancellationToken cancellationToken)
+    {
+        await leaseMutation.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await store.SaveLeaseAsync(card, activationRequestId, lease, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            leaseMutation.Release();
+        }
+    }
+
+    private async Task RemoveLeaseIfCurrentAsync(
+        string card,
+        string machineHash,
+        long generation,
+        CancellationToken cancellationToken)
+    {
+        await leaseMutation.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (IsCurrentGeneration(generation))
+            {
+                await store.RemoveLeaseAsync(card, softwareId, machineHash, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            leaseMutation.Release();
+        }
+    }
 
     private sealed class LicenseApiClientAdapter(LicenseApiClient client) : ILicenseServiceClient
     {

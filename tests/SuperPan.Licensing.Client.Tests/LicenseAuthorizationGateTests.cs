@@ -22,6 +22,24 @@ public sealed class LicenseAuthorizationGateTests
     }
 
     [Fact]
+    public void AuthorizationGateRetainsTheOriginalPublicConstructorSignatures()
+    {
+        var legacyTail = new[]
+        {
+            typeof(string),
+            typeof(ILicenseStateStore),
+            typeof(IMachineFingerprintProvider),
+            typeof(TimeProvider),
+            typeof(Action<string>),
+        };
+
+        Assert.NotNull(typeof(LicenseAuthorizationGate).GetConstructor(
+            [typeof(string), typeof(ILicenseServiceClient), .. legacyTail[1..]]));
+        Assert.NotNull(typeof(LicenseAuthorizationGate).GetConstructor(
+            [typeof(string), typeof(LicenseApiClient), .. legacyTail[1..]]));
+    }
+
+    [Fact]
     public async Task AuthorizationGateValidatesAtStartup()
     {
         var store = StoreWithLease(Lease());
@@ -330,6 +348,73 @@ public sealed class LicenseAuthorizationGateTests
     }
 
     [Fact]
+    public async Task NewerAuthorizationKeepsItsSummaryAndLeaseWhenOlderActivationRejectionFinishesLater()
+    {
+        var olderResponse = new TaskCompletionSource<LicenseApiResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var expiry = Now.AddDays(11);
+        var store = new MemoryStore([Credential()]);
+        var summaries = new List<AuthorizedLicenseSummary?>();
+        var gate = CreateGate(
+            new FakeService(olderResponse.Task, Authorized("最新套餐", expiry)),
+            store,
+            publishSummary: summaries.Add);
+
+        var older = gate.ActivateAsync("CARD-SECRET", CancellationToken.None);
+        var newer = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+        olderResponse.SetResult(Rejected(LicenseCodes.LicenseExpired));
+        var olderResult = await older;
+
+        Assert.True(newer.IsAuthorized);
+        Assert.False(olderResult.IsAuthorized);
+        Assert.Equal(new AuthorizedLicenseSummary("最新套餐", expiry), Assert.Single(summaries));
+        Assert.Single(Assert.Single(store.Snapshot.Credentials).Leases);
+    }
+
+    [Fact]
+    public async Task OlderAuthorizationSuccessPersistsWithoutOverwritingTheNewerActivationFailureSummary()
+    {
+        var olderResponse = new TaskCompletionSource<LicenseApiResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var expiry = Now.AddDays(12);
+        var store = new MemoryStore([Credential()]);
+        var summaries = new List<AuthorizedLicenseSummary?>();
+        var gate = CreateGate(
+            new FakeService(olderResponse.Task, Rejected(LicenseCodes.LicenseExpired)),
+            store,
+            publishSummary: summaries.Add);
+
+        var older = gate.AuthorizeAsync(LicenseOperationKind.Startup, CancellationToken.None);
+        var newer = await gate.ActivateAsync("CARD-SECRET", CancellationToken.None);
+        olderResponse.SetResult(Authorized("旧请求套餐", expiry));
+        var olderResult = await older;
+
+        Assert.False(newer.IsAuthorized);
+        Assert.True(olderResult.IsAuthorized);
+        Assert.Null(Assert.Single(summaries));
+        Assert.Equal("旧请求套餐", Assert.Single(Assert.Single(store.Snapshot.Credentials).Leases).PackageName);
+    }
+
+    [Fact]
+    public async Task ActivationPublishesVerifiedOnlineSummaryAndRejectionClearsIt()
+    {
+        var expiry = Now.AddDays(14);
+        AuthorizedLicenseSummary? current = null;
+        var gate = CreateGate(
+            new FakeService(Authorized("激活套餐", expiry), Rejected(LicenseCodes.LicenseExpired)),
+            new MemoryStore(),
+            publishSummary: summary => current = summary);
+
+        var authorized = await gate.ActivateAsync("CARD-SECRET", CancellationToken.None);
+        Assert.True(authorized.IsAuthorized);
+        Assert.Equal(new AuthorizedLicenseSummary("激活套餐", expiry), current);
+
+        var rejected = await gate.ActivateAsync("CARD-SECRET", CancellationToken.None);
+        Assert.False(rejected.IsAuthorized);
+        Assert.Null(current);
+    }
+
+    [Fact]
     public async Task AuthorizationGateRejectsDpapiRoundTripMetadataTamperingDuringOfflineFallback()
     {
         using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
@@ -513,7 +598,12 @@ public sealed class LicenseAuthorizationGateTests
         {
             Calls.Add((activate, requestId, card, machineHash));
             var response = responses.Count == 0 ? new LicenseApiResult(LicenseApiResultKind.InvalidResponse, null, null) : responses.Dequeue();
-            return response is Exception exception ? Task.FromException<LicenseApiResult>(exception) : Task.FromResult((LicenseApiResult)response);
+            return response switch
+            {
+                Exception exception => Task.FromException<LicenseApiResult>(exception),
+                Task<LicenseApiResult> pending => pending,
+                _ => Task.FromResult((LicenseApiResult)response),
+            };
         }
     }
 

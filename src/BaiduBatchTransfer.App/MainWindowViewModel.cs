@@ -129,7 +129,6 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     public string LicenseExpiryDisplay => licenseSummary is null
         ? "未激活"
         : licenseSummary.ExpiresAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
-    public bool IsLicenseSummaryVisible => licenseSummary is not null;
     public object BatchTransferWorkspace => batchTransferWorkspace;
     public object CurrentContent { get => currentContent; private set => SetProperty(ref currentContent, value); }
     public string CurrentWorkspaceTitle { get => currentWorkspaceTitle; private set => SetProperty(ref currentWorkspaceTitle, value); }
@@ -360,7 +359,6 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         licenseSummary = summary;
         OnPropertyChanged(nameof(LicensePackageDisplay));
         OnPropertyChanged(nameof(LicenseExpiryDisplay));
-        OnPropertyChanged(nameof(IsLicenseSummaryVisible));
     }
 
     private async Task RefreshAccountsAsync(CancellationToken cancellationToken)

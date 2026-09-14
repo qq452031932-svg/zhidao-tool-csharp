@@ -599,7 +599,6 @@ public sealed class MainWindowViewModelTests
         state.PublishSummary(new AuthorizedLicenseSummary("基础版", initialExpiry));
         var vm = CreateViewModel(new FakeLoginLauncher(), licenseAuthorizationState: state);
 
-        Assert.True(vm.IsLicenseSummaryVisible);
         Assert.Equal("基础版", vm.LicensePackageDisplay);
         Assert.Equal(initialExpiry.ToLocalTime().ToString("yyyy-MM-dd HH:mm"), vm.LicenseExpiryDisplay);
 
@@ -610,13 +609,13 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(refreshedExpiry.ToLocalTime().ToString("yyyy-MM-dd HH:mm"), vm.LicenseExpiryDisplay);
 
         state.PublishSummary(null);
-        Assert.False(vm.IsLicenseSummaryVisible);
         Assert.Equal("未激活", vm.LicensePackageDisplay);
         Assert.Equal("未激活", vm.LicenseExpiryDisplay);
 
         vm.Close();
         state.PublishSummary(new AuthorizedLicenseSummary("关闭后套餐", refreshedExpiry));
         Assert.Equal("未激活", vm.LicensePackageDisplay);
+        Assert.Null(typeof(MainWindowViewModel).GetProperty("IsLicenseSummaryVisible"));
     }
 
     [Fact]

@@ -201,8 +201,13 @@ public static class LicenseAuthorizationGateFactory
 {
     public static ILicenseAuthorizationGate Create(
         LicenseClientOptions options,
-        string? statePath = null,
-        Action<AuthorizedLicenseSummary?>? publishSummary = null)
+        string? statePath = null) =>
+        Create(options, statePath, null);
+
+    public static ILicenseAuthorizationGate Create(
+        LicenseClientOptions options,
+        string? statePath,
+        Action<AuthorizedLicenseSummary?>? publishSummary)
     {
         ArgumentNullException.ThrowIfNull(options);
         var client = new LicenseApiClient(options);
@@ -211,7 +216,9 @@ public static class LicenseAuthorizationGateFactory
             client,
             new DpapiLicenseStore(statePath),
             new MachineFingerprintProvider(),
-            publishSummary: publishSummary);
+            null,
+            null,
+            publishSummary);
     }
 }
 
@@ -250,7 +257,8 @@ public static class LicenseServiceRegistration
             sp.GetRequiredService<ILicenseStateStore>(),
             sp.GetRequiredService<IMachineFingerprintProvider>(),
             TimeProvider.System,
-            publishSummary: sp.GetRequiredService<LicenseRuntimeAuthorizationState>().PublishSummary));
+            null,
+            sp.GetRequiredService<LicenseRuntimeAuthorizationState>().PublishSummary));
         services.AddSingleton<ILicenseAuthorizationGate>(sp =>
             sp.GetRequiredService<LicenseAuthorizationGate>());
     }

@@ -119,6 +119,50 @@ public sealed class LicenseAcceptanceSmokeRunnerTests : IDisposable
     }
 
     [Fact]
+    public void RealFactoryRetainsTheOriginalPublicSignatureAlongsideTheCallbackOverload()
+    {
+        var methods = typeof(LicenseAuthorizationGateFactory).GetMethods()
+            .Where(method => method.Name == nameof(LicenseAuthorizationGateFactory.Create))
+            .Select(method => method.GetParameters().Select(parameter => parameter.ParameterType).ToArray())
+            .ToArray();
+
+        Assert.Contains(methods, parameters => parameters.SequenceEqual(
+            [typeof(LicenseClientOptions), typeof(string)]));
+        Assert.Contains(methods, parameters => parameters.SequenceEqual(
+            [typeof(LicenseClientOptions), typeof(string), typeof(Action<AuthorizedLicenseSummary?>)]));
+    }
+
+    [Fact]
+    public async Task ProductionRegistrationConnectsTheGateToTheRegisteredRuntimeState()
+    {
+        using var signingKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var buildInfo = new LicenseRuntimeBuildInfo(
+            LicenseRuntimeMode.Production,
+            IsAcceptanceBuild: false,
+            LicenseAcceptanceSmokeRunner.ProductId,
+            "https://ota.fanfh.cn/",
+            "production-v1",
+            Convert.ToBase64String(signingKey.ExportSubjectPublicKeyInfo()),
+            [new string('a', 64), new string('b', 64)]);
+        var services = new ServiceCollection();
+        LicenseServiceRegistration.Add(
+            services,
+            buildInfo,
+            [],
+            Path.Combine(root, "production-license-state.dat"));
+        using var provider = services.BuildServiceProvider();
+        var state = provider.GetRequiredService<LicenseRuntimeAuthorizationState>();
+        state.PublishSummary(new AuthorizedLicenseSummary("旧套餐", DateTimeOffset.UtcNow.AddDays(1)));
+
+        var result = await provider.GetRequiredService<ILicenseAuthorizationGate>()
+            .AuthorizeAsync(LicenseOperationKind.Startup, CancellationToken.None);
+
+        Assert.Equal("activation_required", result.Code);
+        Assert.Null(state.CurrentSummary);
+        Assert.Same(state, provider.GetRequiredService<LicenseRuntimeAuthorizationState>());
+    }
+
+    [Fact]
     public void AcceptanceRegistrationUsesTaskNineClientStoreFingerprintAndGate()
     {
         var services = new ServiceCollection();
