@@ -3,9 +3,27 @@ using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
-public sealed class SqliteLocalImportDraftCleanupStore(
-    SqliteConnectionFactory connectionFactory) : ILocalImportDraftCleanupStore
+public sealed class SqliteLocalImportDraftCleanupStore : ILocalImportDraftCleanupStore
 {
+    private readonly SqliteConnectionFactory connectionFactory;
+    private readonly Action transactionStarting;
+    private readonly Func<CancellationToken, Task> transactionAcquired;
+
+    public SqliteLocalImportDraftCleanupStore(SqliteConnectionFactory connectionFactory)
+        : this(connectionFactory, static () => { }, static _ => Task.CompletedTask)
+    {
+    }
+
+    internal SqliteLocalImportDraftCleanupStore(
+        SqliteConnectionFactory connectionFactory,
+        Action transactionStarting,
+        Func<CancellationToken, Task> transactionAcquired)
+    {
+        this.connectionFactory = connectionFactory ?? throw new ArgumentNullException(nameof(connectionFactory));
+        this.transactionStarting = transactionStarting ?? throw new ArgumentNullException(nameof(transactionStarting));
+        this.transactionAcquired = transactionAcquired ?? throw new ArgumentNullException(nameof(transactionAcquired));
+    }
+
     public async Task<LocalImportDraftCleanupResult> DeleteAsync(
         Guid importSessionId,
         CancellationToken cancellationToken = default)
@@ -16,10 +34,12 @@ public sealed class SqliteLocalImportDraftCleanupStore(
         await using var connection = await connectionFactory
             .OpenConnectionAsync(cancellationToken)
             .ConfigureAwait(false);
+        transactionStarting();
         await using var transaction = connection.BeginTransaction(deferred: false);
 
         try
         {
+            await transactionAcquired(cancellationToken).ConfigureAwait(false);
             var sessionId = importSessionId.ToString("D");
             if (!await ExistsAsync(connection, transaction, """
                 SELECT EXISTS(SELECT 1 FROM ImportSessions WHERE Id=$session);
@@ -83,6 +103,7 @@ public sealed class SqliteLocalImportDraftCleanupStore(
                 WHERE payload.StagedImportRowId IN (
                     SELECT Id FROM TargetImportDraftStagedRows);
                 """, sessionId, cancellationToken).ConfigureAwait(false);
+            var deletedStagedRowCount = ToDeletedStagedRowCount(stagedRowCount);
 
             var deletedStagedRows = await ExecuteAsync(connection, transaction,
                 "DELETE FROM StagedImportRows WHERE ImportSessionId=$session;",
@@ -116,7 +137,7 @@ public sealed class SqliteLocalImportDraftCleanupStore(
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return new(
                 LocalImportDraftCleanupDisposition.Deleted,
-                checked((int)stagedRowCount));
+                deletedStagedRowCount);
         }
         catch
         {
@@ -131,6 +152,9 @@ public sealed class SqliteLocalImportDraftCleanupStore(
             throw;
         }
     }
+
+    internal static int ToDeletedStagedRowCount(long stagedRowCount) =>
+        checked((int)stagedRowCount);
 
     private static async Task<bool> ExistsAsync(
         SqliteConnection connection,

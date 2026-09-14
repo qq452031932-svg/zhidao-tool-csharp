@@ -116,20 +116,59 @@ public sealed class SqliteLocalImportDraftCleanupStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task ConcurrentCallsSerializeAndSecondCallIsAlreadyAbsent()
+    public async Task SecondImmediateTransactionStartsBeforeFirstCommitsAndSeesAlreadyAbsent()
     {
         var graph = await CreateAsync();
         await SeedDraftAsync(graph.Factory, graph.SessionId, stagedRowCount: 3);
+        var firstTransactionAcquired = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstTransaction = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondTransactionStarting = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var transactionStartCount = 0;
+        var transactionAcquireCount = 0;
+        var store = new SqliteLocalImportDraftCleanupStore(
+            graph.Factory,
+            () =>
+            {
+                if (Interlocked.Increment(ref transactionStartCount) == 2)
+                    secondTransactionStarting.TrySetResult();
+            },
+            async cancellationToken =>
+            {
+                if (Interlocked.Increment(ref transactionAcquireCount) != 1) return;
+                firstTransactionAcquired.TrySetResult();
+                await releaseFirstTransaction.Task.WaitAsync(cancellationToken);
+            });
 
-        var results = await Task.WhenAll(
-            graph.Store.DeleteAsync(graph.SessionId),
-            graph.Store.DeleteAsync(graph.SessionId));
+        var first = Task.Run(() => store.DeleteAsync(graph.SessionId));
+        await firstTransactionAcquired.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var second = Task.Run(() => store.DeleteAsync(graph.SessionId));
+        await secondTransactionStarting.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(first.IsCompleted);
+        Assert.False(second.IsCompleted);
+        Assert.Equal(1, Volatile.Read(ref transactionAcquireCount));
 
+        releaseFirstTransaction.TrySetResult();
+        var results = await Task.WhenAll(first, second);
+
+        Assert.Equal(2, transactionStartCount);
+        Assert.Equal(2, transactionAcquireCount);
         Assert.Single(results, result =>
             result == new LocalImportDraftCleanupResult(LocalImportDraftCleanupDisposition.Deleted, 3));
         Assert.Single(results, result =>
             result == new LocalImportDraftCleanupResult(LocalImportDraftCleanupDisposition.AlreadyAbsent, 0));
         await AssertCountsAsync(graph.Factory, graph.SessionId, 0, 0, 0, 0);
+    }
+
+    [Fact]
+    public void DeletedStagedRowCountConversionRejectsOverflow()
+    {
+        Assert.Equal(int.MaxValue,
+            SqliteLocalImportDraftCleanupStore.ToDeletedStagedRowCount(int.MaxValue));
+        Assert.Throws<OverflowException>(() =>
+            SqliteLocalImportDraftCleanupStore.ToDeletedStagedRowCount((long)int.MaxValue + 1));
     }
 
     private async Task<Graph> CreateAsync()
