@@ -9,6 +9,15 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), "history-cleanup-" + Guid.NewGuid().ToString("N"));
     private const string At = "2026-09-01T00:00:00Z";
+    private const string RetryableTransferFailureSql = """
+        DELETE FROM WebAutomationDirectoryMutations WHERE OperationId='target-share';
+        DELETE FROM WebAutomationAttempts WHERE OperationId='target-share';
+        DELETE FROM ShareOperations WHERE Id='target-share';
+        UPDATE BatchJobs SET ShareOperationCount=0 WHERE Id='target';
+        UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',SubmitState='NotPrepared',TargetSlotState='Released'
+        WHERE Id='target-transfer';
+        UPDATE AccountAllocations SET FailedItemCount=1,TargetSuccessCount=1,EffectiveTargetSuccessCount=1 WHERE BatchJobId='target';
+        """;
 
     [Theory]
     [InlineData(LocalHistoryKind.Transfer)]
@@ -82,7 +91,8 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
         yield return [LocalHistoryKind.Transfer, "UPDATE ShareOperations SET Status='WaitingTransfer',ExactItemSetFingerprint=NULL,LeaseGeneration=0 WHERE Id='target-share'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE ShareOperations SET Status='Failed',SubmissionAcceptance='DefinitelyNotAccepted',NextReconcileAt='2099-01-01' WHERE Id='target-share'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE ShareOperations SET Status='Failed',RequestDescriptorJson='{}' WHERE Id='target-share'"];
-        yield return [LocalHistoryKind.Transfer, "UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',SubmitState='NotPrepared',TargetSlotState='Released' WHERE Id='target-transfer'"];
+        yield return [LocalHistoryKind.Transfer, RetryableTransferFailureSql];
+        yield return [LocalHistoryKind.Transfer, "UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',SubmitState='NotPrepared',TargetSlotState='Released',AdapterRequestId='unresolved-request' WHERE Id='target-transfer'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE TransferOperations SET SubmitState='PendingConfirmation',ConfirmationDescriptorJson='{}' WHERE Id='target-transfer'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE TransferOperations SET TargetSlotState='Reserved' WHERE Id='target-transfer'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE TransferOperations SET LeaseExpiresAt='2099-01-01' WHERE Id='target-transfer'"];
@@ -252,6 +262,110 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
         await Assert.ThrowsAsync<InvalidDataException>(() => DeleteCurrentAsync(store, LocalHistoryKind.Transfer));
         Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM BatchJobs"));
         Assert.Equal(2, await CountAsync(f, "SELECT count(*) FROM WebAutomationAttempts"));
+    }
+
+    [Theory]
+    [InlineData("Transfer", "Intent", "DefinitelyNotSubmitted")]
+    [InlineData("Transfer", "OutcomeUnknown", "DefinitelyNotSubmitted")]
+    [InlineData("TransferShare", "Intent", "DefinitelyNotSubmitted")]
+    [InlineData("TransferShare", "OutcomeUnknown", "DefinitelyNotSubmitted")]
+    [InlineData("StandaloneShare", "Intent", "DefinitelyNotSubmitted")]
+    [InlineData("StandaloneShare", "OutcomeUnknown", "DefinitelyNotSubmitted")]
+    [InlineData("Transfer", "Intent", "Succeeded")]
+    [InlineData("Transfer", "OutcomeUnknown", "Succeeded")]
+    [InlineData("TransferShare", "Intent", "Succeeded")]
+    [InlineData("TransferShare", "OutcomeUnknown", "Succeeded")]
+    [InlineData("StandaloneShare", "Intent", "Succeeded")]
+    [InlineData("StandaloneShare", "OutcomeUnknown", "Succeeded")]
+    public async Task UnresolvedDirectoryMutationBlocksCleanupDespiteTerminalOwnerAndAttempt(
+        string owner, string mutationState, string attemptState)
+    {
+        var kind = owner == "StandaloneShare" ? LocalHistoryKind.StandaloneShare : LocalHistoryKind.Transfer;
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, kind, "target", "Cancelled");
+        await AddEvidenceAsync(f, kind, "target");
+        await ExecuteAsync(f, "UPDATE WebAutomationAttempts SET State=$state WHERE OwnerKind=$owner;",
+            ("$state", attemptState), ("$owner", owner));
+        var confirmed = await store.PreviewAsync(kind);
+        Assert.False(confirmed.HasConflicts);
+        await ExecuteAsync(f, """
+            UPDATE WebAutomationDirectoryMutations SET State=$state
+            WHERE OperationId IN (SELECT OperationId FROM WebAutomationAttempts WHERE OwnerKind=$owner);
+            """, ("$state", mutationState), ("$owner", owner));
+        var preview = await store.PreviewAsync(kind);
+        Assert.True(preview.HasConflicts);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, (await store.DeleteAsync(preview)).Disposition);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, (await store.DeleteAsync(confirmed)).Disposition);
+        Assert.Equal(1, await CountAsync(f, $"SELECT count(*) FROM {BatchTable(kind)}"));
+        Assert.Equal(kind == LocalHistoryKind.Transfer ? 2 : 1, await CountAsync(f, "SELECT count(*) FROM WebAutomationDirectoryMutations"));
+        Assert.Equal(kind == LocalHistoryKind.Transfer ? 2 : 1, await CountAsync(f, "SELECT count(*) FROM WebAutomationAttempts"));
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM LocalResultExports"));
+    }
+
+    [Theory]
+    [InlineData("GloballyInvalid", "Invalid", "NotPrepared")]
+    [InlineData("GloballyInvalid", "Invalid", "PreparingToSubmit")]
+    [InlineData("GloballyInvalid", "Valid", "NotPrepared")]
+    [InlineData("Failed", "Invalid", "NotPrepared")]
+    public async Task ConfirmedNonretryableFailureCanBeDeletedFromCompletedWithShortfall(
+        string outcome, string validity, string submitState)
+    {
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target", "CompletedWithShortfall");
+        await ExecuteAsync(f, RetryableTransferFailureSql);
+        await ExecuteAsync(f, """
+            UPDATE TransferOperations SET OutcomeKind=$outcome,SubmitState=$submit WHERE Id='target-transfer';
+            UPDATE ResourceItems SET GlobalValidityStatus=$validity WHERE Id='target-resource';
+            """, ("$outcome", outcome), ("$submit", submitState), ("$validity", validity));
+        var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.Equal(1, preview.TerminalBatchCount);
+        Assert.False(preview.HasConflicts);
+        var result = await store.DeleteAsync(preview);
+        Assert.Equal(LocalHistoryCleanupDisposition.Deleted, result.Disposition);
+        Assert.Equal(1, result.DeletedBatchCount);
+        Assert.Equal(0, await CountAsync(f, "SELECT count(*) FROM BatchJobs"));
+        Assert.Equal(0, await CountAsync(f, "SELECT count(*) FROM TransferOperations"));
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM Accounts"));
+        await AssertNoForeignKeyIssuesAsync(f);
+    }
+
+    [Theory]
+    [InlineData("NotPrepared")]
+    [InlineData("PreparingToSubmit")]
+    public async Task GenuinelyRetryableTransferFailureBlocksCleanup(string submitState)
+    {
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target", "CompletedWithShortfall");
+        await ExecuteAsync(f, RetryableTransferFailureSql);
+        await ExecuteAsync(f, "UPDATE TransferOperations SET SubmitState=$submit WHERE Id='target-transfer';", ("$submit", submitState));
+        var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.True(preview.HasConflicts);
+        var result = await store.DeleteAsync(preview);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, result.Disposition);
+        Assert.Equal(0, result.DeletedBatchCount);
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM TransferOperations WHERE OutcomeKind='Failed'"));
+    }
+
+    [Theory]
+    [InlineData("Unknown")]
+    [InlineData("DefinitelyNotAccepted")]
+    public async Task GenuinelyRetryableShareFailureBlocksCleanup(string submissionAcceptance)
+    {
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target", "CompletedWithShortfall");
+        await ExecuteAsync(f, """
+            UPDATE TransferOperations SET SubmitState='ResultReceived',ConfirmationDescriptorJson='{}',RemoteItemIdsJson='["remote"]'
+            WHERE Id='target-transfer';
+            UPDATE ShareOperations SET Status='Failed',SubmissionAcceptance=$acceptance WHERE Id='target-share';
+            """, ("$acceptance", submissionAcceptance));
+        var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.True(preview.HasConflicts);
+        var result = await store.DeleteAsync(preview);
+        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, result.Disposition);
+        Assert.Equal(0, result.DeletedBatchCount);
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM ShareOperations WHERE Status='Failed'"));
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM ShareOperationGenerations"));
+        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM ShareOperationRemoteItems"));
     }
 
     [Fact]

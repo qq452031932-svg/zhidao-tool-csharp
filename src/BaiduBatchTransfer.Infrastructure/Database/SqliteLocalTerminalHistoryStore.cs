@@ -138,6 +138,8 @@ public sealed class SqliteLocalTerminalHistoryStore : ILocalTerminalHistoryStore
     private static async Task<bool> HasConflictsAsync(SqliteConnection c, SqliteTransaction tx, LocalHistoryKind kind, CancellationToken token)
     {
         var owner = kind == LocalHistoryKind.Transfer ? "TransferBatch" : "StandaloneShareBatch";
+        // A terminal transfer/share attempt does not resolve a separate directory mutation,
+        // including an intent from an older generation or one without an attempt FK.
         if (await ExistsAsync(c, tx, $"""
             SELECT 1 FROM LocalResultExports WHERE OwnerKind='{owner}' AND OwnerId IN ({Batches})
               AND (Status='InProgress' OR {ActiveLease})
@@ -146,15 +148,36 @@ public sealed class SqliteLocalTerminalHistoryStore : ILocalTerminalHistoryStore
             JOIN temp.HistoryOperations target ON target.Id=attempt.OperationId
             WHERE attempt.State NOT IN ('Succeeded','DefinitelyNotSubmitted') OR attempt.IsWaitingForUser<>0
               OR attempt.ResumeStage IS NOT NULL OR attempt.OwnerKind<>target.OwnerKind OR attempt.AccountId<>target.AccountId
+            UNION ALL
+            SELECT 1 FROM WebAutomationDirectoryMutations mutation
+            JOIN temp.HistoryOperations target ON target.Id=mutation.OperationId
+            WHERE mutation.State<>'Confirmed'
             """, token).ConfigureAwait(false)) return true;
         if (kind == LocalHistoryKind.Transfer)
+        {
+            var safeRetryPredicate = SqliteRetryFailedTransferSafety.Predicate(
+                "o", "b", "r", "allocation", "account", "output", "settings");
             return await ExistsAsync(c, tx, $"""
                 SELECT 1 FROM TransferOperations WHERE Id IN ({Transfers}) AND (
                     Status NOT IN ('Succeeded','Failed','Cancelled') OR {ActiveLease}
                     OR SubmitState IN ('Submitting','PendingConfirmation') OR TargetSlotState='Reserved'
-                    OR (Status='Failed' AND SubmitState IN ('NotPrepared','PreparingToSubmit'))
+                    OR (Status='Failed' AND SubmitState IN ('NotPrepared','PreparingToSubmit')
+                        AND (DailyCountedAt IS NOT NULL OR ConfirmationDescriptorJson IS NOT NULL
+                            OR SubmitStartedAt IS NOT NULL OR AdapterRequestId IS NOT NULL OR RemoteItemIdsJson IS NOT NULL))
                     OR (Status='Cancelled' AND (SubmitStartedAt IS NOT NULL OR AdapterRequestId IS NOT NULL
                         OR ConfirmationDescriptorJson IS NOT NULL OR DailyCountedAt IS NOT NULL)))
+                UNION ALL
+                SELECT 1 FROM TransferOperations o
+                JOIN BatchJobs b ON b.Id=o.BatchJobId
+                JOIN ResourceItems r ON r.Id=o.ResourceItemId
+                JOIN AccountAllocations allocation ON allocation.BatchJobId=o.BatchJobId AND allocation.AccountId=o.AssignedAccountId
+                JOIN Accounts account ON account.Id=o.AssignedAccountId
+                LEFT JOIN BatchOutputAccounts output ON output.BatchJobId=o.BatchJobId AND output.AccountId=o.AssignedAccountId
+                LEFT JOIN BatchShareSettings settings ON settings.BatchJobId=o.BatchJobId
+                WHERE o.Id IN ({Transfers}) AND b.AcceptanceOnly=0 AND ({safeRetryPredicate})
+                UNION ALL
+                SELECT 1 FROM ShareOperations operation WHERE operation.Id IN ({Shares})
+                  AND operation.Status='Failed' AND ({SqliteShareRequeueSafety.Predicate("operation")})
                 UNION ALL
                 SELECT 1 FROM ShareOperations WHERE Id IN ({Shares}) AND (
                     Status NOT IN ('Succeeded','ReusedExisting','Failed','Cancelled') OR {ActiveLease}
@@ -173,6 +196,9 @@ public sealed class SqliteLocalTerminalHistoryStore : ILocalTerminalHistoryStore
                 SELECT 1 FROM ExecutionLogs WHERE BatchJobId IS NOT NULL AND BatchJobId NOT IN ({Batches})
                   AND (TransferOperationId IN ({Transfers}) OR ResourceItemId IN ({Resources}))
                 """, token).ConfigureAwait(false);
+        }
+        // Failed NotStarted/DefinitelyNotAccepted is the exact CanSafelyRetry gate used by
+        // StandaloneShareOperationRecord and SqliteStandaloneShareStore.TryRetryFailedOperationAsync.
         return await ExistsAsync(c, tx, $"""
             SELECT 1 FROM StandaloneShareOperations WHERE Id IN ({Standalones}) AND (
                 Status NOT IN ('Succeeded','Failed','Cancelled') OR {ActiveLease}

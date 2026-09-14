@@ -857,7 +857,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
 
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
-        await using var command = Command(connection, transaction, """
+        await using var command = Command(connection, transaction, $"""
             UPDATE ShareOperations SET
               Status='WaitingShare',Generation=Generation+1,LeaseGeneration=LeaseGeneration+1,
               RequestDescriptorJson=NULL,AdapterRequestId=NULL,SubmissionAcceptance='Unknown',AttemptCount=0,
@@ -865,37 +865,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
               BaselineGeneration=NULL,BaselineFingerprint=NULL,BaselineShareCount=0,BaselineCompletedAt=NULL,
               LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$updated
             WHERE Id=$id AND Status=$status AND Generation=$generation AND UpdatedAt=$expectedUpdated
-              AND ($status<>'Paused' OR COALESCE(LastErrorCode,'') NOT IN (
-                'AwaitingExistingShareDecision','CancelledByUser','IncompatibleExistingShare'))
-              AND (SubmitStartedAt IS NULL OR SubmissionAcceptance='DefinitelyNotAccepted')
-              AND EXISTS(SELECT 1 FROM TransferOperations transfer
-                WHERE transfer.Id=ShareOperations.TransferOperationId
-                  AND transfer.Status='Succeeded' AND transfer.SubmitState='ResultReceived'
-                  AND transfer.RemoteItemIdsJson IS NOT NULL AND length(trim(transfer.RemoteItemIdsJson))>2)
-              AND EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
-                WHERE lineage.ShareOperationId=ShareOperations.Id AND lineage.Generation=ShareOperations.Generation
-                  AND lineage.ExactItemCount>0
-                  AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems remote
-                    WHERE remote.ShareOperationId=ShareOperations.Id))
-              AND EXISTS(SELECT 1 FROM BatchJobs batch
-                WHERE batch.Id=ShareOperations.BatchJobId
-                  AND batch.Status IN ('Active','CompletedWithShortfall') AND batch.AcceptanceOnly=0)
-              AND EXISTS(SELECT 1 FROM Accounts account
-                WHERE account.Id=ShareOperations.AccountId AND account.Status='Active'
-                  AND account.IsEnabled=1 AND account.IsDeleted=0)
-              AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
-                WHERE output.BatchJobId=ShareOperations.BatchJobId
-                  AND output.AccountId=ShareOperations.AccountId
-                  AND output.OutputOrdinal=ShareOperations.OutputOrdinal AND output.ShareEnabled=1)
-              AND EXISTS(SELECT 1 FROM BatchShareSettings settings
-                WHERE settings.BatchJobId=ShareOperations.BatchJobId
-                  AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint)
-              AND NOT EXISTS(SELECT 1 FROM ShareOperations active
-                WHERE active.Id<>ShareOperations.Id AND active.AccountId=ShareOperations.AccountId
-                  AND active.ExactItemSetFingerprint=ShareOperations.ExactItemSetFingerprint
-                  AND active.SettingsFingerprint=ShareOperations.SettingsFingerprint
-                  AND active.Generation=ShareOperations.Generation+1
-                  AND active.Status IN ('WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused'));
+              AND {SqliteShareRequeueSafety.Predicate("ShareOperations")};
             """);
         Add(command, "$id", Id(operationId));
         Add(command, "$status", expectedStatus.ToString());
