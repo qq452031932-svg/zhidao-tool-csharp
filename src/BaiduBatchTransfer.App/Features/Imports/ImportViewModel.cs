@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Imports;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -115,6 +116,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     private int mutationRequests;
     private int pageRequests;
     private bool externalCleanupBusy;
+    private CurrentImportActivityGate activityGate = new();
 
     public ImportViewModel(
         IImportWorkflow workflow,
@@ -200,6 +202,14 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         RaiseCommands();
     }
 
+    internal void AttachActivityGate(CurrentImportActivityGate value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (activityGate.HasActiveActivities)
+            throw new InvalidOperationException("Cannot replace the current-import activity gate while an operation is active.");
+        activityGate = value;
+    }
+
     public bool TryResetAfterSuccessfulCleanup(Guid expectedSessionId)
     {
         if (expectedSessionId == Guid.Empty || sessionId != expectedSessionId) return false;
@@ -243,6 +253,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     public async Task ImportTextAsync(CancellationToken cancellationToken = default)
     {
         if (!CanEdit) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         var newSessionId = Guid.NewGuid();
         BeginNewImport();
         await RunImportAsync(
@@ -255,6 +267,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     public async Task ImportExcelAsync(string filePath, CancellationToken cancellationToken = default)
     {
         if (!CanEdit || string.IsNullOrWhiteSpace(filePath)) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         var newSessionId = Guid.NewGuid();
         BeginNewImport();
         await RunImportAsync(
@@ -267,6 +281,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     public async Task SelectAndImportExcelAsync(CancellationToken cancellationToken = default)
     {
         if (!CanEdit) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         StatusMessage = "请选择 Excel 文件";
         var path = await dialogService.PickExcelFileAsync(linked.Token);
@@ -284,6 +300,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     public async Task ResumeImportAsync(CancellationToken cancellationToken = default)
     {
         if (!CanEdit || sessionId is null) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         await RunImportAsync(
             sessionId.Value,
             isResume: true,
@@ -293,14 +311,18 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
 
     public async Task LoadFirstPageAsync(CancellationToken cancellationToken = default)
     {
-        if (!CanEdit) return;
+        if (isClosed || externalCleanupBusy) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         nextCursor = null;
         await LoadPageAsync(null, cancellationToken);
     }
 
     public async Task LoadNextPageAsync(CancellationToken cancellationToken = default)
     {
-        if (!CanEdit || nextCursor is null) return;
+        if (isClosed || externalCleanupBusy || nextCursor is null) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         await LoadPageAsync(nextCursor, cancellationToken);
     }
 
@@ -376,6 +398,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         CancellationToken cancellationToken)
     {
         if (isClosed || externalCleanupBusy) return false;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return false;
         var generation = Interlocked.Increment(ref mutationGeneration);
         if (Interlocked.Increment(ref mutationRequests) == 1) IsBusy = true;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);

@@ -4,6 +4,7 @@ using System.IO;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Domain;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -73,6 +74,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private string resultDirectory = string.Empty;
     private string existingSharePolicy = "Ask";
     private bool externalCleanupBusy;
+    private CurrentImportActivityGate activityGate = new();
 
     public event EventHandler<Guid>? JobCreated;
 
@@ -388,6 +390,14 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         NotifyEditCommands();
     }
 
+    internal void AttachActivityGate(CurrentImportActivityGate value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (activityGate.HasActiveActivities)
+            throw new InvalidOperationException("Cannot replace the current-import activity gate while an operation is active.");
+        activityGate = value;
+    }
+
     public bool TryDetachAfterSuccessfulCleanup(Guid expectedSessionId)
     {
         if (expectedSessionId == Guid.Empty || importSessionId != expectedSessionId) return false;
@@ -625,6 +635,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task SelectModeAsync(TransferMode mode, CancellationToken cancellationToken = default)
     {
         if (externalCleanupBusy) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         if (importSessionId == Guid.Empty) { SelectMode(mode); return; }
         var session = importSessionId;
         var generation = draftGeneration;
@@ -648,6 +660,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task IgnoreExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
         if (externalCleanupBusy || importSessionId == Guid.Empty || transferMode is null) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         var session = importSessionId;
         var generation = draftGeneration;
         var mode = transferMode.Value;
@@ -671,6 +685,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task AutoMapUniqueExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
         if (externalCleanupBusy || importSessionId == Guid.Empty || transferMode != Core.Domain.TransferMode.Distribution) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         var session = importSessionId;
         var generation = draftGeneration;
         var mode = transferMode.Value;
@@ -698,6 +714,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task OverrideAllExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
         if (externalCleanupBusy || importSessionId == Guid.Empty || transferMode is null) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         var account = ExcelOverrideAccountId is { } accountId
             ? Accounts.FirstOrDefault(x => x.AccountId == accountId && x.IsSelected)
             : null;
@@ -732,6 +750,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     {
         if (externalCleanupBusy || !UseBulkPrecheck || importSessionId == Guid.Empty || PrecheckAccountId is not Guid accountId)
             return new(WizardPrecheckStatus.Unavailable, 0);
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return new(WizardPrecheckStatus.Unavailable, 0);
         if (Accounts.All(x => x.AccountId != accountId))
         {
             ValidationMessage = "请选择一个可用账号执行预检。";
@@ -851,6 +871,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task LoadFirstPreviewPageAsync(CancellationToken cancellationToken = default)
     {
         if (externalCleanupBusy) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         nextPreviewCursor = null;
         await LoadPreviewPageAsync(null, replace: true, cancellationToken);
     }
@@ -858,12 +880,16 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task LoadNextPreviewPageAsync(CancellationToken cancellationToken = default)
     {
         if (externalCleanupBusy || nextPreviewCursor is null) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         await LoadPreviewPageAsync(nextPreviewCursor, replace: true, cancellationToken);
     }
 
     public async Task PrepareConfirmationAsync(CancellationToken cancellationToken = default)
     {
         if (externalCleanupBusy) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         var validation = EvaluateValidation();
         ValidationMessage = validation;
         if (validation.Length != 0) return;
@@ -932,10 +958,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         bool requireFinalCheck,
         CancellationToken cancellationToken)
     {
-        LastConfirmationWasDeclined = false;
         var mayConfirm = adapterAvailability.CanStartTransfers && ConfirmationToken is not null &&
             CanContinue && CanEdit && (!requireFinalCheck || IsFinalConfirmationChecked);
         if (!mayConfirm || ConfirmationToken is null) return null;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return null;
+        LastConfirmationWasDeclined = false;
         var token = ConfirmationToken;
         var draft = BuildDraft();
         var session = importSessionId;
@@ -1405,6 +1433,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private void MoveNext()
     {
         if (!CanEdit) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         var next = currentStepIndex + 1;
         while (next < Steps.Count && Steps[next].IsSkipped) next++;
         if (next >= Steps.Count) return;
@@ -1414,6 +1444,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private void MovePrevious()
     {
         if (!CanEdit) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
         var previous = currentStepIndex - 1;
         while (previous >= 0 && Steps[previous].IsSkipped) previous--;
         if (previous < 0) return;

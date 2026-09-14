@@ -69,6 +69,133 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.False(refusingFallback.ViewModel.CanClearCurrentImport);
     }
 
+    [Fact]
+    public async Task CleanupIsRefusedWhileWizardAwaitsFinalJobConfirmation()
+    {
+        var store = new CurrentImportCleanupStore();
+        var cleanupConfirmation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupInteraction = new CurrentImportCleanupInteraction { Confirmation = cleanupConfirmation.Task };
+        using var fixture = Fixture.Valid(
+            importCleanupStore: store,
+            importCleanupInteraction: cleanupInteraction);
+        await fixture.Wizard.PrepareConfirmationAsync();
+        Assert.NotNull(fixture.Wizard.ConfirmationToken);
+        fixture.Wizard.IsFinalConfirmationChecked = true;
+        var cleanup = fixture.ViewModel.ClearCurrentImportAsync();
+        await cleanupInteraction.Started.Task;
+        var delayedConfirmation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Dialog.DelayedConfirmation = delayedConfirmation.Task;
+        var jobCreation = fixture.Wizard.CreateJobAsync();
+        await fixture.Dialog.ConfirmationStarted.Task;
+
+        cleanupConfirmation.SetResult(true);
+        await cleanup;
+
+        Assert.Empty(store.Sessions);
+        Assert.Equal("当前正在处理其他操作，请稍后重试", fixture.ViewModel.StatusMessage);
+        delayedConfirmation.SetResult(false);
+        await jobCreation;
+    }
+
+    [Fact]
+    public async Task CleanupIsRefusedWhileImportAwaitsExcelPicker()
+    {
+        var store = new CurrentImportCleanupStore();
+        var cleanupConfirmation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupInteraction = new CurrentImportCleanupInteraction { Confirmation = cleanupConfirmation.Task };
+        using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: cleanupInteraction);
+        fixture.ApplyReadyDraft();
+        var cleanup = fixture.ViewModel.ClearCurrentImportAsync();
+        await cleanupInteraction.Started.Task;
+        var delayedSelection = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Dialog.DelayedExcelSelection = delayedSelection.Task;
+        var selection = fixture.Import.SelectAndImportExcelAsync();
+        await fixture.Dialog.ExcelSelectionStarted.Task;
+
+        cleanupConfirmation.SetResult(true);
+        await cleanup;
+
+        Assert.Empty(store.Sessions);
+        Assert.Equal("当前正在处理其他操作，请稍后重试", fixture.ViewModel.StatusMessage);
+        delayedSelection.SetResult(null);
+        await selection;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ConfirmationRefusalOrCancellationIsFullyInert(bool cancel)
+    {
+        var store = new CurrentImportCleanupStore();
+        var interaction = new CurrentImportCleanupInteraction
+        {
+            Confirmation = cancel
+                ? Task.FromCanceled<bool>(new CancellationToken(canceled: true))
+                : Task.FromResult(false),
+        };
+        using var fixture = Fixture.Create(importCleanupStore: store, importCleanupInteraction: interaction);
+        fixture.ApplyReadyDraft();
+        fixture.Import.TextContent = "unchanged input";
+        var before = CaptureCurrentImportState(fixture);
+
+        await fixture.ViewModel.ClearCurrentImportAsync();
+
+        Assert.Empty(store.Sessions);
+        Assert.Equal(before, CaptureCurrentImportState(fixture));
+        Assert.Empty(fixture.ImportWorkflow.DiscardedSessions);
+    }
+
+    private static CurrentImportStateSnapshot CaptureCurrentImportState(Fixture fixture) => new(
+        fixture.Import.SessionId,
+        fixture.Import.TextContent,
+        fixture.Import.StatusMessage,
+        fixture.Import.StatisticsText,
+        fixture.Import.TotalRows,
+        string.Join("|", fixture.Import.Rows.Select(row => $"{row.RowId}:{row.ShareUrl}:{row.ExtractionCode}:{row.DispositionText}")),
+        fixture.Import.SelectedRow?.RowId,
+        fixture.Import.SelectedShareUrl,
+        fixture.Import.SelectedExtractionCode,
+        fixture.Import.CanResumeImport,
+        fixture.Wizard.CurrentImportSessionId,
+        fixture.Wizard.ReadyResourceCount,
+        fixture.Wizard.HasExcelAccountColumn,
+        fixture.Wizard.UnresolvedAccountMappingCount,
+        string.Join("|", fixture.Wizard.MappedAccountIds.Order()),
+        fixture.Wizard.PrecheckAccountId,
+        fixture.Wizard.PrecheckStatusMessage,
+        fixture.Wizard.ConfirmationToken,
+        fixture.Wizard.IsFinalConfirmationChecked,
+        fixture.Wizard.CurrentStepIndex,
+        string.Join("|", fixture.Wizard.Accounts.Select(account =>
+            $"{account.AccountId}:{account.IsSelected}:{account.TargetItemCount}:{account.TargetSuccessCount}:{account.ShareEnabled}")),
+        fixture.ViewModel.CreatedBatchJobId,
+        fixture.ViewModel.StatusMessage);
+
+    private sealed record CurrentImportStateSnapshot(
+        Guid? ImportSessionId,
+        string TextContent,
+        string ImportStatus,
+        string Statistics,
+        long TotalRows,
+        string Rows,
+        Guid? SelectedRowId,
+        string SelectedShareUrl,
+        string SelectedExtractionCode,
+        bool CanResume,
+        Guid? WizardSessionId,
+        int ReadyRows,
+        bool HasExcelAccountColumn,
+        int UnresolvedMappings,
+        string MappedAccounts,
+        Guid? PrecheckAccountId,
+        string PrecheckStatus,
+        string? ConfirmationToken,
+        bool FinalConfirmation,
+        int Step,
+        string Accounts,
+        Guid? CreatedBatchJobId,
+        string WorkspaceStatus);
+
     [Theory]
     [InlineData(LocalImportDraftCleanupDisposition.BatchConflict, "当前导入已关联转存任务，请等待任务结束后使用“清空转存历史”。")]
     [InlineData(LocalImportDraftCleanupDisposition.LocalDependencyConflict, "另一个本地导入依赖当前数据，请先检查并保留相关导入。")]
@@ -3302,7 +3429,9 @@ public sealed class TransferWorkspaceViewModelTests
             IJobResultsWorkflow? resultsWorkflow = null,
             IResultSaveDialog? resultsSaveDialog = null,
             ITransferTargetDirectoryPicker? targetDirectoryPicker = null,
-            ILicenseAuthorizationGate? licenseGate = null)
+            ILicenseAuthorizationGate? licenseGate = null,
+            ILocalImportDraftCleanupStore? importCleanupStore = null,
+            ICurrentImportCleanupInteraction? importCleanupInteraction = null)
         {
             var fixture = Create(
                 accountCount,
@@ -3320,7 +3449,9 @@ public sealed class TransferWorkspaceViewModelTests
                 resultsWorkflow: resultsWorkflow,
                 resultsSaveDialog: resultsSaveDialog,
                 targetDirectoryPicker: targetDirectoryPicker,
-                licenseGate: licenseGate);
+                licenseGate: licenseGate,
+                importCleanupStore: importCleanupStore,
+                importCleanupInteraction: importCleanupInteraction);
             fixture.ApplyReadyDraft();
             if (accountCount == 1)
             {
@@ -3764,11 +3895,20 @@ public sealed class TransferWorkspaceViewModelTests
         public Action<string>? BeforeMessage { get; set; }
         public string LastConfirmationMessage { get; private set; } = string.Empty;
         public bool ConfirmationResult { get; set; } = true;
-        public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default) => Task.FromResult<string?>(null);
+        public Task<bool>? DelayedConfirmation { get; set; }
+        public Task<string?>? DelayedExcelSelection { get; set; }
+        public TaskCompletionSource ConfirmationStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ExcelSelectionStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default)
+        {
+            ExcelSelectionStarted.TrySetResult();
+            return DelayedExcelSelection ?? Task.FromResult<string?>(null);
+        }
         public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
         {
             LastConfirmationMessage = message;
-            return Task.FromResult(ConfirmationResult);
+            ConfirmationStarted.TrySetResult();
+            return DelayedConfirmation ?? Task.FromResult(ConfirmationResult);
         }
         public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default)
         {
