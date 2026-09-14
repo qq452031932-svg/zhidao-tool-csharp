@@ -355,6 +355,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     {
         if (!CanClearCurrentImport || Import.SessionId is not { } capturedSession) return;
         var capturedRowCount = Import.TotalRows;
+        var cleanupAcquired = false;
         try
         {
             var confirmed = await currentImportCleanupInteraction
@@ -369,6 +370,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
                 if (!isClosed) StatusMessage = "当前正在处理其他操作，请稍后重试";
                 return;
             }
+            cleanupAcquired = true;
             try
             {
                 var result = await importDraftCleanupService!
@@ -415,6 +417,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         }
         catch (OperationCanceledException)
         {
+            if (cleanupAcquired && !isClosed) StatusMessage = "已取消清空当前导入。";
         }
         catch
         {

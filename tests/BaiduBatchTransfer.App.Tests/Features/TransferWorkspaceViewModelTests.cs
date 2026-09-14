@@ -319,6 +319,27 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task ServiceCancellationAfterConfirmationReportsSafeStatusAndReleasesFence()
+    {
+        var store = new CurrentImportCleanupStore { Exception = new OperationCanceledException("private cancellation detail") };
+        using var fixture = Fixture.Create(
+            importCleanupStore: store,
+            importCleanupInteraction: new CurrentImportCleanupInteraction());
+        fixture.ApplyReadyDraft();
+        var before = CaptureCurrentImportState(fixture);
+
+        await fixture.ViewModel.ClearCurrentImportAsync();
+
+        Assert.Single(store.Sessions);
+        Assert.Equal(before with { WorkspaceStatus = "已取消清空当前导入。" }, CaptureCurrentImportState(fixture));
+        Assert.Empty(fixture.ImportWorkflow.DiscardedSessions);
+        Assert.True(fixture.Import.CanEdit);
+        Assert.True(fixture.Wizard.CanEdit);
+        Assert.True(fixture.ViewModel.CanClearCurrentImport);
+        Assert.DoesNotContain("private", fixture.ViewModel.StatusMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task CleanupCompletionNeverResetsANewerImportedSession()
     {
         var store = new CurrentImportCleanupStore { Block = true };
