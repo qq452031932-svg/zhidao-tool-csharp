@@ -120,6 +120,117 @@ public sealed class LicenseActivationViewStructureTests
             scrollViewer.ScrollToEnd();
             scrollViewer.UpdateLayout();
             Assert.Equal(scrollViewer.ScrollableHeight, scrollViewer.VerticalOffset, precision: 3);
+            var buttonTop = activate.TransformToAncestor(scrollViewer)
+                .Transform(new Point(0, 0)).Y;
+            var buttonBottom = activate.TransformToAncestor(scrollViewer)
+                .Transform(new Point(0, activate.ActualHeight)).Y;
+            Assert.True(buttonTop >= 0, $"Activate button top was {buttonTop:N1}px above the viewport.");
+            Assert.True(buttonBottom <= scrollViewer.ViewportHeight,
+                $"Activate button bottom was {buttonBottom:N1}px below the {scrollViewer.ViewportHeight:N1}px viewport.");
+
+            return Task.CompletedTask;
+        });
+    }
+
+    [Fact]
+    public async Task ActiveRequestBlocksEscapeAndSystemCloseUntilTheAttemptFinishes()
+    {
+        await RunStaAsync(async () =>
+        {
+            var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var completion = new TaskCompletionSource<LicenseActivationResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var viewModel = new LicenseActivationViewModel(
+                "知道综合工具",
+                (_, _) =>
+                {
+                    started.TrySetResult();
+                    return completion.Task;
+                })
+            {
+                Card = "CARD"
+            };
+            var window = new LicenseActivationWindow(viewModel);
+            var cancel = Assert.IsType<Button>(window.FindName("CancelButton"));
+            window.Show();
+
+            var activation = viewModel.ActivateCommand.ExecuteAsync(null);
+            await started.Task;
+            window.UpdateLayout();
+
+            Assert.False(viewModel.CloseCommand.CanExecute(null));
+            Assert.False(cancel.IsEnabled);
+            cancel.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Assert.True(window.IsVisible);
+            window.Close();
+            Assert.True(window.IsVisible);
+
+            completion.SetResult(new LicenseActivationResult(false, "license_not_found"));
+            await activation;
+
+            Assert.True(viewModel.CloseCommand.CanExecute(null));
+            Assert.True(cancel.IsEnabled);
+            window.Close();
+            Assert.False(window.IsVisible);
+        });
+    }
+
+    [Fact]
+    public async Task ControlledCancellationCancelsTheAttemptBeforeClosingTheWindow()
+    {
+        await RunStaAsync(async () =>
+        {
+            var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var viewModel = new LicenseActivationViewModel(
+                "知道综合工具",
+                async (_, cancellationToken) =>
+                {
+                    started.TrySetResult();
+                    try
+                    {
+                        await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                    }
+                    finally
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                            cancellationObserved.TrySetResult();
+                    }
+                    return new LicenseActivationResult(false, "license_not_found");
+                })
+            {
+                Card = "CARD"
+            };
+            var window = new LicenseActivationWindow(viewModel);
+            window.Show();
+            var activation = viewModel.ActivateCommand.ExecuteAsync(null);
+            await started.Task;
+
+            window.CancelActivationAndClose();
+
+            await cancellationObserved.Task;
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => activation);
+            Assert.False(window.IsVisible);
+        });
+    }
+
+    [Fact]
+    public async Task SuccessfulActivationStillUsesTheControlledInternalClosePath()
+    {
+        await RunStaAsync(() =>
+        {
+            var viewModel = new LicenseActivationViewModel(
+                "知道综合工具",
+                (_, _) => Task.FromResult(new LicenseActivationResult(true, "ok")))
+            {
+                Card = "CARD"
+            };
+            var window = new LicenseActivationWindow(viewModel);
+            _ = window.Dispatcher.BeginInvoke(new Action(() =>
+                viewModel.ActivateCommand.Execute(null)));
+
+            Assert.True(window.ShowDialog());
+            return Task.CompletedTask;
         });
     }
 
@@ -133,19 +244,33 @@ public sealed class LicenseActivationViewStructureTests
         element.UpdateLayout();
     }
 
-    private static Task RunStaAsync(Action action)
+    private static Task RunStaAsync(Func<Task> action)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
-            try
+            var dispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+            SynchronizationContext.SetSynchronizationContext(
+                new System.Windows.Threading.DispatcherSynchronizationContext(dispatcher));
+            dispatcher.BeginInvoke(new Action(() => _ = ExecuteAsync()));
+            System.Windows.Threading.Dispatcher.Run();
+
+            async Task ExecuteAsync()
             {
-                action();
-                completion.TrySetResult();
-            }
-            catch (Exception error)
-            {
-                completion.TrySetException(error);
+                try
+                {
+                    await action();
+                    completion.TrySetResult();
+                }
+                catch (Exception error)
+                {
+                    completion.TrySetException(error);
+                }
+                finally
+                {
+                    if (!dispatcher.HasShutdownStarted)
+                        dispatcher.InvokeShutdown();
+                }
             }
         })
         {

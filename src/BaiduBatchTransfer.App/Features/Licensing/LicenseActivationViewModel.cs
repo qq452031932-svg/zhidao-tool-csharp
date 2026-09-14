@@ -58,7 +58,7 @@ public sealed class LicenseActivationViewModel : ObservableObject
         ProductName = productName.Trim();
         this.activateAsync = activateAsync ?? throw new ArgumentNullException(nameof(activateAsync));
         ActivateCommand = new AsyncRelayCommand(ActivateAsync, CanActivate);
-        CloseCommand = new RelayCommand(RequestExplicitClose);
+        CloseCommand = new RelayCommand(RequestExplicitClose, CanClose);
     }
 
     public event EventHandler<LicenseActivationCloseRequestedEventArgs>? CloseRequested;
@@ -88,10 +88,12 @@ public sealed class LicenseActivationViewModel : ObservableObject
             if (!SetProperty(ref isActivating, value)) return;
             OnPropertyChanged(nameof(ActivateButtonText));
             ActivateCommand.NotifyCanExecuteChanged();
+            CloseCommand.NotifyCanExecuteChanged();
         }
     }
 
     private bool CanActivate() => !IsActivating;
+    private bool CanClose() => !IsActivating;
 
     private async Task ActivateAsync(CancellationToken cancellationToken)
     {
@@ -138,8 +140,11 @@ public sealed class LicenseActivationViewModel : ObservableObject
         }
     }
 
-    private void RequestExplicitClose() =>
+    private void RequestExplicitClose()
+    {
+        if (IsActivating) return;
         CloseRequested?.Invoke(this, new LicenseActivationCloseRequestedEventArgs(isActivated: false));
+    }
 
     private static string ToUserMessage(string? code) => code switch
     {

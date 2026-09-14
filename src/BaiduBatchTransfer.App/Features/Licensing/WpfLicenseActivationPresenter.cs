@@ -29,7 +29,7 @@ public sealed class WpfLicenseActivationPresenter(
         using var registration = cancellationToken.Register(() =>
         {
             if (window.Dispatcher.HasShutdownStarted || window.Dispatcher.HasShutdownFinished) return;
-            _ = window.Dispatcher.BeginInvoke(window.Close);
+            _ = window.Dispatcher.BeginInvoke(window.CancelActivationAndClose);
         });
         var activated = window.ShowDialog() == true;
         cancellationToken.ThrowIfCancellationRequested();

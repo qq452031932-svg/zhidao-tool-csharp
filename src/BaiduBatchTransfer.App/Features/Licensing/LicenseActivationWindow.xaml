@@ -41,7 +41,7 @@
                               Grid.Row="1"
                               VerticalScrollBarVisibility="Auto"
                               HorizontalScrollBarVisibility="Auto">
-                    <Grid x:Name="ActivationBody" Margin="30,24,30,26">
+                    <Grid x:Name="ActivationBody" Margin="30,24,30,0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />

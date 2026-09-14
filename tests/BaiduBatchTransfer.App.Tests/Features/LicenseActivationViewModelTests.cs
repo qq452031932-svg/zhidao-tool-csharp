@@ -34,6 +34,7 @@ public sealed class LicenseActivationViewModelTests
         var completion = new TaskCompletionSource<LicenseActivationResult>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         var calls = 0;
+        var closeRequests = 0;
         var viewModel = new LicenseActivationViewModel(
             "SuperPan",
             (_, _) =>
@@ -45,18 +46,23 @@ public sealed class LicenseActivationViewModelTests
         {
             Card = "CARD"
         };
+        viewModel.CloseRequested += (_, _) => closeRequests++;
 
         var activation = viewModel.ActivateCommand.ExecuteAsync(null);
         await started.Task;
 
         Assert.False(viewModel.ActivateCommand.CanExecute(null));
+        Assert.False(viewModel.CloseCommand.CanExecute(null));
         viewModel.ActivateCommand.Execute(null);
+        viewModel.CloseCommand.Execute(null);
         Assert.Equal(1, calls);
+        Assert.Equal(0, closeRequests);
 
         completion.SetResult(new LicenseActivationResult(false, "license_not_found"));
         await activation;
 
         Assert.True(viewModel.ActivateCommand.CanExecute(null));
+        Assert.True(viewModel.CloseCommand.CanExecute(null));
     }
 
     [Fact]
