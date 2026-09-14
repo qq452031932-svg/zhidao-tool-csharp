@@ -900,6 +900,7 @@ public sealed class AppShellFactory(
     IApplicationUpdateService updateService,
     ApplicationBuildInfo buildInfo,
     AppRuntimeState runtimeState,
+    LicenseRuntimeAuthorizationState licenseAuthorizationState,
     ILicenseAuthorizationGate licenseGate) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -1095,7 +1096,8 @@ public sealed class AppShellFactory(
             saveShareAnalyticsAccount: shareAnalyticsPreferenceStore.SaveLastViewedAccountAsync,
             shareAnalyticsPreferenceLoadFailed: shareAnalyticsPreferenceLoadFailed,
             enterShareData: shareAnalyticsViewModel.EnterAsync,
-            leaveShareData: shareAnalyticsViewModel.Leave);
+            leaveShareData: shareAnalyticsViewModel.Leave,
+            licenseAuthorizationState: licenseAuthorizationState);
         mainViewModel.ConfigureOtaAcceptanceBuild(buildInfo.IsOtaAcceptanceBuild);
         mainWindow = new MainWindow(mainViewModel);
 

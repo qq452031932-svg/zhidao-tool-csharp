@@ -4,14 +4,42 @@ namespace BaiduBatchTransfer.App.Features.Licensing;
 
 public sealed class LicenseRuntimeAuthorizationState
 {
+    private readonly object summaryGate = new();
     private readonly TaskCompletionSource authorized = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SemaphoreSlim authorizationTransition = new(1, 1);
     private int startupValidationCompleted;
     private int isAuthorized;
+    private AuthorizedLicenseSummary? currentSummary;
 
     public bool StartupValidationCompleted => Volatile.Read(ref startupValidationCompleted) != 0;
     public bool IsAuthorized => Volatile.Read(ref isAuthorized) != 0;
+    public AuthorizedLicenseSummary? CurrentSummary
+    {
+        get
+        {
+            lock (summaryGate) return currentSummary;
+        }
+    }
+
+    public event Action<AuthorizedLicenseSummary?>? SummaryChanged;
+
+    public void PublishSummary(AuthorizedLicenseSummary? summary)
+    {
+        Action<AuthorizedLicenseSummary?>? changed;
+        lock (summaryGate)
+        {
+            if (Equals(currentSummary, summary)) return;
+            currentSummary = summary;
+            changed = SummaryChanged;
+        }
+
+        if (changed is null) return;
+        foreach (Action<AuthorizedLicenseSummary?> handler in changed.GetInvocationList())
+        {
+            try { handler(summary); } catch { }
+        }
+    }
 
     public void CompleteStartupValidation()
     {

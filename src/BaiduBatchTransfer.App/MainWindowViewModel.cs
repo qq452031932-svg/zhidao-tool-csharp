@@ -1,15 +1,18 @@
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.Application.Accounts;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Globalization;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App;
 
-public sealed class MainWindowViewModel : ObservableObject
+public sealed class MainWindowViewModel : ObservableObject, IDisposable
 {
     private readonly object homeWorkspace;
     private readonly object shareDataWorkspace;
@@ -26,6 +29,8 @@ public sealed class MainWindowViewModel : ObservableObject
     private readonly ShareAnalyticsPreferencePersistenceCoordinator? shareAnalyticsPreferencePersistence;
     private readonly Func<CancellationToken, Task>? enterShareData;
     private readonly Action? leaveShareData;
+    private readonly LicenseRuntimeAuthorizationState? licenseAuthorizationState;
+    private readonly SynchronizationContext? uiContext;
     private readonly HashSet<AccountAllocationRowViewModel> subscribedAccountRows = [];
     private readonly HashSet<Guid> capacityRefreshesInFlight = [];
     private readonly object capacityRefreshGate = new();
@@ -43,6 +48,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private int updateAvailableReported;
     private bool isOtaAcceptanceBuild;
     private Guid? analyticsAccountId;
+    private AuthorizedLicenseSummary? licenseSummary;
 
     public MainWindowViewModel(
         object homeWorkspace,
@@ -63,7 +69,8 @@ public sealed class MainWindowViewModel : ObservableObject
         Func<Guid?, CancellationToken, Task>? saveShareAnalyticsAccount = null,
         bool shareAnalyticsPreferenceLoadFailed = false,
         Func<CancellationToken, Task>? enterShareData = null,
-        Action? leaveShareData = null)
+        Action? leaveShareData = null,
+        LicenseRuntimeAuthorizationState? licenseAuthorizationState = null)
     {
         this.homeWorkspace = homeWorkspace ?? throw new ArgumentNullException(nameof(homeWorkspace));
         this.shareDataWorkspace = shareDataWorkspace ?? throw new ArgumentNullException(nameof(shareDataWorkspace));
@@ -77,7 +84,7 @@ public sealed class MainWindowViewModel : ObservableObject
         this.refreshAccounts = refreshAccounts;
         this.refreshAccountCapacity = refreshAccountCapacity;
         this.selectShareAnalyticsAccount = selectShareAnalyticsAccount;
-        var uiContext = SynchronizationContext.Current;
+        uiContext = SynchronizationContext.Current;
         shareAnalyticsPreferencePersistence = saveShareAnalyticsAccount is null
             ? null
             : new ShareAnalyticsPreferencePersistenceCoordinator(
@@ -85,6 +92,12 @@ public sealed class MainWindowViewModel : ObservableObject
                 () => ReportShareAnalyticsPreferenceFailure(uiContext));
         this.enterShareData = enterShareData;
         this.leaveShareData = leaveShareData;
+        this.licenseAuthorizationState = licenseAuthorizationState;
+        if (licenseAuthorizationState is not null)
+        {
+            licenseAuthorizationState.SummaryChanged += OnLicenseSummaryChanged;
+            licenseSummary = licenseAuthorizationState.CurrentSummary;
+        }
         Accounts = accounts ?? [];
         Accounts.CollectionChanged += OnAccountsCollectionChanged;
         SynchronizeAccountSubscriptions(resolveMissingCurrent: false);
@@ -112,6 +125,11 @@ public sealed class MainWindowViewModel : ObservableObject
     }
 
     public string ApplicationTitle => FormatApplicationTitle(isOtaAcceptanceBuild);
+    public string LicensePackageDisplay => licenseSummary?.PackageName ?? "未激活";
+    public string LicenseExpiryDisplay => licenseSummary is null
+        ? "未激活"
+        : licenseSummary.ExpiresAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+    public bool IsLicenseSummaryVisible => licenseSummary is not null;
     public object BatchTransferWorkspace => batchTransferWorkspace;
     public object CurrentContent { get => currentContent; private set => SetProperty(ref currentContent, value); }
     public string CurrentWorkspaceTitle { get => currentWorkspaceTitle; private set => SetProperty(ref currentWorkspaceTitle, value); }
@@ -310,6 +328,8 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         if (isClosed) return;
         isClosed = true;
+        if (licenseAuthorizationState is not null)
+            licenseAuthorizationState.SummaryChanged -= OnLicenseSummaryChanged;
         leaveShareData?.Invoke();
         shareAnalyticsPreferencePersistence?.Dispose();
         capacityLifetime.Cancel();
@@ -317,6 +337,30 @@ public sealed class MainWindowViewModel : ObservableObject
         foreach (var row in subscribedAccountRows) row.PropertyChanged -= OnAccountPropertyChanged;
         subscribedAccountRows.Clear();
         capacityLifetime.Dispose();
+    }
+
+    public void Dispose() => Close();
+
+    private void OnLicenseSummaryChanged(AuthorizedLicenseSummary? _)
+    {
+        if (isClosed || licenseAuthorizationState is null) return;
+        if (uiContext is not null && !ReferenceEquals(SynchronizationContext.Current, uiContext))
+        {
+            uiContext.Post(_ => ApplyCurrentLicenseSummary(), null);
+            return;
+        }
+        ApplyCurrentLicenseSummary();
+    }
+
+    private void ApplyCurrentLicenseSummary()
+    {
+        if (isClosed || licenseAuthorizationState is null) return;
+        var summary = licenseAuthorizationState.CurrentSummary;
+        if (Equals(licenseSummary, summary)) return;
+        licenseSummary = summary;
+        OnPropertyChanged(nameof(LicensePackageDisplay));
+        OnPropertyChanged(nameof(LicenseExpiryDisplay));
+        OnPropertyChanged(nameof(IsLicenseSummaryVisible));
     }
 
     private async Task RefreshAccountsAsync(CancellationToken cancellationToken)

@@ -19,6 +19,8 @@ public interface ILicenseServiceClient : ICachedLicenseEnvelopeVerifier
     Task<LicenseApiResult> ValidateAsync(string requestId, string card, string machineHash, CancellationToken cancellationToken);
 }
 
+public sealed record AuthorizedLicenseSummary(string PackageName, DateTimeOffset ExpiresAt);
+
 public sealed record LicenseGateResult(
     LicenseOperationKind Operation,
     bool IsAuthorized,
@@ -49,6 +51,7 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
     private readonly ILicenseStateStore store;
     private readonly IMachineFingerprintProvider fingerprintProvider;
     private readonly Action<string>? log;
+    private readonly Action<AuthorizedLicenseSummary?>? publishSummary;
 
     public LicenseAuthorizationGate(
         string softwareId,
@@ -56,7 +59,8 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         ILicenseStateStore store,
         IMachineFingerprintProvider fingerprintProvider,
         TimeProvider? timeProvider = null,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        Action<AuthorizedLicenseSummary?>? publishSummary = null)
     {
         if (string.IsNullOrWhiteSpace(softwareId) || softwareId != softwareId.Trim())
             throw new ArgumentException("The software identifier is invalid.", nameof(softwareId));
@@ -66,6 +70,7 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         this.fingerprintProvider = fingerprintProvider ?? throw new ArgumentNullException(nameof(fingerprintProvider));
         _ = timeProvider;
         this.log = log;
+        this.publishSummary = publishSummary;
     }
 
     public LicenseAuthorizationGate(
@@ -74,8 +79,9 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         ILicenseStateStore store,
         IMachineFingerprintProvider fingerprintProvider,
         TimeProvider? timeProvider = null,
-        Action<string>? log = null)
-        : this(softwareId, new LicenseApiClientAdapter(service), store, fingerprintProvider, timeProvider, log)
+        Action<string>? log = null,
+        Action<AuthorizedLicenseSummary?>? publishSummary = null)
+        : this(softwareId, new LicenseApiClientAdapter(service), store, fingerprintProvider, timeProvider, log, publishSummary)
     {
     }
 
@@ -120,7 +126,8 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
                 {
                     return Publish(candidate.CachedClaims is not null
                         ? new LicenseGateResult(operation, true, true, SafeCode(response.Code))
-                        : new LicenseGateResult(operation, false, false, SafeCode(response.Code)));
+                        : new LicenseGateResult(operation, false, false, SafeCode(response.Code)),
+                        candidate.CachedClaims is not null ? CreateSummary(candidate.CachedClaims) : null);
                 }
                 return Publish(new LicenseGateResult(operation, false, false, AuthorizationUnavailable));
             }
@@ -155,9 +162,12 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
                 await store.RemoveLeaseAsync(credential.Card, softwareId, machineHash, cancellationToken).ConfigureAwait(false);
                 return Publish(new LicenseGateResult(LicenseOperationKind.Startup, false, false, SafeCode(response.Code)));
             }
-            if (response.Kind == LicenseApiResultKind.TemporaryFailure && FindVerifiedCachedClaims(credential, machineHash) is not null)
+            if (response.Kind == LicenseApiResultKind.TemporaryFailure &&
+                FindVerifiedCachedClaims(credential, machineHash) is { } cachedClaims)
             {
-                return Publish(new LicenseGateResult(LicenseOperationKind.Startup, true, true, SafeCode(response.Code)));
+                return Publish(
+                    new LicenseGateResult(LicenseOperationKind.Startup, true, true, SafeCode(response.Code)),
+                    CreateSummary(cachedClaims));
             }
             return Publish(new LicenseGateResult(LicenseOperationKind.Startup, false, false,
                 response.Kind == LicenseApiResultKind.TemporaryFailure ? SafeCode(response.Code) : AuthorizationUnavailable));
@@ -193,7 +203,9 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
                 claims.ExpiresAt!.Value, claims.LeaseUntil!.Value, Convert.ToBase64String(signedEnvelope));
             await store.SaveLeaseAsync(credential.Card, credential.ActivationRequestId, lease, cancellationToken)
                 .ConfigureAwait(false);
-            return Publish(new LicenseGateResult(operation, true, false, LicenseCodes.Ok));
+            return Publish(
+                new LicenseGateResult(operation, true, false, LicenseCodes.Ok),
+                CreateSummary(claims));
         }
         catch (Exception exception) when (exception is LicenseEnvelopeVerificationException or FormatException or ArgumentException)
         {
@@ -236,8 +248,11 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         }
     }
 
-    private LicenseGateResult Publish(LicenseGateResult result)
+    private LicenseGateResult Publish(
+        LicenseGateResult result,
+        AuthorizedLicenseSummary? summary = null)
     {
+        try { publishSummary?.Invoke(summary); } catch { }
         var status = new LicenseGateStatusEventArgs(result);
         try { StatusChanged?.Invoke(this, status); } catch { }
         try { log?.Invoke(status.ToString()); } catch { }
@@ -247,6 +262,9 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
     private static string SafeCode(string? code) => LicenseCodes.All.Contains(code ?? string.Empty)
         ? code!
         : AuthorizationUnavailable;
+
+    private static AuthorizedLicenseSummary CreateSummary(LicenseClaims claims) =>
+        new(claims.PackageName!, claims.ExpiresAt!.Value);
 
     private sealed class LicenseApiClientAdapter(LicenseApiClient client) : ILicenseServiceClient
     {

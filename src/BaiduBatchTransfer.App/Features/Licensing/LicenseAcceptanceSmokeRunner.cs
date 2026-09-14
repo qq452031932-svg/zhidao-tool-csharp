@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Features.Licensing;
@@ -198,7 +199,10 @@ public static class LicenseAcceptanceSmokeRunner
 
 public static class LicenseAuthorizationGateFactory
 {
-    public static ILicenseAuthorizationGate Create(LicenseClientOptions options, string? statePath = null)
+    public static ILicenseAuthorizationGate Create(
+        LicenseClientOptions options,
+        string? statePath = null,
+        Action<AuthorizedLicenseSummary?>? publishSummary = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         var client = new LicenseApiClient(options);
@@ -206,7 +210,8 @@ public static class LicenseAuthorizationGateFactory
             options.SoftwareId,
             client,
             new DpapiLicenseStore(statePath),
-            new MachineFingerprintProvider());
+            new MachineFingerprintProvider(),
+            publishSummary: publishSummary);
     }
 }
 
@@ -221,6 +226,7 @@ public static class LicenseServiceRegistration
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(buildInfo);
         ArgumentNullException.ThrowIfNull(startupArguments);
+        services.TryAddSingleton<LicenseRuntimeAuthorizationState>();
         services.AddSingleton(buildInfo);
         if (buildInfo.Mode == LicenseRuntimeMode.Disabled)
         {
@@ -243,7 +249,8 @@ public static class LicenseServiceRegistration
             sp.GetRequiredService<LicenseApiClient>(),
             sp.GetRequiredService<ILicenseStateStore>(),
             sp.GetRequiredService<IMachineFingerprintProvider>(),
-            TimeProvider.System));
+            TimeProvider.System,
+            publishSummary: sp.GetRequiredService<LicenseRuntimeAuthorizationState>().PublishSummary));
         services.AddSingleton<ILicenseAuthorizationGate>(sp =>
             sp.GetRequiredService<LicenseAuthorizationGate>());
     }

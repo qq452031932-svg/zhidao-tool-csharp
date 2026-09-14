@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
@@ -10,6 +11,7 @@ using System.Collections.ObjectModel;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Xml.Linq;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Tests;
 
@@ -590,6 +592,51 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public void LicenseSummaryLoadsBeforeShellCreationRefreshesLiveAndUnsubscribesOnClose()
+    {
+        var state = new LicenseRuntimeAuthorizationState();
+        var initialExpiry = new DateTimeOffset(2026, 10, 2, 8, 30, 0, TimeSpan.FromHours(8));
+        state.PublishSummary(new AuthorizedLicenseSummary("基础版", initialExpiry));
+        var vm = CreateViewModel(new FakeLoginLauncher(), licenseAuthorizationState: state);
+
+        Assert.True(vm.IsLicenseSummaryVisible);
+        Assert.Equal("基础版", vm.LicensePackageDisplay);
+        Assert.Equal(initialExpiry.ToLocalTime().ToString("yyyy-MM-dd HH:mm"), vm.LicenseExpiryDisplay);
+
+        var refreshedExpiry = initialExpiry.AddMonths(3);
+        state.PublishSummary(new AuthorizedLicenseSummary("团队版", refreshedExpiry));
+
+        Assert.Equal("团队版", vm.LicensePackageDisplay);
+        Assert.Equal(refreshedExpiry.ToLocalTime().ToString("yyyy-MM-dd HH:mm"), vm.LicenseExpiryDisplay);
+
+        state.PublishSummary(null);
+        Assert.False(vm.IsLicenseSummaryVisible);
+        Assert.Equal("未激活", vm.LicensePackageDisplay);
+        Assert.Equal("未激活", vm.LicenseExpiryDisplay);
+
+        vm.Close();
+        state.PublishSummary(new AuthorizedLicenseSummary("关闭后套餐", refreshedExpiry));
+        Assert.Equal("未激活", vm.LicensePackageDisplay);
+    }
+
+    [Fact]
+    public void ProductHeaderShowsOnlyTheSafeLicensePackageAndExpirySummary()
+    {
+        var document = LoadMainWindowDocument();
+        var panel = FindNamedElement(document, "LicenseSummaryPanel");
+        var panelMarkup = panel.ToString();
+        var bindings = panel.Descendants(PresentationNamespace + "TextBlock")
+            .Select(element => AttributeValue(element, "Text"))
+            .ToArray();
+
+        Assert.Contains("{Binding LicensePackageDisplay, StringFormat=授权：{0}}", bindings);
+        Assert.Contains("{Binding LicenseExpiryDisplay, StringFormat=到期：{0}}", bindings);
+        Assert.DoesNotContain("Card", panelMarkup, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("MachineHash", panelMarkup, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("SignedPayload", panelMarkup, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void AvailableUpdateChangesShellStatusOnlyOnce()
     {
         var viewModel = CreateViewModel(new FakeLoginLauncher());
@@ -919,7 +966,8 @@ public sealed class MainWindowViewModelTests
         Func<Action<int>, CancellationToken, Task>? refreshAccounts = null,
         int initialActiveAccountCount = 0,
         ObservableCollection<AccountAllocationRowViewModel>? accounts = null,
-        Func<Guid, CancellationToken, Task<AccountCapacityRefreshResult>>? refreshAccountCapacity = null)
+        Func<Guid, CancellationToken, Task<AccountCapacityRefreshResult>>? refreshAccountCapacity = null,
+        LicenseRuntimeAuthorizationState? licenseAuthorizationState = null)
     {
         var placeholders = Enumerable.Range(0, 7).Select(_ => new object()).ToArray();
         return new MainWindowViewModel(
@@ -930,7 +978,8 @@ public sealed class MainWindowViewModelTests
             refreshAccounts,
             initialActiveAccountCount,
             accounts,
-            refreshAccountCapacity);
+            refreshAccountCapacity,
+            licenseAuthorizationState: licenseAuthorizationState);
     }
 
     private static AccountAllocationRowViewModel AccountRow(string name) => new(

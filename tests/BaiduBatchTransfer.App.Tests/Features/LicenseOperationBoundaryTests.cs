@@ -7,6 +7,36 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class LicenseOperationBoundaryTests
 {
     [Fact]
+    public void RuntimeAuthorizationStatePublishesClearsAndOverwritesSummaries()
+    {
+        var state = new LicenseRuntimeAuthorizationState();
+        var first = new AuthorizedLicenseSummary("基础版", new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero));
+        var second = new AuthorizedLicenseSummary("团队版", new DateTimeOffset(2027, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var changes = new List<AuthorizedLicenseSummary?>();
+        state.SummaryChanged += changes.Add;
+
+        state.PublishSummary(first);
+        state.PublishSummary(second);
+        state.PublishSummary(null);
+
+        Assert.Null(state.CurrentSummary);
+        Assert.Equal([first, second, null], changes);
+    }
+
+    [Fact]
+    public async Task RuntimeAuthorizationStateProvidesThreadSafeSummarySnapshots()
+    {
+        var state = new LicenseRuntimeAuthorizationState();
+        var summaries = Enumerable.Range(0, 100)
+            .Select(index => new AuthorizedLicenseSummary($"套餐-{index}", DateTimeOffset.UtcNow.AddDays(index + 1)))
+            .ToArray();
+
+        await Task.WhenAll(summaries.Select(summary => Task.Run(() => state.PublishSummary(summary))));
+
+        Assert.Contains(state.CurrentSummary, summaries);
+    }
+
+    [Fact]
     public async Task StartupRejectionKeepsRemoteWorkWaitingUntilLaterActivationSucceeds()
     {
         var state = new LicenseRuntimeAuthorizationState();
