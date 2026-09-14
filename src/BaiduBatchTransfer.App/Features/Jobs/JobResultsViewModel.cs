@@ -338,31 +338,45 @@ public sealed class JobResultsViewModel : ObservableObject
     public async Task<Guid?> RestorePendingExistingShareDecisionAsync(
         CancellationToken cancellationToken = default)
     {
+        var capturedGeneration = generation;
+        var capturedBatch = batchJobId;
         var pendingBatch = await FindPendingExistingShareBatchAsync(cancellationToken).ConfigureAwait(true);
-        if (pendingBatch is not { } batchJobId) return null;
-        await InitializeAsync(batchJobId, cancellationToken).ConfigureAwait(true);
-        await ResolvePendingExistingSharesAsync(batchJobId, cancellationToken).ConfigureAwait(true);
-        return batchJobId;
+        if (capturedGeneration != generation || capturedBatch != batchJobId ||
+            cancellationToken.IsCancellationRequested || pendingBatch is not { } requestedBatch) return null;
+        // Initialize starts exactly one new results generation. A Reset or another load invalidates it.
+        var initializedGeneration = unchecked(capturedGeneration + 1);
+        await InitializeAsync(requestedBatch, cancellationToken).ConfigureAwait(true);
+        if (initializedGeneration != generation || requestedBatch != batchJobId ||
+            cancellationToken.IsCancellationRequested) return null;
+        await ResolvePendingExistingSharesAsync(requestedBatch, cancellationToken).ConfigureAwait(true);
+        return initializedGeneration == generation && requestedBatch == batchJobId &&
+            !cancellationToken.IsCancellationRequested ? requestedBatch : null;
     }
 
     internal async Task<Guid?> FindPendingExistingShareBatchAsync(
         CancellationToken cancellationToken = default)
     {
         if (!capabilities.CanUseShareActions || existingShareInteraction is null || IsBusy || IsSaving) return null;
+        var capturedGeneration = generation;
+        var capturedBatch = batchJobId;
         try
         {
             var pending = await existingShareInteraction.GetPendingBatchIdsAsync(100, cancellationToken).ConfigureAwait(true);
+            if (capturedGeneration != generation || capturedBatch != batchJobId ||
+                cancellationToken.IsCancellationRequested) return null;
             var pendingBatch = pending.FirstOrDefault(id => !autoPromptedExistingShareBatches.Contains(id));
             return pendingBatch == Guid.Empty ? null : pendingBatch;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            StatusMessage = "恢复已有分享确认已取消。";
+            if (capturedGeneration == generation && capturedBatch == batchJobId)
+                StatusMessage = "恢复已有分享确认已取消。";
             return null;
         }
         catch (Exception)
         {
-            StatusMessage = "无法恢复待确认的已有分享，请稍后重试。";
+            if (capturedGeneration == generation && capturedBatch == batchJobId)
+                StatusMessage = "无法恢复待确认的已有分享，请稍后重试。";
             return null;
         }
     }
@@ -371,9 +385,10 @@ public sealed class JobResultsViewModel : ObservableObject
         Guid expectedBatchJobId,
         CancellationToken cancellationToken = default)
     {
-        if (expectedBatchJobId == Guid.Empty || batchJobId != expectedBatchJobId) return;
+        if (expectedBatchJobId == Guid.Empty || batchJobId != expectedBatchJobId || cancellationToken.IsCancellationRequested) return;
+        var capturedGeneration = generation;
         var outcome = await ResolveExistingSharesCoreAsync(cancellationToken).ConfigureAwait(true);
-        if (batchJobId != expectedBatchJobId) return;
+        if (capturedGeneration != generation || batchJobId != expectedBatchJobId || cancellationToken.IsCancellationRequested) return;
         if (outcome?.UserClosed == true) autoPromptedExistingShareBatches.Add(expectedBatchJobId);
         else if (outcome?.Completed == true) autoPromptedExistingShareBatches.Remove(expectedBatchJobId);
     }

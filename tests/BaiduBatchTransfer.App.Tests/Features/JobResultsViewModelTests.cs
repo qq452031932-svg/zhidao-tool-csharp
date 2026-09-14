@@ -12,6 +12,75 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class JobResultsViewModelTests
 {
+    [Theory]
+    [InlineData("success")]
+    [InlineData("failure")]
+    [InlineData("cancelled")]
+    public async Task ResetInvalidatesPendingExistingShareQueryAndPreservesEmptyState(string completion)
+    {
+        var interaction = new DelayedPendingExistingShareInteraction();
+        var workflow = new FakeWorkflow();
+        var vm = Create(workflow, existingShareInteraction: interaction);
+        await vm.InitializeAsync(Guid.NewGuid());
+        using var cancellation = new CancellationTokenSource();
+        var restoring = vm.RestorePendingExistingShareDecisionAsync(cancellation.Token);
+        await interaction.Started.Task;
+
+        vm.Reset();
+        if (completion == "failure") interaction.Release.SetException(new IOException("private failure"));
+        else if (completion == "cancelled")
+        {
+            cancellation.Cancel();
+            interaction.Release.SetCanceled(cancellation.Token);
+        }
+        else interaction.Release.SetResult([Guid.NewGuid()]);
+
+        Assert.Null(await restoring);
+        Assert.Equal(Guid.Empty, vm.BatchJobId);
+        Assert.Empty(vm.Items);
+        Assert.Null(vm.SelectedItem);
+        Assert.Equal(0, vm.TotalCount + vm.ResourceCount + vm.OperationCount + vm.FailedCount +
+            vm.PausedCount + vm.CompleteSuccessCount + vm.TerminalProblemCount + vm.ExportedRows);
+        Assert.Equal("请选择一个任务查看结果。", vm.StatusMessage);
+        Assert.Equal(0, interaction.ResolveCalls);
+        Assert.Single(workflow.RequestedPageSizes);
+    }
+
+    [Fact]
+    public async Task ResetDuringPendingBatchInitializationDoesNotContinueRestore()
+    {
+        var batch = Guid.NewGuid();
+        var interaction = new FakeExistingShareInteraction(batch);
+        var workflow = new DelayedWorkflow(batch, Guid.NewGuid());
+        var vm = Create(workflow, existingShareInteraction: interaction);
+        var restoring = vm.RestorePendingExistingShareDecisionAsync();
+        await workflow.FirstStarted.Task;
+        vm.Reset();
+        workflow.ReleaseFirst();
+
+        Assert.Null(await restoring);
+        Assert.Equal(Guid.Empty, vm.BatchJobId);
+        Assert.Empty(vm.Items);
+        Assert.Equal("请选择一个任务查看结果。", vm.StatusMessage);
+        Assert.Equal(0, interaction.ResolveCalls);
+    }
+
+    private sealed class DelayedPendingExistingShareInteraction : IExistingShareDecisionInteraction
+    {
+        public TaskCompletionSource Started { get; } = new();
+        public TaskCompletionSource<IReadOnlyList<Guid>> Release { get; } = new();
+        public int ResolveCalls { get; private set; }
+        public Task<IReadOnlyList<Guid>> GetPendingBatchIdsAsync(int maximumCount = 1, CancellationToken cancellationToken = default)
+        {
+            Started.SetResult();
+            return Release.Task;
+        }
+        public Task<ExistingShareInteractionOutcome> ResolveAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+        {
+            ResolveCalls++;
+            return Task.FromResult(new ExistingShareInteractionOutcome(false, true, false, "已关闭确认。"));
+        }
+    }
     [Fact]
     public async Task ResetRejectsLateClipboardStatus()
     {
