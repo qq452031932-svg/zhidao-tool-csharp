@@ -1,0 +1,269 @@
+using System.Buffers.Binary;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using BaiduBatchTransfer.Core.Abstractions;
+using Microsoft.Data.Sqlite;
+
+namespace BaiduBatchTransfer.Infrastructure.Database;
+
+/// <summary>Deletes only a confirmed, unchanged terminal history snapshot. Register as a singleton.</summary>
+public sealed class SqliteLocalTerminalHistoryStore : ILocalTerminalHistoryStore
+{
+    private readonly SqliteConnectionFactory factory;
+    private readonly byte[] snapshotKey = RandomNumberGenerator.GetBytes(32);
+    private const string Batches = "SELECT Id FROM temp.HistoryBatches";
+    private const string Transfers = "SELECT Id FROM temp.HistoryOperations WHERE OwnerKind='Transfer'";
+    private const string Shares = "SELECT Id FROM temp.HistoryOperations WHERE OwnerKind='TransferShare'";
+    private const string Standalones = "SELECT Id FROM temp.HistoryOperations WHERE OwnerKind='StandaloneShare'";
+    private const string Resources = "SELECT Id FROM temp.HistoryResources";
+    // SQLite normalizes explicit offsets to UTC; malformed timestamps fail closed.
+    private const string ActiveLease = "(LeaseExpiresAt IS NOT NULL AND (julianday(LeaseExpiresAt) IS NULL OR julianday(LeaseExpiresAt)>julianday('now')))";
+
+    public SqliteLocalTerminalHistoryStore(SqliteConnectionFactory factory) =>
+        this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
+
+    public async Task<LocalHistoryCleanupPreview> PreviewAsync(LocalHistoryKind kind, CancellationToken cancellationToken = default)
+    {
+        ValidateKind(kind);
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        var snapshot = await ReadSnapshotAsync(connection, transaction, kind, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return snapshot;
+    }
+
+    public async Task<LocalHistoryCleanupResult> DeleteAsync(LocalHistoryCleanupPreview confirmedPreview, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(confirmedPreview);
+        ValidateKind(confirmedPreview.Kind);
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        // BEGIN IMMEDIATE prevents another writer from changing the validated closure before commit.
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        var current = await ReadSnapshotAsync(connection, transaction, confirmedPreview.Kind, cancellationToken).ConfigureAwait(false);
+        if (confirmedPreview.HasConflicts || current.HasConflicts ||
+            current.TerminalBatchCount != confirmedPreview.TerminalBatchCount ||
+            !TokenEquals(current.SnapshotToken, confirmedPreview.SnapshotToken))
+            return new(0, LocalHistoryCleanupDisposition.Conflict);
+        if (current.TerminalBatchCount == 0)
+            return new(0, LocalHistoryCleanupDisposition.NothingToDelete);
+
+        var oldForeignKeyIssues = await ForeignKeyIssuesAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        var scopes = Scopes(current.Kind);
+        // Delete non-FK automation evidence before the attempt, and attempts before their owners.
+        foreach (var scope in scopes.Where(s => s.Table.StartsWith("WebAutomation", StringComparison.Ordinal)))
+            await ExecuteAsync(connection, transaction, $"DELETE FROM {scope.Table} WHERE {scope.Predicate};", cancellationToken).ConfigureAwait(false);
+
+        await ExecuteAsync(connection, transaction,
+            $"DELETE FROM LocalResultExports WHERE {scopes.Single(s => s.Table == "LocalResultExports").Predicate};", cancellationToken).ConfigureAwait(false);
+        if (current.Kind == LocalHistoryKind.Transfer)
+        {
+            await ExecuteAsync(connection, transaction, $"""
+                DELETE FROM ExecutionLogs WHERE BatchJobId IN ({Batches})
+                  OR TransferOperationId IN ({Transfers}) OR ResourceItemId IN ({Resources});
+                DELETE FROM ShareOperations WHERE Id IN ({Shares});
+                DELETE FROM TransferOperations WHERE Id IN ({Transfers});
+                DELETE FROM AccountAllocations WHERE BatchJobId IN ({Batches});
+                DELETE FROM ResourceItems WHERE Id IN ({Resources});
+                UPDATE ImportSessions SET CreatedBatchJobId=NULL WHERE CreatedBatchJobId IN ({Batches});
+                UPDATE ImportSessions SET AppendToBatchJobId=NULL WHERE AppendToBatchJobId IN ({Batches});
+                DELETE FROM BatchJobs WHERE Id IN ({Batches});
+                """, cancellationToken).ConfigureAwait(false);
+        }
+        else
+            await ExecuteAsync(connection, transaction, $"""
+                DELETE FROM StandaloneShareOperations WHERE Id IN ({Standalones});
+                DELETE FROM StandaloneShareBatches WHERE Id IN ({Batches});
+                """, cancellationToken).ConfigureAwait(false);
+
+        // Parent deletion performs the real FK cascades. Checking the same persisted target
+        // identities afterwards also catches trigger-suppressed deletes and non-FK orphans.
+        foreach (var scope in scopes)
+            if (await ExistsAsync(connection, transaction, $"SELECT 1 FROM {scope.Table} WHERE {scope.Predicate}", cancellationToken).ConfigureAwait(false))
+                throw new InvalidDataException("Local history cleanup left target records behind.");
+        var newForeignKeyIssues = await ForeignKeyIssuesAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        if (!newForeignKeyIssues.IsSubsetOf(oldForeignKeyIssues))
+            throw new InvalidDataException("Local history cleanup introduced a database relationship violation.");
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new(current.TerminalBatchCount, LocalHistoryCleanupDisposition.Deleted);
+    }
+
+    private async Task<LocalHistoryCleanupPreview> ReadSnapshotAsync(
+        SqliteConnection connection, SqliteTransaction transaction, LocalHistoryKind kind, CancellationToken token)
+    {
+        var table = kind == LocalHistoryKind.Transfer ? "BatchJobs" : "StandaloneShareBatches";
+        var terminal = kind == LocalHistoryKind.Transfer
+            ? "'Completed','CompletedWithShortfall','Cancelled'" : "'Completed','CompletedWithFailures','Cancelled'";
+        await ExecuteAsync(connection, transaction, $"""
+            CREATE TEMP TABLE HistoryBatches(Id TEXT PRIMARY KEY);
+            INSERT INTO HistoryBatches SELECT Id FROM {table} WHERE Status IN ({terminal});
+            CREATE TEMP TABLE HistoryOperations(Id TEXT,OwnerKind TEXT,AccountId TEXT,PRIMARY KEY(Id,OwnerKind));
+            CREATE TEMP TABLE HistoryResources(Id TEXT PRIMARY KEY);
+            """, token).ConfigureAwait(false);
+        await ExecuteAsync(connection, transaction, kind == LocalHistoryKind.Transfer ? $"""
+            INSERT INTO HistoryResources SELECT Id FROM ResourceItems WHERE BatchJobId IN ({Batches});
+            INSERT INTO HistoryOperations SELECT Id,'Transfer',AssignedAccountId FROM TransferOperations WHERE BatchJobId IN ({Batches});
+            INSERT INTO HistoryOperations SELECT Id,'TransferShare',AccountId FROM ShareOperations WHERE BatchJobId IN ({Batches});
+            """ : $"""
+            INSERT INTO HistoryOperations SELECT Id,'StandaloneShare',AccountId FROM StandaloneShareOperations WHERE BatchId IN ({Batches});
+            """, token).ConfigureAwait(false);
+        await using var countCommand = Command(connection, transaction, "SELECT count(*) FROM temp.HistoryBatches;");
+        var count = checked(Convert.ToInt32(await countCommand.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture));
+        var conflicts = await HasConflictsAsync(connection, transaction, kind, token).ConfigureAwait(false);
+        using var hash = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, snapshotKey);
+        Append(hash, kind.ToString());
+        foreach (var scope in Scopes(kind))
+        {
+            Append(hash, scope.Table);
+            await using var command = Command(connection, transaction,
+                $"SELECT * FROM {scope.Table} WHERE {scope.Predicate} ORDER BY rowid;");
+            await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false))
+            {
+                hash.AppendData([1]);
+                for (var column = 0; column < reader.FieldCount; column++)
+                {
+                    Append(hash, reader.GetName(column));
+                    var value = reader.GetValue(column);
+                    if (value is DBNull) hash.AppendData([0]);
+                    else if (value is byte[] bytes) { hash.AppendData([2]); Append(hash, Convert.ToHexString(bytes)); }
+                    else { hash.AppendData([3]); Append(hash, Convert.ToString(value, CultureInfo.InvariantCulture)!); }
+                }
+            }
+            hash.AppendData([0]);
+        }
+        return new(kind, count, conflicts, Convert.ToHexString(hash.GetHashAndReset()));
+    }
+
+    private static async Task<bool> HasConflictsAsync(SqliteConnection c, SqliteTransaction tx, LocalHistoryKind kind, CancellationToken token)
+    {
+        var owner = kind == LocalHistoryKind.Transfer ? "TransferBatch" : "StandaloneShareBatch";
+        if (await ExistsAsync(c, tx, $"""
+            SELECT 1 FROM LocalResultExports WHERE OwnerKind='{owner}' AND OwnerId IN ({Batches})
+              AND (Status='InProgress' OR {ActiveLease})
+            UNION ALL
+            SELECT 1 FROM WebAutomationAttempts attempt
+            JOIN temp.HistoryOperations target ON target.Id=attempt.OperationId
+            WHERE attempt.State NOT IN ('Succeeded','DefinitelyNotSubmitted') OR attempt.IsWaitingForUser<>0
+              OR attempt.ResumeStage IS NOT NULL OR attempt.OwnerKind<>target.OwnerKind OR attempt.AccountId<>target.AccountId
+            """, token).ConfigureAwait(false)) return true;
+        if (kind == LocalHistoryKind.Transfer)
+            return await ExistsAsync(c, tx, $"""
+                SELECT 1 FROM TransferOperations WHERE Id IN ({Transfers}) AND (
+                    Status NOT IN ('Succeeded','Failed','Cancelled') OR {ActiveLease}
+                    OR SubmitState IN ('Submitting','PendingConfirmation') OR TargetSlotState='Reserved'
+                    OR (Status='Failed' AND SubmitState IN ('NotPrepared','PreparingToSubmit'))
+                    OR (Status='Cancelled' AND (SubmitStartedAt IS NOT NULL OR AdapterRequestId IS NOT NULL
+                        OR ConfirmationDescriptorJson IS NOT NULL OR DailyCountedAt IS NOT NULL)))
+                UNION ALL
+                SELECT 1 FROM ShareOperations WHERE Id IN ({Shares}) AND (
+                    Status NOT IN ('Succeeded','ReusedExisting','Failed','Cancelled') OR {ActiveLease}
+                    OR NextReconcileAt IS NOT NULL
+                    OR (Status IN ('Failed','Cancelled') AND SubmissionAcceptance<>'DefinitelyNotAccepted'
+                        AND (RequestDescriptorJson IS NOT NULL OR AdapterRequestId IS NOT NULL OR SubmitStartedAt IS NOT NULL
+                             OR BaselineCompletedAt IS NOT NULL OR AttemptCount<>0)))
+                UNION ALL
+                SELECT 1 FROM ResourceItems WHERE Id IN ({Resources}) AND
+                    (CandidateStatus='Reserved' OR ReservedAccountId IS NOT NULL OR ReservationExpiresAt IS NOT NULL)
+                UNION ALL
+                SELECT 1 FROM TransferOperations WHERE ResourceItemId IN ({Resources}) AND BatchJobId NOT IN ({Batches})
+                UNION ALL
+                SELECT 1 FROM BatchShareDiscoveryRuns WHERE BatchJobId IN ({Batches})
+                UNION ALL
+                SELECT 1 FROM ExecutionLogs WHERE BatchJobId IS NOT NULL AND BatchJobId NOT IN ({Batches})
+                  AND (TransferOperationId IN ({Transfers}) OR ResourceItemId IN ({Resources}))
+                """, token).ConfigureAwait(false);
+        return await ExistsAsync(c, tx, $"""
+            SELECT 1 FROM StandaloneShareOperations WHERE Id IN ({Standalones}) AND (
+                Status NOT IN ('Succeeded','Failed','Cancelled') OR {ActiveLease}
+                OR NextReconcileAt IS NOT NULL OR ReconciliationIssue IS NOT NULL
+                OR SubmissionState IN ('Prepared','Accepted','ResultPending')
+                OR (Status='Succeeded' AND SubmissionState<>'Completed')
+                OR (Status='Failed' AND SubmissionState IN ('NotStarted','DefinitelyNotAccepted'))
+                OR (Status='Cancelled' AND (RequestDescriptorJson IS NOT NULL OR SubmitStartedAt IS NOT NULL OR AdapterRequestId IS NOT NULL)))
+            """, token).ConfigureAwait(false);
+    }
+
+    private static List<Scope> Scopes(LocalHistoryKind kind)
+    {
+        // Directory mutations intentionally have no FK. Scope by owner identity across
+        // all generations, including evidence from older attempts and orphaned generations.
+        var result = new List<Scope>();
+        foreach (var table in new[] { "WebAutomationDirectoryMutations", "WebAutomationAttemptSourceItems", "WebAutomationAttemptRemoteItems", "WebAutomationTransferMappings", "WebAutomationAttemptAcceptedRemoteItems", "WebAutomationShareAcceptances", "WebAutomationAttempts" })
+            result.Add(new(table, $"EXISTS(SELECT 1 FROM temp.HistoryOperations target WHERE target.Id={table}.OperationId AND target.AccountId={table}.AccountId)"));
+        result.Add(new("LocalResultExports", $"OwnerKind='{(kind == LocalHistoryKind.Transfer ? "TransferBatch" : "StandaloneShareBatch")}' AND OwnerId IN ({Batches})"));
+        if (kind == LocalHistoryKind.Transfer)
+        {
+            result.Add(new("TransferOperations", $"Id IN ({Transfers})"));
+            result.Add(new("ShareOperations", $"Id IN ({Shares})"));
+            foreach (var table in new[] { "ShareOperationGenerations", "ShareOperationRemoteItems", "ShareDiscoveryBaselines", "BaiduShareResults" })
+                result.Add(new(table, $"ShareOperationId IN ({Shares})"));
+            result.Add(new("ResourceItems", $"Id IN ({Resources})"));
+            result.Add(new("ExecutionLogs", $"BatchJobId IN ({Batches}) OR TransferOperationId IN ({Transfers}) OR ResourceItemId IN ({Resources})"));
+            foreach (var table in new[] { "AccountAllocations", "BatchShareSettings", "BatchCreationReceipts", "BatchSourceColumns", "BatchOutputAccounts", "BatchShareDecisionSnapshots", "BatchShareDiscoverySnapshots", "BatchShareDiscoveryMembers", "BatchShareDiscoveryExactSets", "BatchShareDiscoveryRuns", "BatchShareDiscoveryStaging", "BatchResultDestinations" })
+                result.Add(new(table, $"BatchJobId IN ({Batches})"));
+            result.Add(new("DirectBackgroundAcceptanceAuthorizations", $"BatchId IN ({Batches})"));
+            result.Add(new("ImportSessions", $"CreatedBatchJobId IN ({Batches}) OR AppendToBatchJobId IN ({Batches})"));
+            result.Add(new("BatchJobs", $"Id IN ({Batches})"));
+        }
+        else
+        {
+            result.Add(new("StandaloneShareOperations", $"Id IN ({Standalones})"));
+            foreach (var table in new[] { "StandaloneShareRemoteItems", "StandaloneShareDiscoveryBaselines", "StandaloneShareResults" })
+                result.Add(new(table, $"OperationId IN ({Standalones})"));
+            result.Add(new("StandaloneShareBatches", $"Id IN ({Batches})"));
+        }
+        return result;
+    }
+
+    private static async Task<HashSet<string>> ForeignKeyIssuesAsync(SqliteConnection c, SqliteTransaction tx, CancellationToken token)
+    {
+        var issues = new HashSet<string>(StringComparer.Ordinal);
+        await using var command = Command(c, tx, "PRAGMA foreign_key_check;");
+        await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+        while (await reader.ReadAsync(token).ConfigureAwait(false))
+            issues.Add(string.Join("|", Enumerable.Range(0, reader.FieldCount).Select(i => Convert.ToString(reader.GetValue(i), CultureInfo.InvariantCulture))));
+        return issues;
+    }
+
+    private static bool TokenEquals(string? current, string? supplied) =>
+        current is not null && supplied is not null && supplied.Length == current.Length &&
+        CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(current), Encoding.ASCII.GetBytes(supplied));
+
+    private static void Append(IncrementalHash hash, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        Span<byte> length = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(length, bytes.Length);
+        hash.AppendData(length);
+        hash.AppendData(bytes);
+    }
+
+    private static void ValidateKind(LocalHistoryKind kind)
+    {
+        if (kind is not (LocalHistoryKind.Transfer or LocalHistoryKind.StandaloneShare))
+            throw new ArgumentOutOfRangeException(nameof(kind));
+    }
+
+    private static SqliteCommand Command(SqliteConnection c, SqliteTransaction tx, string sql)
+    {
+        var command = c.CreateCommand();
+        command.Transaction = tx;
+        command.CommandText = sql;
+        return command;
+    }
+
+    private static async Task ExecuteAsync(SqliteConnection c, SqliteTransaction tx, string sql, CancellationToken token)
+    {
+        await using var command = Command(c, tx, sql);
+        await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> ExistsAsync(SqliteConnection c, SqliteTransaction tx, string sql, CancellationToken token)
+    {
+        await using var command = Command(c, tx, $"SELECT EXISTS({sql});");
+        return Convert.ToInt64(await command.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture) != 0;
+    }
+
+    private sealed record Scope(string Table, string Predicate);
+}
