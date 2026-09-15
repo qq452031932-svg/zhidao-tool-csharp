@@ -159,11 +159,42 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 	if err := validateSetupStructure(files[setupName]); err != nil {
 		return Report{}, fmt.Errorf("%w: %v", ErrMetadata, err)
 	}
+	fullLayouts := make(map[string]packageLayout, len(fullAssets))
+	for _, asset := range feed.Assets {
+		if *asset.Type != "Full" {
+			continue
+		}
+		layout, layoutErr := classifyFullPackageStructure(files[*asset.FileName], *asset.Version)
+		if layoutErr != nil {
+			return Report{}, fmt.Errorf("%w: %s: %v", ErrMetadata, *asset.FileName, layoutErr)
+		}
+		fullLayouts[*asset.Version] = layout
+	}
+	currentLayout := fullLayouts[currentVersion]
+	if currentLayout != packageLayoutRenamed {
+		return Report{}, fmt.Errorf("%w: current Full package does not use the renamed layout", ErrMetadata)
+	}
 	if err := validatePortableStructure(files[portableName], currentVersion); err != nil {
 		return Report{}, fmt.Errorf("%w: %v", ErrMetadata, err)
 	}
+	currentParsed, _ := parseVersion(currentVersion)
+	baseVersion := version{}
+	baseLayout := packageLayout(0)
+	for _, full := range fullAssets {
+		if full.parsed.compare(currentParsed) >= 0 || baseLayout != 0 && full.parsed.compare(baseVersion) <= 0 {
+			continue
+		}
+		baseVersion = full.parsed
+		baseLayout = fullLayouts[*releaseFiles[full.name].Version]
+	}
 	for _, asset := range feed.Assets {
-		if err := validatePackageStructure(files[*asset.FileName], *asset.Version, *asset.Type, currentVersion); err != nil {
+		if *asset.Type != "Delta" {
+			continue
+		}
+		if *asset.Version != currentVersion {
+			return Report{}, fmt.Errorf("%w: historical Delta packages are not allowed", ErrMetadata)
+		}
+		if err := validateDeltaPackageStructure(files[*asset.FileName], *asset.Version, baseLayout, currentLayout); err != nil {
 			return Report{}, fmt.Errorf("%w: %s: %v", ErrMetadata, *asset.FileName, err)
 		}
 	}

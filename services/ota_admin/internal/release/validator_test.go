@@ -29,9 +29,16 @@ import (
 )
 
 type fixtureAsset struct {
-	version string
-	kind    string
+	version    string
+	kind       string
+	layout     string
+	baseLayout string
 }
+
+const (
+	fixtureLayoutLegacy  = "legacy"
+	fixtureLayoutRenamed = "renamed"
+)
 
 type bundleFixture struct {
 	t         *testing.T
@@ -43,10 +50,10 @@ type bundleFixture struct {
 }
 
 func newBundleFixture(t *testing.T, version string, includeDelta bool) *bundleFixture {
-	assets := []fixtureAsset{{version: version, kind: "Full"}}
+	assets := []fixtureAsset{{version: version, kind: "Full", layout: fixtureLayoutRenamed}}
 	if includeDelta {
-		assets = append([]fixtureAsset{{version: previousVersion(t, version), kind: "Full"}}, assets...)
-		assets = append(assets, fixtureAsset{version: version, kind: "Delta"})
+		assets = append([]fixtureAsset{{version: previousVersion(t, version), kind: "Full", layout: fixtureLayoutLegacy}}, assets...)
+		assets = append(assets, fixtureAsset{version: version, kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutLegacy})
 	}
 	return newBundleFixtureWithAssets(t, assets)
 }
@@ -86,7 +93,7 @@ func newBundleFixtureWithAssets(t *testing.T, specs []fixtureAsset) *bundleFixtu
 	}
 	for _, spec := range specs {
 		name := fmt.Sprintf("%s-%s-%s.nupkg", packageID, spec.version, strings.ToLower(spec.kind))
-		fixture.files[name] = makeNupkg(t, spec.version, spec.kind, channel, spec.version == currentVersion)
+		fixture.files[name] = makeNupkg(t, spec.version, spec.kind, channel, spec.layout, spec.baseLayout)
 		assets = append(assets, fixture.releaseAsset(spec.version, spec.kind, name))
 		if spec.kind == "Full" {
 			fullNames = append(fullNames, name)
@@ -146,10 +153,10 @@ func previousVersion(t *testing.T, value string) string {
 	return fmt.Sprintf("%d.%d.%d", numbers[0], numbers[1], numbers[2])
 }
 
-func makeNupkg(t *testing.T, version, kind, packageChannel string, current bool) []byte {
+func makeNupkg(t *testing.T, version, kind, packageChannel, layout, baseLayout string) []byte {
 	t.Helper()
 	mainExecutable := productLegacyExecutableName
-	if current {
+	if layout == fixtureLayoutRenamed {
 		mainExecutable = productMainExecutableName
 	}
 	entries := map[string][]byte{
@@ -160,7 +167,7 @@ func makeNupkg(t *testing.T, version, kind, packageChannel string, current bool)
 	if kind == "Full" {
 		assemblyName := productLegacyAssemblyName
 		dllName := assemblyName + ".dll"
-		if current {
+		if layout == fixtureLayoutRenamed {
 			assemblyName = productMainAssemblyName
 			dllName = productMainDLLName
 		}
@@ -169,19 +176,22 @@ func makeNupkg(t *testing.T, version, kind, packageChannel string, current bool)
 		entries["lib/app/"+assemblyName+".runtimeconfig.json"] = []byte(`{}`)
 		entries["lib/app/"+assemblyName+"_ExecutionStub.exe"] = makeSetupImage()
 		entries["lib/app/"+mainExecutable] = makeSetupImage()
-		if current {
+		if layout == fixtureLayoutRenamed {
 			entries["lib/app/"+productLegacyExecutableName] = makeSetupImage()
 		}
 		entries["lib/app/Squirrel.exe"] = makeSetupImage()
 	} else {
-		entries["lib/app/"+productLegacyExecutableName+".diff"] = []byte("real patch bytes")
-		entries["lib/app/"+productLegacyExecutableName+".shasum"] = []byte(strings.Repeat("0", 64))
-		if current {
+		if baseLayout == fixtureLayoutLegacy {
+			entries["lib/app/"+productLegacyExecutableName+".diff"] = []byte("real patch bytes")
+			entries["lib/app/"+productLegacyExecutableName+".shasum"] = []byte(strings.Repeat("0", 64))
 			entries["lib/app/"+productMainAssemblyName+"_ExecutionStub.exe"] = makeSetupImage()
 			entries["lib/app/"+productMainExecutableName] = makeSetupImage()
 			entries["lib/app/"+productMainDLLName] = []byte("managed assembly")
 			entries["lib/app/"+productMainAssemblyName+".deps.json"] = []byte(`{}`)
 			entries["lib/app/"+productMainAssemblyName+".runtimeconfig.json"] = []byte(`{}`)
+		} else {
+			entries["lib/app/"+productMainExecutableName+".diff"] = []byte("routine patch bytes")
+			entries["lib/app/"+productMainExecutableName+".shasum"] = []byte(strings.Repeat("0", 64))
 		}
 	}
 	return zipBytes(t, entries)
@@ -373,20 +383,59 @@ func TestValidatorAcceptsExactProductionClosureAndReportsCurrentVersion(t *testi
 	}
 }
 
-func TestValidatorAcceptsRetainedHistoricalDeltasWithLowerFullBases(t *testing.T) {
+func TestValidatorAcceptsRenamedHistoricalFullAndRoutineCurrentDelta(t *testing.T) {
 	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
-		{version: "1.2.1", kind: "Full"},
-		{version: "1.2.2", kind: "Full"},
-		{version: "1.2.2", kind: "Delta"},
-		{version: "1.2.3", kind: "Full"},
-		{version: "1.2.3", kind: "Delta"},
+		{version: "1.2.2", kind: "Full", layout: fixtureLayoutLegacy},
+		{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutRenamed},
 	})
 	report, err := fixture.validator.Validate(context.Background(), fixture.envelope, "1.2.0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Version != "1.2.3" {
+	if report.Version != "1.2.4" {
 		t.Fatalf("version = %q", report.Version)
+	}
+}
+
+func TestValidatorRejectsDeltaThatDoesNotMatchHighestLowerFullLayout(t *testing.T) {
+	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
+		{version: "1.2.2", kind: "Full", layout: fixtureLayoutLegacy},
+		{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutLegacy},
+	})
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+		t.Fatalf("error = %v, want %v", err, ErrMetadata)
+	}
+}
+
+func TestValidatorRejectsEmptyOptionalPublisherExecutableInRoutineDelta(t *testing.T) {
+	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
+		{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutRenamed},
+	})
+	name := fmt.Sprintf("%s-1.2.4-delta.nupkg", packageID)
+	entries := readZipBytes(t, fixture.files[name])
+	entries["lib/app/"+productLegacyExecutableName] = []byte{}
+	fixture.replaceReleaseAsset(name, zipBytes(t, entries))
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+		t.Fatalf("error = %v, want %v", err, ErrMetadata)
+	}
+}
+
+func TestValidatorRejectsHistoricalDeltaEvenWhenCurrentDeltaExists(t *testing.T) {
+	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
+		{version: "1.2.1", kind: "Full", layout: fixtureLayoutLegacy},
+		{version: "1.2.2", kind: "Full", layout: fixtureLayoutLegacy},
+		{version: "1.2.2", kind: "Delta", layout: fixtureLayoutLegacy, baseLayout: fixtureLayoutLegacy},
+		{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.3", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutLegacy},
+	})
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+		t.Fatalf("error = %v, want %v", err, ErrMetadata)
 	}
 }
 
@@ -395,9 +444,12 @@ func TestValidatorRejectsDeltaWithoutLowerFullAndMissingCurrentDelta(t *testing.
 		name   string
 		assets []fixtureAsset
 	}{
-		{"no lower Full base", []fixtureAsset{{version: "1.2.3", kind: "Full"}, {version: "1.2.3", kind: "Delta"}}},
+		{"no lower Full base", []fixtureAsset{{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed}, {version: "1.2.3", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutLegacy}}},
 		{"historical Delta but no current Delta", []fixtureAsset{
-			{version: "1.2.1", kind: "Full"}, {version: "1.2.2", kind: "Full"}, {version: "1.2.2", kind: "Delta"}, {version: "1.2.3", kind: "Full"},
+			{version: "1.2.1", kind: "Full", layout: fixtureLayoutLegacy},
+			{version: "1.2.2", kind: "Full", layout: fixtureLayoutRenamed},
+			{version: "1.2.2", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutLegacy},
+			{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
 		}},
 	}
 	for _, test := range tests {
@@ -506,7 +558,7 @@ func TestValidatorRejectsArbitraryOrMismatchedPackageStructures(t *testing.T) {
 			f.replaceReleaseAsset("SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg", []byte("not a package"))
 		}},
 		{"renamed Acceptance Full", func(f *bundleFixture) {
-			f.replaceReleaseAsset("SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg", makeNupkg(t, "1.2.3", "Full", "ota-acceptance", true))
+			f.replaceReleaseAsset("SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg", makeNupkg(t, "1.2.3", "Full", "ota-acceptance", fixtureLayoutRenamed, ""))
 		}},
 		{"Delta without patch structure", func(f *bundleFixture) {
 			name := "SuperPan.BaiduBatchTransfer-1.2.3-delta.nupkg"
@@ -536,9 +588,9 @@ func TestValidatorRejectsArbitraryOrMismatchedPackageStructures(t *testing.T) {
 
 func TestValidatorAcceptsHistoricalLegacyFullAndCurrentDeltaReplacement(t *testing.T) {
 	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
-		{version: "1.2.2", kind: "Full"},
-		{version: "1.2.3", kind: "Full"},
-		{version: "1.2.3", kind: "Delta"},
+		{version: "1.2.2", kind: "Full", layout: fixtureLayoutLegacy},
+		{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.3", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutLegacy},
 	})
 	deltaName := fmt.Sprintf("%s-1.2.3-delta.nupkg", packageID)
 	entries := readZipBytes(t, fixture.files[deltaName])
@@ -559,12 +611,18 @@ func TestValidatorRejectsCurrentPackagesThatDoNotExpressRenameMigration(t *testi
 	}{
 		{"current Full uses historical layout", func(f *bundleFixture) {
 			name := fmt.Sprintf("%s-1.2.3-full.nupkg", packageID)
-			f.replaceReleaseAsset(name, makeNupkg(t, "1.2.3", "Full", channel, false))
+			f.replaceReleaseAsset(name, makeNupkg(t, "1.2.3", "Full", channel, fixtureLayoutLegacy, ""))
 		}},
 		{"current Full lacks compatibility launcher", func(f *bundleFixture) {
 			name := fmt.Sprintf("%s-1.2.3-full.nupkg", packageID)
 			entries := readZipBytes(t, f.files[name])
 			delete(entries, "lib/app/"+productLegacyExecutableName)
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"current Full mixes legacy business companions", func(f *bundleFixture) {
+			name := fmt.Sprintf("%s-1.2.3-full.nupkg", packageID)
+			entries := readZipBytes(t, f.files[name])
+			entries["lib/app/"+productLegacyAssemblyName+".dll"] = []byte("stale legacy assembly")
 			f.replaceReleaseAsset(name, zipBytes(t, entries))
 		}},
 		{"Portable lacks compatibility launcher", func(f *bundleFixture) {
@@ -602,6 +660,12 @@ func TestValidatorRejectsCurrentPackagesThatDoNotExpressRenameMigration(t *testi
 			name := fmt.Sprintf("%s-1.2.3-delta.nupkg", packageID)
 			entries := readZipBytes(t, f.files[name])
 			entries["lib/app/evil.exe"] = makeSetupImage()
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"Delta has both patch encodings for one target", func(f *bundleFixture) {
+			name := fmt.Sprintf("%s-1.2.3-delta.nupkg", packageID)
+			entries := readZipBytes(t, f.files[name])
+			entries["lib/app/"+productLegacyExecutableName+".zsdiff"] = []byte("duplicate patch encoding")
 			f.replaceReleaseAsset(name, zipBytes(t, entries))
 		}},
 	}

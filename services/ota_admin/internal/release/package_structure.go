@@ -66,93 +66,216 @@ func validateSetupStructure(file *verifiedFile) error {
 	return nil
 }
 
-func validatePackageStructure(file *verifiedFile, expectedVersion, expectedType, currentVersion string) error {
+type packageLayout uint8
+
+const (
+	packageLayoutLegacy packageLayout = iota + 1
+	packageLayoutRenamed
+)
+
+func classifyFullPackageStructure(file *verifiedFile, expectedVersion string) (packageLayout, error) {
 	inner, err := openInnerArchive(file)
 	if err != nil {
+		return 0, err
+	}
+	legacyErr := validateFullLayout(inner, expectedVersion, packageLayoutLegacy)
+	renamedErr := validateFullLayout(inner, expectedVersion, packageLayoutRenamed)
+	if legacyErr == nil && renamedErr != nil {
+		return packageLayoutLegacy, nil
+	}
+	if renamedErr == nil && legacyErr != nil {
+		return packageLayoutRenamed, nil
+	}
+	return 0, errors.New("Full package does not match exactly one supported application layout")
+}
+
+func validateFullLayout(inner *innerArchive, expectedVersion string, layout packageLayout) error {
+	assemblyName := productLegacyAssemblyName
+	dllName := assemblyName + ".dll"
+	mainExecutable := productLegacyExecutableName
+	requiredExecutables := []string{
+		"lib/app/" + assemblyName + "_ExecutionStub.exe",
+		"lib/app/" + mainExecutable,
+		"lib/app/Squirrel.exe",
+	}
+	if layout == packageLayoutRenamed {
+		assemblyName = productMainAssemblyName
+		dllName = productMainDLLName
+		mainExecutable = productMainExecutableName
+		requiredExecutables = []string{
+			"lib/app/" + assemblyName + "_ExecutionStub.exe",
+			"lib/app/" + mainExecutable,
+			"lib/app/" + productLegacyExecutableName,
+			"lib/app/Squirrel.exe",
+		}
+	}
+	if err := validatePackageEnvelope(inner, expectedVersion, mainExecutable); err != nil {
 		return err
 	}
+	for _, required := range []string{
+		"lib/app/" + dllName,
+		"lib/app/" + assemblyName + ".deps.json",
+		"lib/app/" + assemblyName + ".runtimeconfig.json",
+	} {
+		if _, ok := inner.entries[required]; !ok {
+			return fmt.Errorf("Full package is missing %s", required)
+		}
+	}
+	oppositeAssembly := productMainAssemblyName
+	oppositeDLL := productMainDLLName
+	if layout == packageLayoutRenamed {
+		oppositeAssembly = productLegacyAssemblyName
+		oppositeDLL = oppositeAssembly + ".dll"
+	}
+	for _, forbidden := range []string{
+		"lib/app/" + oppositeDLL,
+		"lib/app/" + oppositeAssembly + ".deps.json",
+		"lib/app/" + oppositeAssembly + ".runtimeconfig.json",
+	} {
+		if _, mixed := inner.entries[forbidden]; mixed {
+			return fmt.Errorf("Full package mixes application layouts at %s", forbidden)
+		}
+	}
+	return validateExecutableSet(inner, requiredExecutables, []string{
+		"lib/app/managed-browser-helper/python.exe",
+		"lib/app/managed-browser-helper/pythonw.exe",
+	})
+}
+
+func validatePackageEnvelope(inner *innerArchive, expectedVersion, mainExecutable string) error {
 	for _, required := range []string{"[Content_Types].xml", "_rels/.rels", packageID + ".nuspec"} {
 		if _, ok := inner.entries[required]; !ok {
 			return fmt.Errorf("package is missing %s", required)
 		}
 	}
-	isCurrent := expectedVersion == currentVersion
-	expectedMainExecutable := productLegacyExecutableName
-	if isCurrent {
-		expectedMainExecutable = productMainExecutableName
-	}
-	if err := validateNuspec(inner.entries[packageID+".nuspec"], expectedVersion, expectedMainExecutable, false); err != nil {
+	return validateNuspec(inner.entries[packageID+".nuspec"], expectedVersion, mainExecutable, false)
+}
+
+func validateDeltaPackageStructure(file *verifiedFile, expectedVersion string, baseLayout, targetLayout packageLayout) error {
+	inner, err := openInnerArchive(file)
+	if err != nil {
 		return err
 	}
-	if expectedType == "Full" {
-		assemblyName := productLegacyAssemblyName
-		dllName := assemblyName + ".dll"
-		if isCurrent {
-			assemblyName = productMainAssemblyName
-			dllName = productMainDLLName
-		}
-		for _, required := range []string{
-			"lib/app/" + dllName,
-			"lib/app/" + assemblyName + ".deps.json",
-			"lib/app/" + assemblyName + ".runtimeconfig.json",
-		} {
-			if _, ok := inner.entries[required]; !ok {
-				return fmt.Errorf("Full package is missing %s", required)
-			}
-		}
-		requiredExecutables := []string{
-			"lib/app/" + assemblyName + "_ExecutionStub.exe",
-			"lib/app/" + expectedMainExecutable,
-			"lib/app/Squirrel.exe",
-		}
-		if isCurrent {
-			requiredExecutables = append(requiredExecutables, "lib/app/"+productLegacyExecutableName)
-		}
-		return validateExecutableSet(inner, requiredExecutables, []string{
-			"lib/app/managed-browser-helper/python.exe",
-			"lib/app/managed-browser-helper/pythonw.exe",
-		})
+	if targetLayout != packageLayoutRenamed || (baseLayout != packageLayoutLegacy && baseLayout != packageLayoutRenamed) {
+		return errors.New("Delta package layout transition is unsupported")
 	}
+	if err := validatePackageEnvelope(inner, expectedVersion, productMainExecutableName); err != nil {
+		return err
+	}
+	allowedPatchExecutables := map[string]struct{}{
+		"lib/app/" + productMainExecutableName:                      {},
+		"lib/app/" + productMainAssemblyName + "_ExecutionStub.exe": {},
+		"lib/app/" + productLegacyExecutableName:                    {},
+		"lib/app/Squirrel.exe":                                      {},
+	}
+	patches, err := validateDeltaPatches(inner, allowedPatchExecutables)
+	if err != nil {
+		return err
+	}
+	if baseLayout == packageLayoutLegacy {
+		return validateLegacyToRenamedDelta(inner, patches)
+	}
+	return validateRenamedToRenamedDelta(inner, patches)
+}
+
+func validateLegacyToRenamedDelta(inner *innerArchive, patches map[string]struct{}) error {
 	legacyBase := "lib/app/" + productLegacyExecutableName
-	if isCurrent {
-		for _, required := range []string{
-			"lib/app/" + productMainDLLName,
-			"lib/app/" + productMainAssemblyName + ".deps.json",
-			"lib/app/" + productMainAssemblyName + ".runtimeconfig.json",
-		} {
-			if _, ok := inner.entries[required]; !ok {
-				return fmt.Errorf("Delta package is missing %s", required)
-			}
+	for _, required := range []string{
+		"lib/app/" + productMainDLLName,
+		"lib/app/" + productMainAssemblyName + ".deps.json",
+		"lib/app/" + productMainAssemblyName + ".runtimeconfig.json",
+	} {
+		if _, ok := inner.entries[required]; !ok {
+			return fmt.Errorf("Delta package is missing %s", required)
 		}
 	}
 	_, legacyReplacement := inner.entries[legacyBase]
-	_, diff := inner.entries[legacyBase+".diff"]
-	_, zsdiff := inner.entries[legacyBase+".zsdiff"]
-	if !legacyReplacement && ((!diff && !zsdiff) || inner.entries[legacyBase+".shasum"] == nil) {
+	_, legacyPatch := patches[legacyBase]
+	if legacyReplacement == legacyPatch {
 		return errors.New("Delta package does not replace or patch the compatibility executable")
 	}
-	for name := range inner.entries {
+	requiredExecutables := []string{
+		"lib/app/" + productMainAssemblyName + "_ExecutionStub.exe",
+		"lib/app/" + productMainExecutableName,
+	}
+	if legacyReplacement {
+		requiredExecutables = append(requiredExecutables, legacyBase)
+	}
+	return validateExecutableSet(inner, requiredExecutables, nil)
+}
+
+func validateRenamedToRenamedDelta(inner *innerArchive, patches map[string]struct{}) error {
+	mainBase := "lib/app/" + productMainExecutableName
+	_, mainReplacement := inner.entries[mainBase]
+	_, mainPatch := patches[mainBase]
+	if mainReplacement == mainPatch {
+		return errors.New("Delta package must replace or uniquely patch the renamed main executable")
+	}
+	legacyBase := "lib/app/" + productLegacyExecutableName
+	_, legacyReplacement := inner.entries[legacyBase]
+	_, legacyPatch := patches[legacyBase]
+	if (legacyReplacement || legacyPatch) && containsAllEntries(inner,
+		mainBase,
+		"lib/app/"+productMainAssemblyName+"_ExecutionStub.exe",
+		"lib/app/"+productMainDLLName,
+		"lib/app/"+productMainAssemblyName+".deps.json",
+		"lib/app/"+productMainAssemblyName+".runtimeconfig.json",
+	) {
+		return errors.New("Delta package replays a legacy-to-renamed migration against a renamed base")
+	}
+	requiredExecutables := []string(nil)
+	if mainReplacement {
+		requiredExecutables = append(requiredExecutables, mainBase)
+	}
+	for _, optionalExecutable := range []string{
+		"lib/app/" + productMainAssemblyName + "_ExecutionStub.exe",
+		"lib/app/" + productLegacyExecutableName,
+	} {
+		if _, present := inner.entries[optionalExecutable]; present {
+			requiredExecutables = append(requiredExecutables, optionalExecutable)
+		}
+	}
+	return validateExecutableSet(inner, requiredExecutables, nil)
+}
+
+func containsAllEntries(inner *innerArchive, names ...string) bool {
+	for _, name := range names {
+		if _, ok := inner.entries[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func validateDeltaPatches(inner *innerArchive, allowedExecutableBases map[string]struct{}) (map[string]struct{}, error) {
+	patches := make(map[string]struct{})
+	for name, entry := range inner.entries {
 		base := ""
 		if strings.HasPrefix(name, "lib/app/") && strings.HasSuffix(name, ".zsdiff") {
 			base = strings.TrimSuffix(name, ".zsdiff")
 		} else if strings.HasPrefix(name, "lib/app/") && strings.HasSuffix(name, ".diff") {
 			base = strings.TrimSuffix(name, ".diff")
 		}
-		if base != "" && inner.entries[base+".shasum"] == nil {
-			return fmt.Errorf("Delta patch has no shasum: %s", name)
+		if base == "" {
+			continue
 		}
+		if _, duplicate := patches[base]; duplicate {
+			return nil, fmt.Errorf("Delta package has multiple patches for %s", base)
+		}
+		if entry.UncompressedSize64 == 0 || inner.entries[base+".shasum"] == nil {
+			return nil, fmt.Errorf("Delta patch is empty or has no shasum: %s", name)
+		}
+		if _, direct := inner.entries[base]; direct {
+			return nil, fmt.Errorf("Delta package both replaces and patches %s", base)
+		}
+		if strings.HasSuffix(strings.ToLower(base), ".exe") {
+			if _, allowed := allowedExecutableBases[base]; !allowed {
+				return nil, fmt.Errorf("Delta package patches unexpected executable %s", base)
+			}
+		}
+		patches[base] = struct{}{}
 	}
-	requiredExecutables := []string(nil)
-	if isCurrent {
-		requiredExecutables = append(requiredExecutables,
-			"lib/app/"+productMainAssemblyName+"_ExecutionStub.exe",
-			"lib/app/"+productMainExecutableName,
-		)
-	}
-	if legacyReplacement {
-		requiredExecutables = append(requiredExecutables, legacyBase)
-	}
-	return validateExecutableSet(inner, requiredExecutables, nil)
+	return patches, nil
 }
 
 func validatePortableStructure(file *verifiedFile, expectedVersion string) error {
