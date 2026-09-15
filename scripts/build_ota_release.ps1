@@ -187,6 +187,8 @@ function Install-VerifiedLegacyLauncher(
     $legacyLauncherProbeDirectory = Join-Path $ProbeParent (
         '.legacy-launcher-probe-' + [Guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($legacyLauncherProbeDirectory) | Out-Null
+    $legacyLauncherProbeCanBeRemoved = $true
+    $legacyLauncherFailure = $null
     try {
         $probeLauncher = Join-Path $legacyLauncherProbeDirectory $legacyLauncherExecutableName
         [IO.File]::Copy($launcherSource, $probeLauncher, $false)
@@ -201,33 +203,71 @@ function Install-VerifiedLegacyLauncher(
         $startInfo.CreateNoWindow = $true
         $startInfo.EnvironmentVariables['BAIDU_BATCH_TRANSFER_LEGACY_LAUNCHER_SUPPRESS_DIALOG'] = '1'
         $process = [Diagnostics.Process]::Start($startInfo)
+        if ($null -eq $process) {
+            throw 'Legacy launcher single-file probe could not be started.'
+        }
+        $legacyLauncherProbeCanBeRemoved = $false
         try {
             if (-not $process.WaitForExit(15000)) {
-                try { $process.Kill() } catch {}
-                throw 'Legacy launcher single-file probe timed out.'
+                $legacyLauncherFailure = 'Legacy launcher single-file probe timed out.'
+                try {
+                    $process.Kill()
+                }
+                catch {
+                    $legacyLauncherFailure += " Termination request failed: $($_.Exception.Message)"
+                }
+
+                $legacyLauncherExitConfirmed = $false
+                try {
+                    $legacyLauncherExitConfirmed = $process.WaitForExit(5000)
+                }
+                catch {
+                    $legacyLauncherFailure += " Exit confirmation failed: $($_.Exception.Message)"
+                }
+                if ($legacyLauncherExitConfirmed) {
+                    $legacyLauncherProbeCanBeRemoved = $true
+                    $legacyLauncherFailure += ' Process termination was confirmed.'
+                }
+                else {
+                    $legacyLauncherFailure += " Process exit could not be confirmed within 5000 ms; probe directory retained: $legacyLauncherProbeDirectory"
+                }
             }
-            $legacyLauncherExitCode = $process.ExitCode
+            else {
+                $legacyLauncherProbeCanBeRemoved = $true
+                $legacyLauncherExitCode = $process.ExitCode
+            }
         }
         finally { $process.Dispose() }
-        if ($legacyLauncherExitCode -ne 2) {
+
+        if ($null -eq $legacyLauncherFailure -and $legacyLauncherExitCode -ne 2) {
             throw "Legacy launcher single-file probe returned unexpected exit code $legacyLauncherExitCode."
         }
 
-        $probeEntries = @([IO.Directory]::EnumerateFileSystemEntries($legacyLauncherProbeDirectory))
-        if ($probeEntries.Count -ne 1 -or
-            [IO.Path]::GetFileName($probeEntries[0]) -cne $legacyLauncherExecutableName) {
-            throw 'Legacy launcher single-file probe created an unexpected dependency or side-effect file.'
+        if ($null -eq $legacyLauncherFailure) {
+            $probeEntries = @([IO.Directory]::EnumerateFileSystemEntries($legacyLauncherProbeDirectory))
+            if ($probeEntries.Count -ne 1 -or
+                [IO.Path]::GetFileName($probeEntries[0]) -cne $legacyLauncherExecutableName) {
+                throw 'Legacy launcher single-file probe created an unexpected dependency or side-effect file.'
+            }
+            [IO.File]::Copy(
+                $probeLauncher,
+                (Join-Path $MainPublishDirectory $legacyLauncherExecutableName),
+                $false)
         }
-        [IO.File]::Copy(
-            $probeLauncher,
-            (Join-Path $MainPublishDirectory $legacyLauncherExecutableName),
-            $false)
     }
     finally {
-        if (Test-Path -LiteralPath $legacyLauncherProbeDirectory) {
-            Remove-Item -LiteralPath $legacyLauncherProbeDirectory -Recurse -Force
+        if ($legacyLauncherProbeCanBeRemoved -and
+            (Test-Path -LiteralPath $legacyLauncherProbeDirectory)) {
+            try {
+                Remove-Item -LiteralPath $legacyLauncherProbeDirectory -Recurse -Force
+            }
+            catch {
+                if ($null -eq $legacyLauncherFailure) { throw }
+                $legacyLauncherFailure += " Probe cleanup also failed: $($_.Exception.Message)"
+            }
         }
     }
+    if ($null -ne $legacyLauncherFailure) { throw $legacyLauncherFailure }
 }
 
 function Test-SafeNupkgFileName([string]$FileName) {

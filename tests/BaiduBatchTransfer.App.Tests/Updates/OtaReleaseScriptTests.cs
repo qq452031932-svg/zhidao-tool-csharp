@@ -609,6 +609,36 @@ public sealed class OtaReleaseScriptTests
     }
 
     [Fact]
+    public async Task HangingLegacyLauncherIsTerminatedBeforeProbeDirectoryCleanup()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+        var processMarker = Path.Combine(fixture.Root, "hanging-legacy-launcher.pid");
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_LEGACY_LAUNCHER_HANG"] = "1",
+                ["FAKE_OTA_LEGACY_LAUNCHER_PID"] = processMarker,
+            });
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("single-file probe timed out", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.True(File.Exists(processMarker), "The controllable launcher did not reach its hang point.");
+        var processId = int.Parse(await File.ReadAllTextAsync(processMarker));
+        Assert.False(IsProcessRunning(processId), $"Legacy launcher process {processId} survived the timeout path.");
+        var buildDirectory = Path.Combine(fixture.OutputDirectory, ".build");
+        Assert.Empty(Directory.EnumerateDirectories(
+            buildDirectory, ".legacy-launcher-probe-*", SearchOption.TopDirectoryOnly));
+
+        var script = ReadScript();
+        Assert.Contains("$process.WaitForExit(5000)", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("try { $process.Kill() } catch {}", script, StringComparison.Ordinal);
+        Assert.Contains("$legacyLauncherProbeCanBeRemoved", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task FakeToolchainAcceptsCurrentDeltaCatalogAndFullOnlyMultiVersionReleasesIndex()
     {
         using var fixture = ScriptFixture.Create();
@@ -920,6 +950,19 @@ public sealed class OtaReleaseScriptTests
 
     private static int CountOccurrences(string text, string value) =>
         (text.Length - text.Replace(value, string.Empty, StringComparison.Ordinal).Length) / value.Length;
+
+    private static bool IsProcessRunning(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
 
     private static string ParseCommandPrefix(string line)
     {
@@ -1277,7 +1320,7 @@ if ($ToolArgs[0] -ceq 'publish') {
     [IO.Directory]::CreateDirectory($publishDirectory) | Out-Null
     if ($ToolArgs[1] -like '*BaiduBatchTransfer.LegacyLauncher*') {
         $launcherPath = Join-Path $publishDirectory 'BaiduBatchTransfer.App.exe'
-        Add-Type -TypeDefinition 'public static class FakeLauncher { public static int Main() { return 2; } }' -Language CSharp -OutputAssembly $launcherPath -OutputType WindowsApplication
+        Add-Type -TypeDefinition 'using System; using System.Diagnostics; using System.IO; using System.Threading; public static class FakeLauncher { public static int Main() { if (Environment.GetEnvironmentVariable("FAKE_OTA_LEGACY_LAUNCHER_HANG") == "1") { File.WriteAllText(Environment.GetEnvironmentVariable("FAKE_OTA_LEGACY_LAUNCHER_PID"), Process.GetCurrentProcess().Id.ToString()); Thread.Sleep(Timeout.Infinite); } return 2; } }' -Language CSharp -OutputAssembly $launcherPath -OutputType WindowsApplication
     }
     else {
         . (Join-Path (Get-Location).Path 'scripts\ProductIdentity.ps1')
