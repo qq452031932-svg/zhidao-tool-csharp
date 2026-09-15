@@ -126,6 +126,7 @@ public static class MigrationFileIdentity {
 public sealed class MigrationContainedResult {
     public int ExitCode; public int ProcessId; public string StartedUtc; public string CompletedUtc;
     public string StandardOutput; public string StandardError; public string Failure; public bool SafeToCleanup;
+    public int RestartPid; public string RestartPath; public string RestartStartedUtc; public string RestartFileIdentity; public IntPtr JobHandle;
 }
 public static class MigrationContainedRunner {
     const uint CREATE_SUSPENDED=4, CREATE_NO_WINDOW=0x08000000, STARTF_USESTDHANDLES=0x100;
@@ -147,26 +148,32 @@ public static class MigrationContainedRunner {
     [DllImport("kernel32.dll",SetLastError=true)] static extern uint WaitForSingleObject(IntPtr h,uint ms);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr h,out uint e);
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool QueryFullProcessImageName(IntPtr h,uint flags,StringBuilder path,ref uint size);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetProcessTimes(IntPtr process,out System.Runtime.InteropServices.ComTypes.FILETIME created,out System.Runtime.InteropServices.ComTypes.FILETIME exited,out System.Runtime.InteropServices.ComTypes.FILETIME kernel,out System.Runtime.InteropServices.ComTypes.FILETIME user);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetHandleInformation(IntPtr h,uint m,uint f);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int i);
     static string Q(string s){var b=new StringBuilder("\"");int n=0;foreach(char c in s){if(c=='\\'){n++;continue;}if(c=='\"'){b.Append('\\',n*2+1).Append('"');}else{if(n>0)b.Append('\\',n);b.Append(c);}n=0;}if(n>0)b.Append('\\',n*2);return b.Append('"').ToString();}
     static uint Active(IntPtr j){int z=Marshal.SizeOf(typeof(ACCOUNTING));IntPtr p=Marshal.AllocHGlobal(z);try{uint r;if(!QueryInformationJobObject(j,1,p,(uint)z,out r))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());return ((ACCOUNTING)Marshal.PtrToStructure(p,typeof(ACCOUNTING))).active;}finally{Marshal.FreeHGlobal(p);}}
+    static uint[] ActivePids(IntPtr job){int capacity=16;int bytes=8+capacity*IntPtr.Size;IntPtr memory=Marshal.AllocHGlobal(bytes);try{uint returned;if(!QueryInformationJobObject(job,3,memory,(uint)bytes,out returned))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());uint count=(uint)Marshal.ReadInt32(memory,4);var ids=new uint[count];for(int i=0;i<count;i++)ids[i]=unchecked((uint)Marshal.ReadIntPtr(memory,8+i*IntPtr.Size).ToInt64());return ids;}finally{Marshal.FreeHGlobal(memory);}}
+    static string ProcessPathAndStart(uint pid,out string started,out string identity){IntPtr process=OpenProcess(0x1000,false,pid);if(process==IntPtr.Zero)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());try{var path=new StringBuilder(32768);uint size=(uint)path.Capacity;if(!QueryFullProcessImageName(process,0,path,ref size))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());System.Runtime.InteropServices.ComTypes.FILETIME c,e,k,u;if(!GetProcessTimes(process,out c,out e,out k,out u))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());long ticks=((long)c.dwHighDateTime<<32)|(uint)c.dwLowDateTime;started=DateTimeOffset.FromFileTime(ticks).ToString("O");string full=Path.GetFullPath(path.ToString());using(var file=new FileStream(full,FileMode.Open,FileAccess.Read,FileShare.Read)){identity=MigrationFileIdentity.Get(file);}return full;}finally{CloseHandle(process);}}
     static bool Offline(){foreach(var n in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()){if(n.NetworkInterfaceType!=System.Net.NetworkInformation.NetworkInterfaceType.Loopback && n.OperationalStatus==System.Net.NetworkInformation.OperationalStatus.Up)return false;}return true;}
-    public static MigrationContainedResult Run(string exe,string[] args,string cwd,string stdoutPath,string stderrPath,int timeoutMs,long maxLog){
+    public static MigrationContainedResult Run(string exe,string[] args,string cwd,string stdoutPath,string stderrPath,int timeoutMs,long maxLog,string completionMode,string expectedRestartPath){
+      if(completionMode!="NoRestart"&&completionMode!="SuccessExpectRestart")throw new ArgumentException("Unknown completion mode.");if(completionMode=="SuccessExpectRestart"&&String.IsNullOrWhiteSpace(expectedRestartPath))throw new ArgumentException("Expected restart path is required.");
       var r=new MigrationContainedResult{ExitCode=-1,SafeToCleanup=false};IntPtr job=IntPtr.Zero;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();FileStream so=null,se=null;bool assigned=false;
       try{job=CreateJobObject(IntPtr.Zero,null);if(job==IntPtr.Zero)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());var lim=new EXT_LIMIT();lim.basic.flags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE|JOB_OBJECT_LIMIT_JOB_MEMORY|JOB_OBJECT_LIMIT_ACTIVE_PROCESS;lim.basic.active=8;lim.jobMemory=new UIntPtr(1073741824);int z=Marshal.SizeOf(typeof(EXT_LIMIT));IntPtr lp=Marshal.AllocHGlobal(z);try{Marshal.StructureToPtr(lim,lp,false);if(!SetInformationJobObject(job,9,lp,(uint)z))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());}finally{Marshal.FreeHGlobal(lp);}
         so=new FileStream(stdoutPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read);se=new FileStream(stderrPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read);SetHandleInformation(so.SafeFileHandle.DangerousGetHandle(),HANDLE_FLAG_INHERIT,HANDLE_FLAG_INHERIT);SetHandleInformation(se.SafeFileHandle.DangerousGetHandle(),HANDLE_FLAG_INHERIT,HANDLE_FLAG_INHERIT);
         var cmd=new StringBuilder(Q(exe));foreach(var a in args)cmd.Append(' ').Append(Q(a));var si=new STARTUPINFO();si.cb=(uint)Marshal.SizeOf(typeof(STARTUPINFO));si.flags=STARTF_USESTDHANDLES;si.input=GetStdHandle(-10);si.output=so.SafeFileHandle.DangerousGetHandle();si.error=se.SafeFileHandle.DangerousGetHandle();
         r.StartedUtc=DateTimeOffset.UtcNow.ToString("O");if(!CreateProcess(exe,cmd,IntPtr.Zero,IntPtr.Zero,true,CREATE_SUSPENDED|CREATE_NO_WINDOW,IntPtr.Zero,cwd,ref si,out pi))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());r.ProcessId=(int)pi.processId;
         var image=new StringBuilder(32768);uint imageSize=(uint)image.Capacity;if(!QueryFullProcessImageName(pi.process,0,image,ref imageSize))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());if(!String.Equals(Path.GetFullPath(image.ToString()),Path.GetFullPath(exe),StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Suspended process executable path differs from the verified ApplicationName.");
-        if(!AssignProcessToJobObject(job,pi.process))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());assigned=true;if(ResumeThread(pi.thread)==UInt32.MaxValue)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());CloseHandle(pi.thread);pi.thread=IntPtr.Zero;var timer=Stopwatch.StartNew();
-        while(true){bool done=WaitForSingleObject(pi.process,100)==WAIT_OBJECT_0;if(!Offline()){r.Failure="Offline invariant changed during contained process.";TerminateJobObject(job,0xEE10);break;}if(so.Length>maxLog||se.Length>maxLog||so.Length>maxLog-se.Length){r.Failure="Contained process output exceeded limit.";TerminateJobObject(job,0xEE11);break;}if(timer.ElapsedMilliseconds>timeoutMs){r.Failure="Contained process timed out.";TerminateJobObject(job,0xEE12);break;}if(done&&Active(job)==0)break;}
-        uint code;if(WaitForSingleObject(pi.process,5000)==WAIT_OBJECT_0&&GetExitCodeProcess(pi.process,out code))r.ExitCode=unchecked((int)code);r.SafeToCleanup=Active(job)==0;r.CompletedUtc=DateTimeOffset.UtcNow.ToString("O");
+        if(!AssignProcessToJobObject(job,pi.process))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());assigned=true;if(ResumeThread(pi.thread)==UInt32.MaxValue)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());CloseHandle(pi.thread);pi.thread=IntPtr.Zero;var timer=Stopwatch.StartNew();long rootDoneAt=-1;
+        while(true){bool done=rootDoneAt>=0||WaitForSingleObject(pi.process,100)==WAIT_OBJECT_0;if(!Offline()){r.Failure="Offline invariant changed during contained process.";TerminateJobObject(job,0xEE10);break;}if(so.Length>maxLog||se.Length>maxLog||so.Length>maxLog-se.Length){r.Failure="Contained process output exceeded limit.";TerminateJobObject(job,0xEE11);break;}if(timer.ElapsedMilliseconds>timeoutMs){r.Failure="Contained process timed out.";TerminateJobObject(job,0xEE12);break;}if(done){if(rootDoneAt<0){rootDoneAt=timer.ElapsedMilliseconds;uint rootCode;if(GetExitCodeProcess(pi.process,out rootCode))r.ExitCode=unchecked((int)rootCode);CloseHandle(pi.process);pi.process=IntPtr.Zero;}var ids=ActivePids(job);if(completionMode=="NoRestart"){if(ids.Length!=0){r.Failure="NoRestart process left a live job child.";TerminateJobObject(job,0xEE14);}break;}if(ids.Length!=1||ids[0]==pi.processId){if(timer.ElapsedMilliseconds-rootDoneAt<750){System.Threading.Thread.Sleep(25);continue;}r.Failure="SuccessExpectRestart requires exactly one non-root live job process; observed ["+String.Join(",",ids)+"].";TerminateJobObject(job,0xEE15);break;}string childStarted,childIdentity;string childPath=ProcessPathAndStart(ids[0],out childStarted,out childIdentity);if(!String.Equals(childPath,Path.GetFullPath(expectedRestartPath),StringComparison.OrdinalIgnoreCase)){r.Failure="SuccessExpectRestart child executable path mismatch.";TerminateJobObject(job,0xEE16);break;}r.RestartPid=(int)ids[0];r.RestartPath=childPath;r.RestartStartedUtc=childStarted;r.RestartFileIdentity=childIdentity;r.JobHandle=job;job=IntPtr.Zero;break;}}
+        if(r.JobHandle==IntPtr.Zero){var emptyTimer=Stopwatch.StartNew();while(Active(job)!=0&&emptyTimer.ElapsedMilliseconds<5000)System.Threading.Thread.Sleep(25);r.SafeToCleanup=Active(job)==0;}else r.SafeToCleanup=false;r.CompletedUtc=DateTimeOffset.UtcNow.ToString("O");
       }catch(Exception e){if(assigned&&job!=IntPtr.Zero)TerminateJobObject(job,0xEE13);r.Failure=e.Message;r.CompletedUtc=DateTimeOffset.UtcNow.ToString("O");}
       finally{if(pi.thread!=IntPtr.Zero)CloseHandle(pi.thread);if(pi.process!=IntPtr.Zero)CloseHandle(pi.process);if(job!=IntPtr.Zero)CloseHandle(job);if(so!=null)so.Dispose();if(se!=null)se.Dispose();}
       try{r.StandardOutput=File.Exists(stdoutPath)?File.ReadAllText(stdoutPath,Encoding.Default):"";r.StandardError=File.Exists(stderrPath)?File.ReadAllText(stderrPath,Encoding.Default):"";}catch(Exception e){r.Failure="Unable to read bounded logs: "+e.Message;}return r;
     }
+    public static bool CloseSession(MigrationContainedResult result){if(result==null||result.JobHandle==IntPtr.Zero)return true;IntPtr job=result.JobHandle;result.JobHandle=IntPtr.Zero;try{TerminateJobObject(job,0xEE20);var timer=Stopwatch.StartNew();while(timer.ElapsedMilliseconds<5000){if(Active(job)==0){result.SafeToCleanup=true;return true;}System.Threading.Thread.Sleep(25);}return false;}finally{CloseHandle(job);}}
 }
 '@
 
@@ -936,7 +943,7 @@ function Invoke-BoundedDriver {
     param([string]$Driver, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 120)
     Assert-NoNonLoopbackNetwork|Out-Null
     $token=[Guid]::NewGuid().ToString('N');$stdoutPath=Join-Path $WorkingDirectory ".driver-$token.stdout";$stderrPath=Join-Path $WorkingDirectory ".driver-$token.stderr"
-    $result=[MigrationContainedRunner]::Run($Driver,$Arguments,$WorkingDirectory,$stdoutPath,$stderrPath,($TimeoutSeconds*1000),$script:MaximumDriverOutputBytes)
+    $result=[MigrationContainedRunner]::Run($Driver,$Arguments,$WorkingDirectory,$stdoutPath,$stderrPath,($TimeoutSeconds*1000),$script:MaximumDriverOutputBytes,'NoRestart',$null)
     Assert-NoNonLoopbackNetwork|Out-Null
     if($result.Failure-or-not$result.SafeToCleanup){throw "Trusted state driver containment failed: $($result.Failure)"}
     if ($result.ExitCode -ne 0) { throw "Trusted state driver failed with exit code $($result.ExitCode): $($result.StandardError)" }
@@ -951,7 +958,7 @@ function Invoke-BoundedDriver {
 function Invoke-CheckedProcess {
     param([string]$File, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 120, [switch]$ExpectFailure)
     Assert-NoNonLoopbackNetwork|Out-Null
-    $token=[Guid]::NewGuid().ToString('N');$result=[MigrationContainedRunner]::Run($File,$Arguments,$WorkingDirectory,(Join-Path $WorkingDirectory ".process-$token.stdout"),(Join-Path $WorkingDirectory ".process-$token.stderr"),($TimeoutSeconds*1000),$script:MaximumDriverOutputBytes)
+    $token=[Guid]::NewGuid().ToString('N');$result=[MigrationContainedRunner]::Run($File,$Arguments,$WorkingDirectory,(Join-Path $WorkingDirectory ".process-$token.stdout"),(Join-Path $WorkingDirectory ".process-$token.stderr"),($TimeoutSeconds*1000),$script:MaximumDriverOutputBytes,'NoRestart',$null)
     Assert-NoNonLoopbackNetwork|Out-Null
     if($result.Failure-or-not$result.SafeToCleanup){throw "Contained process safety enforcement failed: $($result.Failure)"}
     if (-not $ExpectFailure -and $result.ExitCode -ne 0) { throw "Process failed ($($result.ExitCode)): $File`n$($result.StandardOutput)$($result.StandardError)" }
@@ -1104,7 +1111,7 @@ function Get-FileInventory {
 $runId = New-RunId
 $startedUtc = [DateTimeOffset]::UtcNow
 $evidenceRoot = $null
-$driverLock=$null;$updaterLock=$null;$selectedAssetLock=$null;$updaterPackageLock=$null;$oldSetupLock=$null;$oldPortableLock=$null
+$driverLock=$null;$updaterLock=$null;$selectedAssetLock=$null;$updaterPackageLock=$null;$oldSetupLock=$null;$oldPortableLock=$null;$currentMainLock=$null;$upgradeRun=$null
 $evidence = [ordered]@{
     SchemaVersion = 2; RunId = $runId; StartedUtc = $startedUtc.ToString('O'); FinishedUtc = $null
     AssetSource = 'caller-supplied-local-directories'; AssetKind = $AssetKind; Path = $Path
@@ -1226,8 +1233,9 @@ try {
     $updaterStdout=Join-Path $evidenceRoot 'updater.stdout.log';$updaterStderr=Join-Path $evidenceRoot 'updater.stderr.log'
     $updaterArguments=@('apply','--package',$updaterPackage,'--rootDir',$installRoot,'--packageDir',$localReleaseSource)
     $upgradeChallenge=New-RunChallenge;$priorRun=$env:SUPERPAN_MIGRATION_RUN_ID;$priorChallenge=$env:SUPERPAN_MIGRATION_CHALLENGE_SHA256;$priorScenario=$env:SUPERPAN_MIGRATION_SCENARIO
-    try{$env:SUPERPAN_MIGRATION_RUN_ID=$runId;$env:SUPERPAN_MIGRATION_CHALLENGE_SHA256=$upgradeChallenge.Sha256;$env:SUPERPAN_MIGRATION_SCENARIO=$evidence.Scenario;$upgradeRun=[MigrationContainedRunner]::Run($updater,$updaterArguments,$installRoot,$updaterStdout,$updaterStderr,300000,1048576)}finally{$env:SUPERPAN_MIGRATION_RUN_ID=$priorRun;$env:SUPERPAN_MIGRATION_CHALLENGE_SHA256=$priorChallenge;$env:SUPERPAN_MIGRATION_SCENARIO=$priorScenario}
-    if(-not$upgradeRun.SafeToCleanup-or$upgradeRun.Failure){throw "Contained Velopack updater failed safety enforcement: $($upgradeRun.Failure)"}
+    $completionMode=if($FailureInjection-ceq'None'){'SuccessExpectRestart'}else{'NoRestart'}
+    try{$env:SUPERPAN_MIGRATION_RUN_ID=$runId;$env:SUPERPAN_MIGRATION_CHALLENGE_SHA256=$upgradeChallenge.Sha256;$env:SUPERPAN_MIGRATION_SCENARIO=$evidence.Scenario;$upgradeRun=[MigrationContainedRunner]::Run($updater,$updaterArguments,$installRoot,$updaterStdout,$updaterStderr,300000,1048576,$completionMode,$currentMain)}finally{$env:SUPERPAN_MIGRATION_RUN_ID=$priorRun;$env:SUPERPAN_MIGRATION_CHALLENGE_SHA256=$priorChallenge;$env:SUPERPAN_MIGRATION_SCENARIO=$priorScenario}
+    if($upgradeRun.Failure-or($completionMode-ceq'NoRestart'-and-not$upgradeRun.SafeToCleanup)-or($completionMode-ceq'SuccessExpectRestart'-and$upgradeRun.JobHandle-eq[IntPtr]::Zero)){throw "Contained Velopack updater failed safety enforcement: $($upgradeRun.Failure)"}
     Assert-NoNonLoopbackNetwork|Out-Null
     Assert-ArtifactReadLockUnchanged $updaterLock;Assert-ArtifactReadLockUnchanged $selectedAssetLock;Assert-ArtifactReadLockUnchanged $updaterPackageLock
     $upgrade=[ordered]@{run_id=$runId;challenge_sha256=$upgradeChallenge.Sha256;scenario=$evidence.Scenario;asset_kind=$AssetKind;path=$Path;failure_injection=$FailureInjection;started_utc=$upgradeRun.StartedUtc;completed_utc=$upgradeRun.CompletedUtc;source_asset_path=$selectedAsset;source_asset_sha256=$selectedAssetHash;source_asset_length=$selectedAssetBytes;updater_path=$updater;updater_identity=$updaterLock.Identity;updater_pid=$upgradeRun.ProcessId;updater_exit_code=$upgradeRun.ExitCode;updater_arguments=$updaterArguments;package_path=$updaterPackage;package_sha256=$updaterPackageLock.Sha256}
@@ -1263,9 +1271,10 @@ try {
         }
         Assert-ExactThreePartVersion -Executable $currentMain -Expected '1.1.1'
         foreach ($application in @($currentMain,$rootLauncher,$legacy)) { Assert-PublisherExecutable -Executable $application }
-        $restart = Find-ExactProcessPath -ExpectedPath $currentMain -NotBefore $restartStarted
-        $restartEvidence = [ordered]@{ Id=$restart.Id; Path=$restart.Path; StartTimeUtc=$restart.StartTime.ToUniversalTime().ToString('O') }
-        Stop-OwnedProcessTree -RootProcessId $restart.Id
+        $currentMainLock=Open-ArtifactReadLock -File $currentMain -Label 'Job-owned restarted current executable'
+        if(-not[string]::Equals([IO.Path]::GetFullPath([string]$upgradeRun.RestartPath),[IO.Path]::GetFullPath($currentMain),[StringComparison]::OrdinalIgnoreCase)-or[int]$upgradeRun.RestartPid-le 0-or[string]$upgradeRun.RestartFileIdentity-cne$currentMainLock.Identity){throw 'Contained updater did not retain the exact current Chinese restart process/file identity.'}
+        $restartTime=[DateTimeOffset]$upgradeRun.RestartStartedUtc;if($restartTime-lt$restartStarted-or$restartTime-gt[DateTimeOffset]$upgradeRun.CompletedUtc){throw 'Contained restart process creation time is outside the upgrade window.'}
+        $restartEvidence = [ordered]@{ Id=[int]$upgradeRun.RestartPid; Path=[string]$upgradeRun.RestartPath; StartTimeUtc=$restartTime.ToString('O'); FileIdentity=$currentMainLock.Identity; JobOwned=$true }
         if ($AssetKind -ceq 'Setup') {
             $surfaces = Assert-SetupSurfaces -InstallRoot $installRoot -CurrentMain $currentMain -RootLauncher $rootLauncher -LegacyLauncher $legacy -Profile $profile
         } else {
@@ -1293,7 +1302,8 @@ try {
     $evidence.Error = $_.Exception.Message
     throw
 } finally {
-    foreach($lock in @($updaterPackageLock,$selectedAssetLock,$updaterLock,$oldPortableLock,$oldSetupLock,$driverLock)){if($lock){$lock.Stream.Dispose()}}
+    if($upgradeRun-and$upgradeRun.JobHandle-ne[IntPtr]::Zero){if(-not[MigrationContainedRunner]::CloseSession($upgradeRun)){throw 'Contained restart job did not terminate cleanly.'}}
+    foreach($lock in @($currentMainLock,$updaterPackageLock,$selectedAssetLock,$updaterLock,$oldPortableLock,$oldSetupLock,$driverLock)){if($lock){$lock.Stream.Dispose()}}
     if ($evidenceRoot) {
         $evidence.FinishedUtc = [DateTimeOffset]::UtcNow.ToString('O')
         Write-CanonicalJson -Value $evidence -Destination (Join-Path $evidenceRoot 'evidence.json')

@@ -331,10 +331,21 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         Directory.CreateDirectory(root);
         var updater = System.IO.Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
         var harness = System.IO.Path.Combine(root, "harness.ps1");
+        var rootHelper = System.IO.Path.Combine(root, "root-helper.ps1");
+        var childHelper = System.IO.Path.Combine(root, "child-helper.ps1");
+        var childExe = System.IO.Path.Combine(root, "RestartChild.exe");
         try
         {
+            var childSource = System.IO.Path.Combine(root, "RestartChild.cs");
+            await File.WriteAllTextAsync(childSource, "using System.Threading; static class P { [System.STAThread] static void Main() { Thread.Sleep(30000); } }", new UTF8Encoding(false));
+            var csc = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
+            var compile = new ProcessStartInfo(csc) { UseShellExecute = false, RedirectStandardError = true };
+            foreach (var value in new[] { "/nologo", "/target:winexe", $"/out:{childExe}", childSource }) compile.ArgumentList.Add(value);
+            using (var compiler = Process.Start(compile)!) { var error = await compiler.StandardError.ReadToEndAsync(); await compiler.WaitForExitAsync(); Assert.True(compiler.ExitCode == 0, error); }
+            await File.WriteAllTextAsync(childHelper, "Start-Sleep -Seconds 30\n", new UTF8Encoding(false));
+            await File.WriteAllTextAsync(rootHelper, "param([string]$ChildExe,[string]$ChildScript,[int]$Count=1,[switch]$Ping,[switch]$Raw)\n1..$Count|ForEach-Object{if($Raw){Start-Process -FilePath $ChildExe|Out-Null}elseif($Ping){Start-Process -FilePath $ChildExe -ArgumentList @('-t','127.0.0.1')|Out-Null}else{Start-Process -FilePath $ChildExe -ArgumentList @('-NoProfile','-File',$ChildScript)|Out-Null}}\n", new UTF8Encoding(false));
             await File.WriteAllTextAsync(harness, """
-                param([string]$ScriptPath,[string]$Updater,[string]$WorkingDirectory)
+                param([string]$ScriptPath,[string]$Updater,[string]$WorkingDirectory,[string]$RootHelper,[string]$ChildHelper,[string]$ChildExe)
                 $ErrorActionPreference='Stop'
                 $text=[IO.File]::ReadAllText($ScriptPath)
                 $match=[regex]::Match($text,"(?s)Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
@@ -346,11 +357,20 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
                 $lockedFile=Join-Path $WorkingDirectory 'locked.bin';[IO.File]::WriteAllBytes($lockedFile,[byte[]](1,2,3,4))
                 $lock=Open-ArtifactReadLock -File $lockedFile -Label 'test locked file'
                 try{$blocked=$false;try{[IO.File]::Delete($lockedFile)}catch [IO.IOException]{$blocked=$true};if(-not$blocked){throw 'Replacement/delete was not blocked by the artifact lock.'};Assert-ArtifactReadLockUnchanged $lock}finally{$lock.Stream.Dispose()}
-                $run=[MigrationContainedRunner]::Run($Updater,@('-NoProfile','-Command','exit 7'),$WorkingDirectory,(Join-Path $WorkingDirectory 'out.log'),(Join-Path $WorkingDirectory 'err.log'),5000,65536)
+                $run=[MigrationContainedRunner]::Run($Updater,@('-NoProfile','-Command','exit 7'),$WorkingDirectory,(Join-Path $WorkingDirectory 'out.log'),(Join-Path $WorkingDirectory 'err.log'),5000,65536,'NoRestart',$null)
                 if($run.ProcessId-le 0-or$run.ExitCode-ne 7-or-not$run.SafeToCleanup-or$run.Failure){throw ($run|ConvertTo-Json -Compress)}
+                $success=[MigrationContainedRunner]::Run($Updater,@('-NoProfile','-File',$RootHelper,'-ChildExe',$ChildExe,'-Raw','-Count','1'),$WorkingDirectory,(Join-Path $WorkingDirectory 'success.out'),(Join-Path $WorkingDirectory 'success.err'),5000,65536,'SuccessExpectRestart',$ChildExe)
+                if($success.Failure-or$success.RestartPid-le 0-or$success.JobHandle-eq[IntPtr]::Zero-or-not(Get-Process -Id $success.RestartPid -ErrorAction SilentlyContinue)){throw ($success|ConvertTo-Json -Compress)}
+                $restartPid=$success.RestartPid;if(-not[MigrationContainedRunner]::CloseSession($success)){throw 'Restart job did not empty.'};Start-Sleep -Milliseconds 100;if(Get-Process -Id $restartPid -ErrorAction SilentlyContinue){throw 'Restart child survived job disposal.'}
+                $two=[MigrationContainedRunner]::Run($Updater,@('-NoProfile','-File',$RootHelper,'-ChildExe',$ChildExe,'-Raw','-Count','2'),$WorkingDirectory,(Join-Path $WorkingDirectory 'two.out'),(Join-Path $WorkingDirectory 'two.err'),5000,65536,'SuccessExpectRestart',$ChildExe)
+                if(-not$two.Failure-or-not$two.SafeToCleanup){throw ($two|ConvertTo-Json -Compress)}
+                $ping=Join-Path $env:SystemRoot 'System32\PING.EXE';$wrong=[MigrationContainedRunner]::Run($Updater,@('-NoProfile','-File',$RootHelper,'-ChildExe',$ping,'-Ping'),$WorkingDirectory,(Join-Path $WorkingDirectory 'wrong.out'),(Join-Path $WorkingDirectory 'wrong.err'),5000,65536,'SuccessExpectRestart',$Updater)
+                if(-not$wrong.Failure-or-not$wrong.SafeToCleanup){throw ($wrong|ConvertTo-Json -Compress)}
+                $noRestart=[MigrationContainedRunner]::Run($Updater,@('-NoProfile','-File',$RootHelper,'-ChildExe',$ChildExe,'-Raw','-Count','1'),$WorkingDirectory,(Join-Path $WorkingDirectory 'none.out'),(Join-Path $WorkingDirectory 'none.err'),5000,65536,'NoRestart',$null)
+                if(-not$noRestart.Failure-or-not$noRestart.SafeToCleanup){throw ($noRestart|ConvertTo-Json -Compress)}
                 """, new UTF8Encoding(false));
             var startInfo = PowerShell();
-            foreach (var argument in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-Updater", updater, "-WorkingDirectory", root }) startInfo.ArgumentList.Add(argument);
+            foreach (var argument in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-Updater", updater, "-WorkingDirectory", root, "-RootHelper", rootHelper, "-ChildHelper", childHelper, "-ChildExe", childExe }) startInfo.ArgumentList.Add(argument);
             using var process = Process.Start(startInfo)!;
             var output = await process.StandardOutput.ReadToEndAsync() + await process.StandardError.ReadToEndAsync();
             await process.WaitForExitAsync();
