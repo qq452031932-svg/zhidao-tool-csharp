@@ -635,11 +635,10 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
                 $ErrorActionPreference='Stop';Import-Module Microsoft.PowerShell.Utility;$tokens=$null;$errors=$null
                 $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
                 foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
-                Set-Item function:Original-WriteFrozenBytes (Get-Command Write-FrozenBytes).ScriptBlock
-                $script:evidenceWrites=0
-                function Write-FrozenBytes{param([byte[]]$Bytes,[string]$Destination,[switch]$CreateNew)
-                    if([IO.Path]::GetFileName($Destination)-ceq'evidence.json'){$script:evidenceWrites++;if($script:evidenceWrites-ge 2){throw 'forced failure-record write failure'}}
-                    Original-WriteFrozenBytes -Bytes $Bytes -Destination $Destination -CreateNew:$CreateNew
+                Set-Item function:Original-WriteFrozenBytesAtomically (Get-Command Write-FrozenBytesAtomically).ScriptBlock
+                function Write-FrozenBytesAtomically{param([byte[]]$Bytes,[string]$Destination)
+                    if([IO.Path]::GetFileName($Destination)-ceq'evidence.json'){throw 'forced failure-record write failure'}
+                    Original-WriteFrozenBytesAtomically -Bytes $Bytes -Destination $Destination
                 }
                 function Get-FileInventory{throw 'forced inventory failure'}
                 $evidence=[ordered]@{SchemaVersion=2;RunId='RUN';FinishedUtc=$null;Succeeded=$true;Error=$null}
@@ -654,6 +653,70 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             {
                 using var document = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(evidencePath));
                 Assert.False(document.RootElement.GetProperty("Succeeded").GetBoolean());
+            }
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task WindowsPowerShell51PublishesFrozenSuccessOnlyAfterMatchingInventory()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-terminal-success-{Guid.NewGuid():N}"); Directory.CreateDirectory(root);
+        var harness = System.IO.Path.Combine(root, "harness.ps1"); var evidenceRoot = System.IO.Path.Combine(root, "evidence"); Directory.CreateDirectory(evidenceRoot);
+        try
+        {
+            await File.WriteAllTextAsync(harness, """
+                param([string]$ScriptPath,[string]$EvidenceRoot)
+                $ErrorActionPreference='Stop';Import-Module Microsoft.PowerShell.Utility;$tokens=$null;$errors=$null
+                $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
+                foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
+                $evidence=[ordered]@{SchemaVersion=2;RunId='RUN';FinishedUtc=$null;Succeeded=$true;Error=$null}
+                $failures=New-Object Collections.Generic.List[string]
+                Write-TerminalMigrationEvidence -Evidence $evidence -EvidenceRoot $EvidenceRoot -RunId 'RUN' -Failures $failures
+                """, new UTF8Encoding(false));
+            var start = PowerShell(); foreach (var value in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-EvidenceRoot", evidenceRoot }) start.ArgumentList.Add(value);
+            using var process = Process.Start(start)!; var output = await process.StandardOutput.ReadToEndAsync() + await process.StandardError.ReadToEndAsync(); await process.WaitForExitAsync();
+            if (process.ExitCode != 0) throw new Xunit.Sdk.XunitException(output);
+            var evidencePath = System.IO.Path.Combine(evidenceRoot, "evidence.json"); var evidenceBytes = await File.ReadAllBytesAsync(evidencePath);
+            using var evidence = System.Text.Json.JsonDocument.Parse(evidenceBytes);
+            if (!evidence.RootElement.GetProperty("Succeeded").GetBoolean()) throw new Xunit.Sdk.XunitException(Encoding.UTF8.GetString(evidenceBytes));
+            using var inventory = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(System.IO.Path.Combine(evidenceRoot, "files.sha256.json")));
+            var record = inventory.RootElement.GetProperty("Files").EnumerateArray().Single(item => string.Equals(item.GetProperty("Path").GetString(), evidencePath, StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(evidenceBytes.LongLength, record.GetProperty("Length").GetInt64());
+            Assert.Equal(Convert.ToHexString(SHA256.HashData(evidenceBytes)).ToLowerInvariant(), record.GetProperty("Sha256").GetString());
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task LateSuccessCommitAndFailureRecordCommitFailuresLeaveOnlyPendingFalse()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-terminal-atomic-{Guid.NewGuid():N}"); Directory.CreateDirectory(root);
+        var harness = System.IO.Path.Combine(root, "harness.ps1"); var evidenceRoot = System.IO.Path.Combine(root, "evidence"); Directory.CreateDirectory(evidenceRoot);
+        try
+        {
+            await File.WriteAllTextAsync(harness, """
+                param([string]$ScriptPath,[string]$EvidenceRoot)
+                $ErrorActionPreference='Stop';Import-Module Microsoft.PowerShell.Utility;$tokens=$null;$errors=$null
+                $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
+                foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
+                Set-Item function:Original-CommitFrozenFile (Get-Command Commit-FrozenFile).ScriptBlock
+                function Commit-FrozenFile{param([string]$Temporary,[string]$Destination)
+                    if([IO.Path]::GetFileName($Destination)-ceq'evidence.json'){throw 'forced atomic evidence commit failure'}
+                    Original-CommitFrozenFile -Temporary $Temporary -Destination $Destination
+                }
+                $evidence=[ordered]@{SchemaVersion=2;RunId='RUN';FinishedUtc=$null;Succeeded=$true;Error=$null}
+                $failures=New-Object Collections.Generic.List[string]
+                try{Write-TerminalMigrationEvidence -Evidence $evidence -EvidenceRoot $EvidenceRoot -RunId 'RUN' -Failures $failures;exit 91}catch{exit 23}
+                """, new UTF8Encoding(false));
+            var start = PowerShell(); foreach (var value in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-EvidenceRoot", evidenceRoot }) start.ArgumentList.Add(value);
+            using var process = Process.Start(start)!; var output = await process.StandardOutput.ReadToEndAsync() + await process.StandardError.ReadToEndAsync(); await process.WaitForExitAsync();
+            Assert.True(process.ExitCode == 23, output);
+            var evidencePath = System.IO.Path.Combine(evidenceRoot, "evidence.json");
+            if (File.Exists(evidencePath))
+            {
+                using var evidence = System.Text.Json.JsonDocument.Parse(await File.ReadAllBytesAsync(evidencePath));
+                Assert.False(evidence.RootElement.GetProperty("Succeeded").GetBoolean());
             }
         }
         finally { Directory.Delete(root, recursive: true); }
