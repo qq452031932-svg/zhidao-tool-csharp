@@ -52,9 +52,11 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
 
         Assert.Contains("Assert-NoNonLoopbackNetwork", script, StringComparison.Ordinal);
         Assert.Contains("Get-NetAdapter", script, StringComparison.Ordinal);
+        Assert.Contains("-IncludeHidden", script, StringComparison.Ordinal);
         Assert.Contains("Get-NetRoute", script, StringComparison.Ordinal);
-        Assert.Contains("0.0.0.0/0", script, StringComparison.Ordinal);
-        Assert.Contains("::/0", script, StringComparison.Ordinal);
+        Assert.Contains("IsInRole", script, StringComparison.Ordinal);
+        Assert.Contains("WindowsBuiltInRole]::Administrator", script, StringComparison.Ordinal);
+        Assert.Contains("Stop-OwnedProcessTree", script, StringComparison.Ordinal);
         Assert.True(script.Split("Assert-NoNonLoopbackNetwork", StringSplitOptions.None).Length >= 4);
     }
 
@@ -73,6 +75,14 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         Assert.Contains("settings_row_sha256", script, StringComparison.Ordinal);
         Assert.Contains("task_row_sha256", script, StringComparison.Ordinal);
         Assert.Contains("marker_count", script, StringComparison.Ordinal);
+        Assert.Contains("account_row", script, StringComparison.Ordinal);
+        Assert.Contains("query_completed_utc", script, StringComparison.Ordinal);
+        Assert.Contains("challenge_sha256", script, StringComparison.Ordinal);
+        Assert.Contains("Assert-IndependentLicenseAudit", script, StringComparison.Ordinal);
+        Assert.Contains("ProtectedData]::Unprotect", script, StringComparison.Ordinal);
+        Assert.Contains("SuperPan.Licensing.State.v1", script, StringComparison.Ordinal);
+        Assert.Contains("Import-P256SubjectPublicKeyInfo", script, StringComparison.Ordinal);
+        Assert.Contains("Convert-DerEcdsaSignatureToP1363", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -84,12 +94,88 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         Assert.Contains("Assert-UpgradeEvidence", script, StringComparison.Ordinal);
         Assert.Contains("update_manager_invoked", script, StringComparison.Ordinal);
         Assert.Contains("updater_invoked", script, StringComparison.Ordinal);
-        Assert.Contains("asset_consumed_sha256", script, StringComparison.Ordinal);
+        Assert.Contains("source_asset_sha256", script, StringComparison.Ordinal);
         Assert.Contains("DownloadInterrupted", script, StringComparison.Ordinal);
         Assert.Contains("ApplicationFailed", script, StringComparison.Ordinal);
         Assert.Contains("fault_observed", script, StringComparison.Ordinal);
         Assert.Contains("bytes_consumed", script, StringComparison.Ordinal);
         Assert.Contains("old_version_after_failure", script, StringComparison.Ordinal);
+        Assert.Contains("ObservedUpdater", script, StringComparison.Ordinal);
+        Assert.Contains("challenge_sha256", script, StringComparison.Ordinal);
+        Assert.Contains("update_manager_stage", script, StringComparison.Ordinal);
+        Assert.Contains("partial_artifact_path", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReplayedUpgradeChallengeIsRejected()
+    {
+        var evidence = "{\"run_id\":\"RUN\",\"challenge_sha256\":\"" + new string('b', 64) + "\",\"scenario\":\"Setup-Full\",\"asset_kind\":\"Setup\",\"path\":\"Full\",\"failure_injection\":\"ApplicationFailed\"}";
+        var result = await RunFunctionAsync("Assert-UpgradeEvidence", new Dictionary<string, string>
+        {
+            ["EvidenceJson"] = evidence, ["RunId"] = "RUN", ["ExpectedChallengeSha256"] = new string('a', 64),
+            ["Scenario"] = "Setup-Full", ["AssetKind"] = "Setup", ["Path"] = "Full", ["FailureInjection"] = "ApplicationFailed",
+        });
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("challenge", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ApplicationFailedWithoutObservedUpdaterIsRejected()
+    {
+        var result = await RunFunctionAsync("Assert-UpgradeEvidence", new Dictionary<string, string>
+        {
+            ["EvidenceJson"] = "{\"run_id\":\"RUN\",\"challenge_sha256\":\"" + new string('a', 64) + "\",\"scenario\":\"Setup-Full\",\"asset_kind\":\"Setup\",\"path\":\"Full\",\"failure_injection\":\"ApplicationFailed\"}",
+            ["RunId"] = "RUN", ["ExpectedChallengeSha256"] = new string('a', 64), ["Scenario"] = "Setup-Full",
+            ["AssetKind"] = "Setup", ["Path"] = "Full", ["FailureInjection"] = "ApplicationFailed",
+            ["ObservedUpdaterJson"] = "null",
+        });
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("observed", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task TestScriptCopyActuallyObservesUpdaterAndValidatesChallengeBoundSuccessEvidence()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-orchestration-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var updater = System.IO.Path.Combine(root, "Update.exe");
+        var driver = System.IO.Path.Combine(root, "driver.ps1");
+        var harness = System.IO.Path.Combine(root, "harness.ps1");
+        File.Copy(System.IO.Path.Combine(Environment.SystemDirectory, "cmd.exe"), updater);
+        try
+        {
+            await File.WriteAllTextAsync(driver, """
+                param([string]$Updater,[string]$ChallengeSha)
+                $started=[DateTimeOffset]::UtcNow
+                $child=Start-Process -FilePath $Updater -ArgumentList '/d','/c','timeout /t 2 /nobreak >nul' -PassThru
+                $cim=Get-CimInstance Win32_Process -Filter "ProcessId=$($child.Id)"
+                $creation=$cim.CreationDate
+                $creationUtc=if($creation-is[DateTime]){([DateTime]$creation).ToUniversalTime()}else{[Management.ManagementDateTimeConverter]::ToDateTime([string]$creation).ToUniversalTime()}
+                $childStarted=$creationUtc.ToString('O')
+                $child.WaitForExit()
+                $record=[ordered]@{asset_kind='Setup';challenge_sha256=$ChallengeSha;completed_utc=[DateTimeOffset]::UtcNow.ToString('O');failure_injection='None';outcome='updated';path='Full';run_id='RUN';scenario='Setup-Full';source_asset_length=100;source_asset_sha256=('a'*64);started_utc=$started.ToString('O');update_manager_invoked=$true;update_manager_stage='apply-completed';update_manager_succeeded=$true;updater_exit_code=$child.ExitCode;updater_invoked=$true;updater_path=[IO.Path]::GetFullPath($Updater);updater_pid=$child.Id;updater_started_utc=$childStarted}
+                [Console]::Out.Write(($record|ConvertTo-Json -Compress)+"`n")
+                """, new UTF8Encoding(false));
+            await File.WriteAllTextAsync(harness, """
+                param([string]$ScriptPath,[string]$Driver,[string]$Updater,[string]$WorkingDirectory)
+                $ErrorActionPreference='Stop'
+                $tokens=$null;$errors=$null
+                $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
+                foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
+                function Assert-NoNonLoopbackNetwork{return @{TestOverride=$true}}
+                $script:MaximumDriverOutputBytes=1048576
+                $challenge='e'*64
+                $run=Invoke-BoundedDriver -Driver "$PSHOME\powershell.exe" -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$Driver,'-Updater',$Updater,'-ChallengeSha',$challenge) -WorkingDirectory $WorkingDirectory -TimeoutSeconds 15 -ExpectedUpdater $Updater -RequireUpdaterObservation
+                Assert-UpgradeEvidence -EvidenceJson $run.StandardOutput -RunId RUN -ExpectedChallengeSha256 $challenge -Scenario Setup-Full -AssetKind Setup -Path Full -FailureInjection None -ExpectedAssetSha256 ('a'*64) -ExpectedAssetBytes 100 -ExpectedUpdaterPath $Updater -ObservedUpdaterJson (ConvertTo-CanonicalJson $run.ObservedUpdater) -WindowStartedUtc $run.StartedUtc -WindowCompletedUtc $run.CompletedUtc -RunOwnedRoot $WorkingDirectory|Out-Null
+                """, new UTF8Encoding(false));
+            var startInfo = PowerShell();
+            foreach (var argument in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-Driver", driver, "-Updater", updater, "-WorkingDirectory", root }) startInfo.ArgumentList.Add(argument);
+            using var process = Process.Start(startInfo)!;
+            var output = await process.StandardOutput.ReadToEndAsync() + await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            Assert.True(process.ExitCode == 0, output);
+        }
+        finally { Directory.Delete(root, recursive: true); }
     }
 
     [Fact]
@@ -101,6 +187,7 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         {
             using var key = RSA.Create(3072);
             using var wrongKey = RSA.Create(3072);
+            using var licenseKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
             var request = new CertificateRequest("CN=Migration Gate Test", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
             using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddHours(1));
             var certPath = System.IO.Path.Combine(root, "publisher.cer");
@@ -108,7 +195,7 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             var signaturePath = fixturePath + ".sig";
             await File.WriteAllBytesAsync(certPath, certificate.Export(X509ContentType.Cert));
             var fixtureBytes = new UTF8Encoding(false).GetBytes(
-                "{\"new_delta_file\":\"new-delta.nupkg\",\"new_full_file\":\"new-full.nupkg\",\"old_full_file\":\"old-full.nupkg\",\"old_portable_file\":\"old.zip\",\"old_setup_file\":\"old.exe\",\"schema_version\":1,\"state_driver_file\":\"driver.exe\",\"state_driver_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n");
+                "{\"license_signing_key_id\":\"production-key-1\",\"license_signing_spki_base64\":\"" + Convert.ToBase64String(licenseKey.ExportSubjectPublicKeyInfo()) + "\",\"new_delta_file\":\"new-delta.nupkg\",\"new_full_file\":\"new-full.nupkg\",\"old_full_file\":\"old-full.nupkg\",\"old_portable_file\":\"old.zip\",\"old_setup_file\":\"old.exe\",\"schema_version\":1,\"state_driver_file\":\"driver.exe\",\"state_driver_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n");
             await File.WriteAllBytesAsync(fixturePath, fixtureBytes);
             await File.WriteAllBytesAsync(signaturePath, wrongKey.SignData(fixtureBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1));
             var pin = Convert.ToHexString(SHA256.HashData(certificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
@@ -199,20 +286,25 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             var license = System.IO.Path.Combine(root, "AppData", "Local", "SuperPan", "Licensing", "v1", "licenses.dat");
             await File.WriteAllTextAsync(database, "RUN RUN RUN database");
             await File.WriteAllTextAsync(license, "protected-license");
-            var state = "{\"account_marker\":\"RUN\",\"account_marker_count\":1,\"account_row_sha256\":\"" + new string('a', 64) +
+            var accountRow = "{\"marker\":\"RUN\",\"value\":\"account\"}";
+            var settingsRow = "{\"marker\":\"RUN\",\"value\":\"settings\"}";
+            var taskRow = "{\"marker\":\"RUN\",\"value\":\"task\"}";
+            var state = "{\"account_marker\":\"RUN\",\"account_marker_count\":1,\"account_row\":" + accountRow + ",\"account_row_sha256\":\"" + HashText(accountRow) +
+                        "\",\"challenge_sha256\":\"" + new string('e', 64) + "\",\"query_completed_utc\":\"2026-09-15T00:00:00.0000000+00:00\",\"run_id\":\"RUN" +
                         "\",\"database_file_sha256\":\"" + new string('0', 64) +
                         "\",\"database_path\":\"" + JsonEscape(database) +
                         "\",\"environment_authorization_is_auxiliary\":true,\"expires_at_utc\":\"2099-01-01T00:00:00.0000000+00:00\",\"license_file_sha256\":\"" + Hash(license) +
                         "\",\"license_path\":\"" + JsonEscape(license) +
-                        "\",\"license_source\":\"preissued-local-production-chain-license\",\"network_accessed\":false,\"production_trust_chain\":true,\"reactivation_required\":false,\"settings_marker\":\"RUN\",\"settings_marker_count\":1,\"settings_row_sha256\":\"" + new string('b', 64) +
+                        "\",\"license_source\":\"preissued-local-production-chain-license\",\"network_accessed\":false,\"production_trust_chain\":true,\"reactivation_required\":false,\"settings_marker\":\"RUN\",\"settings_marker_count\":1,\"settings_row\":" + settingsRow + ",\"settings_row_sha256\":\"" + HashText(settingsRow) +
                         "\",\"signed_payload_sha256\":\"" + new string('c', 64) +
-                        "\",\"task_marker\":\"RUN\",\"task_marker_count\":1,\"task_row_sha256\":\"" + new string('d', 64) + "\"}";
+                        "\",\"task_marker\":\"RUN\",\"task_marker_count\":1,\"task_row\":" + taskRow + ",\"task_row_sha256\":\"" + HashText(taskRow) + "\"}";
             var statePath = System.IO.Path.Combine(root, "state.json");
             await File.WriteAllTextAsync(statePath, state);
 
             var result = await RunFunctionAsync("Assert-StateEvidence", new Dictionary<string, string>
             {
-                ["StateJsonPath"] = statePath, ["ProfileRoot"] = root, ["RunId"] = "RUN",
+                ["StateJsonPath"] = statePath, ["ProfileRoot"] = root, ["RunId"] = "RUN", ["ExpectedChallengeSha256"] = new string('e',64),
+                ["WindowStartedUtc"] = "2026-09-14T00:00:00.0000000+00:00", ["WindowCompletedUtc"] = "2026-09-16T00:00:00.0000000+00:00",
             });
             Assert.NotEqual(0, result.ExitCode);
             Assert.Contains("hash", result.Output, StringComparison.OrdinalIgnoreCase);
@@ -223,12 +315,14 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
     [Fact]
     public async Task DownloadFailureEvidenceWithoutUpdateManagerInvocationFailsClosed()
     {
-        var evidence = "{\"asset_consumed_sha256\":\"" + new string('a', 64) +
-                       "\",\"bytes_consumed\":10,\"expected_asset_bytes\":100,\"failure_injection\":\"DownloadInterrupted\",\"fault_observed\":true,\"old_version_after_failure\":\"1.1.0\",\"outcome\":\"failed-and-rolled-back\",\"update_manager_invoked\":false,\"updater_invoked\":false}";
+        const string updater = "C:\\isolated\\Update.exe";
+        var observed = "{\"Path\":\"" + JsonEscape(updater) + "\",\"Pid\":42,\"StartedUtc\":\"2026-09-15T00:00:01.0000000+00:00\"}";
+        var evidence = "{\"asset_kind\":\"Setup\",\"challenge_sha256\":\"" + new string('e',64) + "\",\"completed_utc\":\"2026-09-15T00:00:03.0000000+00:00\",\"failure_injection\":\"DownloadInterrupted\",\"path\":\"Full\",\"run_id\":\"RUN\",\"scenario\":\"Setup-Full\",\"source_asset_length\":100,\"source_asset_sha256\":\"" + new string('a',64) + "\",\"started_utc\":\"2026-09-15T00:00:00.0000000+00:00\",\"update_manager_invoked\":false,\"update_manager_stage\":\"download-failed\",\"updater_path\":\"" + JsonEscape(updater) + "\",\"updater_pid\":42,\"updater_started_utc\":\"2026-09-15T00:00:01.0000000+00:00\"}";
         var result = await RunFunctionAsync("Assert-UpgradeEvidence", new Dictionary<string, string>
         {
-            ["EvidenceJson"] = evidence, ["FailureInjection"] = "DownloadInterrupted",
+            ["EvidenceJson"] = evidence, ["RunId"]="RUN", ["ExpectedChallengeSha256"]=new string('e',64), ["Scenario"]="Setup-Full", ["AssetKind"]="Setup", ["Path"]="Full", ["FailureInjection"] = "DownloadInterrupted",
             ["ExpectedAssetSha256"] = new string('a', 64), ["ExpectedAssetBytes"] = "100",
+            ["ExpectedUpdaterPath"]=updater, ["ObservedUpdaterJson"]=observed, ["WindowStartedUtc"]="2026-09-14T00:00:00.0000000+00:00", ["WindowCompletedUtc"]="2026-09-16T00:00:00.0000000+00:00",
         });
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("UpdateManager", result.Output, StringComparison.OrdinalIgnoreCase);
@@ -423,12 +517,14 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             await File.WriteAllTextAsync(database, "RUN account settings task");
             await File.WriteAllTextAsync(license, "RUN signed license");
             const string rowHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            var row = "{\"marker\":\"RUN\"}";
             var state = $$"""
-                {"account_marker":"RUN","account_marker_count":1,"account_row_sha256":"{{rowHash}}","settings_marker":"RUN","settings_marker_count":1,"settings_row_sha256":"{{rowHash}}","task_marker":"RUN","task_marker_count":1,"task_row_sha256":"{{rowHash}}","database_path":"{{JsonEscape(database)}}","database_file_sha256":"{{Hash(database)}}","database_length":{{new FileInfo(database).Length}},"license_path":"{{JsonEscape(license)}}","license_file_sha256":"{{Hash(license)}}","license_length":{{new FileInfo(license).Length}},"production_trust_chain":true,"signed_payload_sha256":"{{rowHash}}","expires_at_utc":"2020-01-01T00:00:00.0000000+00:00","activation_request_id":"11111111-1111-1111-1111-111111111111","environment_authorization_is_auxiliary":true,"network_accessed":false,"license_source":"preissued-local-production-chain-license","reactivation_required":false}
+                {"account_marker":"RUN","account_marker_count":1,"account_row":{{row}},"account_row_sha256":"{{HashText(row)}}","challenge_sha256":"{{rowHash}}","query_completed_utc":"2026-09-15T00:00:00.0000000+00:00","run_id":"RUN","settings_marker":"RUN","settings_marker_count":1,"settings_row":{{row}},"settings_row_sha256":"{{HashText(row)}}","task_marker":"RUN","task_marker_count":1,"task_row":{{row}},"task_row_sha256":"{{HashText(row)}}","database_path":"{{JsonEscape(database)}}","database_file_sha256":"{{Hash(database)}}","database_length":{{new FileInfo(database).Length}},"license_path":"{{JsonEscape(license)}}","license_file_sha256":"{{Hash(license)}}","license_length":{{new FileInfo(license).Length}},"production_trust_chain":true,"signed_payload_sha256":"{{rowHash}}","expires_at_utc":"2020-01-01T00:00:00.0000000+00:00","activation_request_id":"11111111-1111-1111-1111-111111111111","environment_authorization_is_auxiliary":true,"network_accessed":false,"license_source":"preissued-local-production-chain-license","reactivation_required":false}
                 """;
             var result = await RunFunctionAsync("Assert-StateEvidence", new Dictionary<string, string>
             {
-                ["StateJson"] = state, ["ProfileRoot"] = profile, ["RunId"] = "RUN",
+                ["StateJson"] = state, ["ProfileRoot"] = profile, ["RunId"] = "RUN", ["ExpectedChallengeSha256"]=rowHash,
+                ["WindowStartedUtc"]="2026-09-14T00:00:00.0000000+00:00", ["WindowCompletedUtc"]="2026-09-16T00:00:00.0000000+00:00",
             });
             Assert.NotEqual(0, result.ExitCode);
             Assert.Contains("expired", result.Output, StringComparison.OrdinalIgnoreCase);
@@ -485,6 +581,9 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
 
     private static string Hash(string path) =>
         Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant();
+
+    private static string HashText(string text) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
 
     private static string JsonEscape(string value) =>
         System.Text.Json.JsonSerializer.Serialize(value)[1..^1];

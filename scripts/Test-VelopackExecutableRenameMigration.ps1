@@ -12,6 +12,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.Security
 Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;
@@ -134,6 +135,30 @@ function Get-CertificateSpkiSha256 {
     finally { $sha.Dispose() }
 }
 
+function Import-P256SubjectPublicKeyInfo([byte[]]$Der) {
+    [byte[]]$prefix=0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00,0x04
+    if($Der.Length-ne 91){throw 'License SPKI length is invalid.'}
+    for($index=0;$index-lt $prefix.Length;$index++){if($Der[$index]-ne $prefix[$index]){throw 'License SPKI is not canonical P-256.'}}
+    [byte[]]$blob=0x45,0x43,0x53,0x31,0x20,0,0,0
+    [Array]::Resize([ref]$blob,72);[Array]::Copy($Der,27,$blob,8,64)
+    return [Security.Cryptography.CngKey]::Import($blob,[Security.Cryptography.CngKeyBlobFormat]::EccPublicBlob)
+}
+
+function Copy-DerEcdsaInteger([byte[]]$Signature,[ref]$Offset,[byte[]]$Output,[int]$TargetOffset) {
+    if($Offset.Value+2-gt $Signature.Length-or $Signature[$Offset.Value]-ne 0x02){throw 'ECDSA signature integer is invalid.'}
+    $length=[int]$Signature[$Offset.Value+1];$Offset.Value+=2
+    if($length-lt 1-or $length-gt 33-or $Offset.Value+$length-gt $Signature.Length-or ($Signature[$Offset.Value]-band 0x80)-ne 0){throw 'ECDSA signature integer is invalid.'}
+    if($Signature[$Offset.Value]-eq 0){$Offset.Value++;$length--};if($length-gt 32){throw 'ECDSA signature integer is invalid.'}
+    [Array]::Copy($Signature,$Offset.Value,$Output,$TargetOffset+32-$length,$length);$Offset.Value+=$length
+}
+
+function Convert-DerEcdsaSignatureToP1363([byte[]]$Signature) {
+    if($Signature.Length-lt 8-or $Signature[0]-ne 0x30-or $Signature[1]-ge 0x80-or $Signature[1]-ne $Signature.Length-2){throw 'ECDSA signature encoding is invalid.'}
+    $output=New-Object byte[] 64;$offset=2
+    Copy-DerEcdsaInteger $Signature ([ref]$offset) $output 0;Copy-DerEcdsaInteger $Signature ([ref]$offset) $output 32
+    if($offset-ne $Signature.Length){throw 'ECDSA signature encoding is invalid.'};return ,$output
+}
+
 function Assert-AssetFileName {
     param([string]$FileName, [string]$Label)
     if ([string]::IsNullOrWhiteSpace($FileName) -or [IO.Path]::IsPathRooted($FileName) -or
@@ -158,7 +183,7 @@ function Assert-CanonicalSignedFixture {
     $utf8 = New-Object Text.UTF8Encoding($false, $true)
     try { $json = $utf8.GetString($bytes) } catch { throw 'Migration fixture is not canonical UTF-8.' }
     try { $fixture = $json | ConvertFrom-Json } catch { throw 'Migration fixture JSON is malformed.' }
-    $expectedProperties = @('new_delta_file','new_full_file','old_full_file','old_portable_file','old_setup_file','schema_version','state_driver_file','state_driver_sha256')
+    $expectedProperties = @('license_signing_key_id','license_signing_spki_base64','new_delta_file','new_full_file','old_full_file','old_portable_file','old_setup_file','schema_version','state_driver_file','state_driver_sha256')
     $actualProperties = @($fixture.PSObject.Properties.Name | Sort-Object)
     if (($actualProperties -join "`n") -cne ($expectedProperties -join "`n") -or $fixture.schema_version -ne 1) {
         throw 'Migration fixture schema is not exactly version 1.'
@@ -167,6 +192,11 @@ function Assert-CanonicalSignedFixture {
         Assert-AssetFileName -FileName ([string]$fixture.$name) -Label $name | Out-Null
     }
     if ([string]$fixture.state_driver_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'state_driver_sha256 is invalid.' }
+    if ([string]$fixture.license_signing_key_id -cnotmatch '^[A-Za-z0-9._-]{1,128}$') { throw 'license_signing_key_id is invalid.' }
+    try { $licenseSpki=[Convert]::FromBase64String([string]$fixture.license_signing_spki_base64) } catch { throw 'license_signing_spki_base64 is invalid.' }
+    if ($licenseSpki.Length -ne 91 -or [Convert]::ToBase64String($licenseSpki) -cne [string]$fixture.license_signing_spki_base64) { throw 'license signing SPKI must be canonical P-256 SPKI DER base64.' }
+    $licenseKey=$null
+    try { $licenseKey=Import-P256SubjectPublicKeyInfo $licenseSpki } finally { if($licenseKey){$licenseKey.Dispose()} }
     $canonical = ConvertTo-CanonicalJson $fixture
     $canonicalBytes = $utf8.GetBytes($canonical + "`n")
     if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$bytes, [byte[]]$canonicalBytes)) { throw 'Migration fixture JSON is not canonical.' }
@@ -210,17 +240,17 @@ function Assert-NoReparsePoint {
 }
 
 function Assert-NoNonLoopbackNetwork {
-    $adapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object {
+    $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
         $_.ifIndex -ne 1 -and [string]$_.InterfaceDescription -notmatch '(?i)loopback'
     })
-    $enabled = @($adapters | Where-Object { [string]$_.Status -cne 'Disabled' })
+    $enabled = @($adapters | Where-Object { [string]$_.Status -notin @('Disabled','Not Present') })
     if ($enabled.Count -ne 0) { throw 'Every non-loopback network adapter must be disabled in the isolated migration environment.' }
-    $defaultRoutes = @(
+    $reachableRoutes = @(
         Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop
         Get-NetRoute -AddressFamily IPv6 -ErrorAction Stop
-    ) | Where-Object { $_.ifIndex -ne 1 -and [string]$_.DestinationPrefix -in @('0.0.0.0/0', '::/0') }
-    if (@($defaultRoutes).Count -ne 0) { throw 'The isolated migration environment must have no IPv4 or IPv6 default route.' }
-    return [ordered]@{ NonLoopbackAdapters = $adapters.Count; DefaultRoutes = 0; VerifiedUtc = [DateTimeOffset]::UtcNow.ToString('O') }
+    ) | Where-Object { $_.ifIndex -ne 1 -and [string]$_.State -notin @('Invalid','Unreachable') }
+    if (@($reachableRoutes).Count -ne 0) { throw 'The isolated migration environment must have no reachable IPv4 or IPv6 non-loopback route.' }
+    return [ordered]@{ NonLoopbackAdapters=$adapters.Count; ReachableRoutes=0; VerifiedUtc=[DateTimeOffset]::UtcNow.ToString('O') }
 }
 
 function Assert-NoReparseAncestors {
@@ -273,6 +303,10 @@ function Assert-IsolatedWindowsProfile {
     $profile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not $identity.User) { throw 'The current Windows identity has no SID.' }
+    $principal = New-Object Security.Principal.WindowsPrincipal $identity
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'The migration gate must run as a non-Administrators isolated user token.'
+    }
     $markerDirectory = Join-Path $profile $script:IsolationDirectoryName
     $markerPath = Join-Path $markerDirectory 'marker.json'
     if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
@@ -324,6 +358,15 @@ function New-RunId {
     $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
     return (-join @($bytes | ForEach-Object { $_.ToString('x2') }))
+}
+
+function New-RunChallenge {
+    $bytes = New-Object byte[] 32
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash=(($sha.ComputeHash($bytes)|ForEach-Object{$_.ToString('x2')}) -join '') } finally { $sha.Dispose() }
+    return [ordered]@{ Base64=[Convert]::ToBase64String($bytes); Sha256=$hash }
 }
 
 function ConvertTo-CanonicalNode {
@@ -411,6 +454,13 @@ function Get-StreamingSha256 {
     finally { $sha.Dispose(); $stream.Dispose() }
 }
 
+function Get-Utf8Sha256 {
+    param([string]$Text)
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash((New-Object Text.UTF8Encoding($false,$true)).GetBytes($Text))|ForEach-Object{$_.ToString('x2')}) -join '') }
+    finally { $sha.Dispose() }
+}
+
 function Get-FileHardLinkCount {
     param([string]$File)
     $output = @(& fsutil.exe hardlink list $File 2>&1)
@@ -436,19 +486,27 @@ function Assert-ExactProfileFile {
 }
 
 function Assert-StateEvidence {
-    param([string]$StateJson, [string]$StateJsonPath, [string]$ProfileRoot, [string]$RunId)
+    param([string]$StateJson, [string]$StateJsonPath, [string]$ProfileRoot, [string]$RunId, [string]$ExpectedChallengeSha256, [DateTimeOffset]$WindowStartedUtc, [DateTimeOffset]$WindowCompletedUtc)
     if ([string]::IsNullOrWhiteSpace($StateJson)) {
         if ([string]::IsNullOrWhiteSpace($StateJsonPath)) { throw 'State evidence JSON is missing.' }
         $StateJson = Get-Content -LiteralPath $StateJsonPath -Raw -Encoding UTF8
     }
     try { $state = $StateJson | ConvertFrom-Json } catch { throw 'State evidence JSON is malformed.' }
+    if ([string]$state.run_id -cne $RunId -or [string]$state.challenge_sha256 -cne $ExpectedChallengeSha256) { throw 'State query run id or challenge does not match this invocation.' }
+    $queryTime=[DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParseExact([string]$state.query_completed_utc,'O',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$queryTime) -or
+        $queryTime -lt $WindowStartedUtc -or $queryTime -gt $WindowCompletedUtc) { throw 'State query time is outside this invocation window.' }
+    # The fixed-production-signed, signed-fixture-hash-pinned driver is the TCB for
+    # SQLite row selection. This detects replay/bugs, not a malicious trusted TCB.
     foreach ($kind in @('account','settings','task')) {
         $markerName = $kind + '_marker'
         $countName = $kind + '_marker_count'
         $hashName = $kind + '_row_sha256'
-        if ([string]$state.$markerName -cne $RunId -or [int]$state.$countName -ne 1 -or
-            [string]$state.$hashName -cnotmatch '^[0-9a-f]{64}$') {
-            throw "$kind marker must be one unique row bound to the current run id and row hash."
+        $rowName = $kind + '_row'
+        $canonicalRow = ConvertTo-CanonicalJson $state.$rowName
+        if (-not $state.$rowName -or [string]$state.$markerName -cne $RunId -or [string]$state.$rowName.marker -cne $RunId -or [int]$state.$countName -ne 1 -or
+            [string]$state.$hashName -cne (Get-Utf8Sha256 $canonicalRow)) {
+            throw "$kind marker must be one unique canonical row bound to the current run id and row hash."
         }
     }
     $expectedDatabase = Join-Path $ProfileRoot 'AppData\Local\BaiduBatchTransfer\data\baidu-batch-transfer.db'
@@ -489,26 +547,76 @@ function Assert-StateEvidencePreserved {
     if ($After.reactivation_required -ne $false) { throw 'The upgraded application required reactivation.' }
 }
 
+function Assert-IndependentLicenseAudit {
+    param($State,[string]$ProfileRoot,$Fixture)
+    $licensePath=Join-Path $ProfileRoot 'AppData\Local\SuperPan\Licensing\v1\licenses.dat'
+    Assert-ExactProfileFile -Actual $licensePath -Expected $licensePath -MaximumBytes 1048576 -Label 'License state file'|Out-Null
+    $entropy=[Security.Cryptography.SHA256]::Create()
+    try{$purposeHash=$entropy.ComputeHash([Text.Encoding]::UTF8.GetBytes('SuperPan.Licensing.State.v1'))}finally{$entropy.Dispose()}
+    try{$plaintext=[Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($licensePath),$purposeHash,[Security.Cryptography.DataProtectionScope]::CurrentUser)}catch{throw 'License DPAPI CurrentUser audit failed.'}
+    try {
+        if($plaintext.Length-lt 2-or $plaintext.Length-gt 786432){throw 'License plaintext size is invalid.'}
+        $utf8=New-Object Text.UTF8Encoding($false,$true)
+        try{$document=$utf8.GetString($plaintext)|ConvertFrom-Json}catch{throw 'License plaintext JSON is invalid.'}
+        if($document.version-ne 1){throw 'License state version is invalid.'}
+        $credentials=@($document.credentials|Where-Object{[string]$_.activation_request_id-ceq[string]$State.activation_request_id})
+        if($credentials.Count-ne 1){throw 'License activation request id is not unique in DPAPI state.'}
+        $leases=@($credentials[0].leases|Where-Object{[string]$_.software_id-ceq'8270e8d7-1791-487d-ad76-0da7a0cbed12'-and[string]$_.machine_hash-ceq[string]$State.machine_hash})
+        if($leases.Count-ne 1){throw 'License ProductId/machine lease is not unique in DPAPI state.'}
+        $lease=$leases[0];$expires=[DateTimeOffset]$lease.expires_at;$leaseUntil=[DateTimeOffset]$lease.lease_until
+        if($expires-le[DateTimeOffset]::UtcNow-or $leaseUntil-le[DateTimeOffset]::UtcNow-or $leaseUntil-gt$expires-or $expires.ToString('O')-cne[string]$State.expires_at_utc){throw 'License expiry/lease audit failed.'}
+        try{$envelope=[string]$lease.signed_payload|ConvertFrom-Json;$payload=[Convert]::FromBase64String([string]$envelope.payload);$signature=[Convert]::FromBase64String([string]$envelope.signature)}catch{throw 'Stored signed license envelope is malformed.'}
+        if([string]$envelope.key_id-cne[string]$Fixture.license_signing_key_id-or (Get-Utf8Sha256 ([string]$lease.signed_payload))-cne[string]$State.signed_payload_sha256){throw 'Stored license key id or signed-envelope hash audit failed.'}
+        $cng=$null;$ecdsa=$null
+        try{$cng=Import-P256SubjectPublicKeyInfo ([Convert]::FromBase64String([string]$Fixture.license_signing_spki_base64));$ecdsa=[Security.Cryptography.ECDsaCng]::new($cng);$ecdsa.HashAlgorithm=[Security.Cryptography.CngAlgorithm]::Sha256;if(-not$ecdsa.VerifyData($payload,(Convert-DerEcdsaSignatureToP1363 $signature))){throw 'Stored license production P-256 signature is invalid.'}}
+        finally{if($ecdsa){$ecdsa.Dispose()};if($cng){$cng.Dispose()}}
+        $claims=$utf8.GetString($payload)|ConvertFrom-Json
+        if([string]$claims.request_id-cne[string]$State.activation_request_id-or[string]$claims.software_id-cne'8270e8d7-1791-487d-ad76-0da7a0cbed12'-or[string]$claims.machine_hash-cne[string]$State.machine_hash-or[string]$claims.decision-cne'allow'-or[string]$claims.code-cne'ok'){throw 'Signed license claims bindings are invalid.'}
+        return [ordered]@{KeyId=[string]$envelope.key_id;SoftwareId=[string]$claims.software_id;MachineHash=[string]$claims.machine_hash;RequestId=[string]$claims.request_id;ExpiresAtUtc=$expires.ToString('O');LeaseUntilUtc=$leaseUntil.ToString('O')}
+    } finally { if($plaintext){[Array]::Clear($plaintext,0,$plaintext.Length)} }
+}
+
 function Assert-UpgradeEvidence {
-    param([string]$EvidenceJson, [string]$FailureInjection, [string]$ExpectedAssetSha256, [long]$ExpectedAssetBytes)
+    param(
+        [string]$EvidenceJson, [string]$RunId, [string]$ExpectedChallengeSha256, [string]$Scenario,
+        [string]$AssetKind, [string]$Path, [string]$FailureInjection, [string]$ExpectedAssetSha256,
+        [long]$ExpectedAssetBytes, [string]$ExpectedUpdaterPath, [string]$ObservedUpdaterJson,
+        [DateTimeOffset]$WindowStartedUtc, [DateTimeOffset]$WindowCompletedUtc, [string]$RunOwnedRoot
+    )
     try { $upgrade = $EvidenceJson | ConvertFrom-Json } catch { throw 'Upgrade evidence JSON is malformed.' }
-    if ([string]$upgrade.failure_injection -cne $FailureInjection -or [string]$upgrade.asset_consumed_sha256 -cne $ExpectedAssetSha256 -or
-        [long]$upgrade.expected_asset_bytes -ne $ExpectedAssetBytes) { throw 'Upgrade evidence is not bound to the selected local asset.' }
-    if ($upgrade.update_manager_invoked -ne $true) { throw 'The trusted driver did not invoke Velopack UpdateManager.' }
+    if ([string]$upgrade.run_id -cne $RunId -or [string]$upgrade.challenge_sha256 -cne $ExpectedChallengeSha256) { throw 'Upgrade evidence run id or challenge does not match this invocation.' }
+    if ([string]$upgrade.scenario -cne $Scenario -or [string]$upgrade.asset_kind -cne $AssetKind -or [string]$upgrade.path -cne $Path -or [string]$upgrade.failure_injection -cne $FailureInjection) { throw 'Upgrade evidence scenario fields do not match this invocation.' }
+    if ([string]$upgrade.source_asset_sha256 -cne $ExpectedAssetSha256 -or [long]$upgrade.source_asset_length -ne $ExpectedAssetBytes) { throw 'Upgrade evidence is not bound to the selected local source asset.' }
+    try { $observed=$ObservedUpdaterJson|ConvertFrom-Json } catch { throw 'ObservedUpdater evidence is malformed.' }
+    if (-not $observed -or [int]$observed.Pid -le 0) { throw 'An independently observed updater process is required.' }
+    if ([IO.Path]::GetFullPath([string]$observed.Path) -cne [IO.Path]::GetFullPath($ExpectedUpdaterPath) -or
+        [int]$upgrade.updater_pid -ne [int]$observed.Pid -or [string]$upgrade.updater_path -cne [string]$observed.Path -or
+        [string]$upgrade.updater_started_utc -cne [string]$observed.StartedUtc) { throw 'Driver updater evidence does not match the independently observed install-root Update.exe process.' }
+    $started=[DateTimeOffset]::MinValue; $completed=[DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParseExact([string]$upgrade.started_utc,'O',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$started) -or
+        -not [DateTimeOffset]::TryParseExact([string]$upgrade.completed_utc,'O',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$completed) -or
+        $started -lt $WindowStartedUtc -or $completed -gt $WindowCompletedUtc -or $completed -lt $started) { throw 'Upgrade timestamps are outside this invocation window.' }
+    if ($upgrade.update_manager_invoked -ne $true -or [string]::IsNullOrWhiteSpace([string]$upgrade.update_manager_stage)) { throw 'The trusted driver did not invoke a named Velopack UpdateManager stage.' }
     if ($FailureInjection -ceq 'None') {
-        if ($upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -ne 0 -or [string]$upgrade.outcome -cne 'updated') {
+        if ($upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -ne 0 -or $upgrade.update_manager_succeeded -ne $true -or [string]$upgrade.update_manager_stage -cne 'apply-completed' -or [string]$upgrade.outcome -cne 'updated') {
             throw 'Successful migration did not execute the Velopack updater successfully.'
         }
     } elseif ($FailureInjection -ceq 'DownloadInterrupted') {
-        if ($upgrade.fault_observed -ne $true -or $upgrade.asset_opened -ne $true -or
-            [long]$upgrade.bytes_consumed -le 0 -or [long]$upgrade.bytes_consumed -ge $ExpectedAssetBytes -or
+        $partial=Assert-StrictChildPath -Candidate ([string]$upgrade.partial_artifact_path) -Root $RunOwnedRoot -Label 'Partial download artifact'
+        if (-not (Test-Path -LiteralPath $partial -PathType Leaf)) { throw 'Partial download artifact was not created.' }
+        Assert-NoReparseAncestors -ExistingPath $partial -Label 'Partial download artifact'
+        $partialInfo=Get-Item -LiteralPath $partial
+        if ($partialInfo.Length -le 0 -or $partialInfo.Length -ge $ExpectedAssetBytes -or [long]$upgrade.bytes_consumed -ne $partialInfo.Length -or [string]$upgrade.partial_artifact_sha256 -cne (Get-StreamingSha256 $partial) -or
+            $upgrade.fault_observed -ne $true -or $upgrade.asset_opened -ne $true -or $upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -eq 0 -or $upgrade.update_manager_succeeded -ne $false -or [string]$upgrade.update_manager_stage -cne 'download-failed' -or
             [string]$upgrade.old_version_after_failure -cne '1.1.0' -or [string]$upgrade.outcome -cne 'failed-and-rolled-back') {
-            throw 'DownloadInterrupted did not prove a real consumed partial asset and 1.1.0 rollback.'
+            throw 'DownloadInterrupted did not prove a real updater/UpdateManager failure over an independently hashed partial artifact and 1.1.0 rollback.'
         }
     } else {
-        if ($upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -eq 0 -or $upgrade.fault_observed -ne $true -or
+        $hook=Assert-StrictChildPath -Candidate ([string]$upgrade.candidate_hook_trace_path) -Root $RunOwnedRoot -Label 'Candidate failure hook trace'
+        if (-not (Test-Path -LiteralPath $hook -PathType Leaf) -or [string]$upgrade.candidate_hook_challenge_sha256 -cne $ExpectedChallengeSha256 -or [string]$upgrade.candidate_hook_trace_sha256 -cne (Get-StreamingSha256 $hook) -or
+            $upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -eq 0 -or $upgrade.update_manager_succeeded -ne $false -or [string]$upgrade.update_manager_stage -cne 'apply-failed' -or $upgrade.fault_observed -ne $true -or
             [string]$upgrade.old_version_after_failure -cne '1.1.0' -or [string]$upgrade.outcome -cne 'failed-and-rolled-back') {
-            throw 'ApplicationFailed did not prove a real updater failure and 1.1.0 rollback.'
+            throw 'ApplicationFailed did not prove an observed updater nonzero exit, challenge-bound candidate hook, UpdateManager failure, and 1.1.0 rollback.'
         }
     }
     return $upgrade
@@ -576,34 +684,78 @@ function ConvertTo-NativeCommandLine {
     }) -join ' ')
 }
 
+function Invoke-MonitoredProcess {
+    param([string]$File, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds, [string]$ExpectedUpdater, [switch]$RequireUpdaterObservation)
+    $token = [Guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $WorkingDirectory ".migration-$token.stdout"
+    $stderrPath = Join-Path $WorkingDirectory ".migration-$token.stderr"
+    $started = [DateTimeOffset]::UtcNow
+    Assert-NoNonLoopbackNetwork | Out-Null
+    $process = Start-Process -FilePath $File -ArgumentList (ConvertTo-NativeCommandLine $Arguments) -WorkingDirectory $WorkingDirectory -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -NoNewWindow -PassThru
+    $observedUpdater = $null
+    try {
+        $deadline = $started.AddSeconds($TimeoutSeconds)
+        while (-not $process.HasExited) {
+            try { Assert-NoNonLoopbackNetwork | Out-Null } catch { Stop-OwnedProcessTree -RootProcessId $process.Id; throw }
+            $snapshot=@(Get-CimInstance Win32_Process -ErrorAction Stop)
+            $descendantIds=New-Object Collections.Generic.List[int]
+            $descendantIds.Add($process.Id)
+            do {
+                $added=$false
+                foreach($item in $snapshot) { if ($descendantIds.Contains([int]$item.ParentProcessId) -and -not $descendantIds.Contains([int]$item.ProcessId)) { $descendantIds.Add([int]$item.ProcessId); $added=$true } }
+            } while($added)
+            foreach ($candidate in $snapshot) {
+                if ($RequireUpdaterObservation -and $descendantIds.Contains([int]$candidate.ProcessId) -and [int]$candidate.ProcessId -ne $process.Id -and $candidate.ExecutablePath -and
+                    [string]::Equals([IO.Path]::GetFullPath([string]$candidate.ExecutablePath), [IO.Path]::GetFullPath($ExpectedUpdater), [StringComparison]::OrdinalIgnoreCase)) {
+                    $creation=$candidate.CreationDate
+                    $creationUtc=if($creation-is[DateTime]){([DateTime]$creation).ToUniversalTime()}else{[Management.ManagementDateTimeConverter]::ToDateTime([string]$creation).ToUniversalTime()}
+                    $observedUpdater = [ordered]@{ Pid=[int]$candidate.ProcessId; Path=[IO.Path]::GetFullPath([string]$candidate.ExecutablePath); StartedUtc=$creationUtc.ToString('O') }
+                }
+            }
+            foreach ($outputPath in @($stdoutPath,$stderrPath)) {
+                if ((Test-Path -LiteralPath $outputPath) -and (Get-Item -LiteralPath $outputPath).Length -gt $script:MaximumDriverOutputBytes) { Stop-OwnedProcessTree -RootProcessId $process.Id; throw 'Bounded process output exceeded the byte limit.' }
+            }
+            if ([DateTimeOffset]::UtcNow -ge $deadline) { Stop-OwnedProcessTree -RootProcessId $process.Id; throw "Bounded process timed out after $TimeoutSeconds seconds." }
+            Start-Sleep -Milliseconds 20
+            $process.Refresh()
+        }
+        $process.WaitForExit()
+        if ($RequireUpdaterObservation -and -not $observedUpdater) { throw 'The expected install-root Update.exe descendant was not independently observed.' }
+        [byte[]]$stdoutBytes = [IO.File]::ReadAllBytes($stdoutPath)
+        [byte[]]$stderrBytes = [IO.File]::ReadAllBytes($stderrPath)
+        if ($stdoutBytes.Length + $stderrBytes.Length -gt $script:MaximumDriverOutputBytes) { throw 'Bounded process output exceeded the byte limit.' }
+        $utf8 = New-Object Text.UTF8Encoding($false, $true)
+        try { $stdout=$utf8.GetString($stdoutBytes); $stderr=$utf8.GetString($stderrBytes) } catch { throw 'Bounded process output is not strict UTF-8.' }
+        $process.Refresh();$exitCode=[int]$process.ExitCode;$processId=[int]$process.Id
+        return [pscustomobject]@{ ExitCode=$exitCode; StandardOutput=$stdout; StandardError=$stderr; ProcessId=$processId; StartedUtc=$started.ToString('O'); CompletedUtc=[DateTimeOffset]::UtcNow.ToString('O'); ObservedUpdater=$observedUpdater }
+    } finally {
+        $process.Dispose()
+        foreach ($ownedOutput in @($stdoutPath,$stderrPath)) {
+            $cleanupDeadline=[DateTimeOffset]::UtcNow.AddSeconds(5)
+            while(Test-Path -LiteralPath $ownedOutput){try{Remove-Item -LiteralPath $ownedOutput -Force -ErrorAction Stop}catch [IO.IOException]{if([DateTimeOffset]::UtcNow-ge$cleanupDeadline){throw};Start-Sleep -Milliseconds 50}}
+        }
+        Assert-NoNonLoopbackNetwork | Out-Null
+    }
+}
+
 function Invoke-BoundedDriver {
-    param([string]$Driver, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 120)
-    Assert-NoNonLoopbackNetwork | Out-Null
-    $result = [MigrationBoundedProcessRunner]::Run(
-        $Driver, (ConvertTo-NativeCommandLine $Arguments), $WorkingDirectory,
-        $TimeoutSeconds * 1000, $script:MaximumDriverOutputBytes)
-    Assert-NoNonLoopbackNetwork | Out-Null
+    param([string]$Driver, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 120, [string]$ExpectedUpdater, [switch]$RequireUpdaterObservation)
+    $result = Invoke-MonitoredProcess -File $Driver -Arguments $Arguments -WorkingDirectory $WorkingDirectory -TimeoutSeconds $TimeoutSeconds -ExpectedUpdater $ExpectedUpdater -RequireUpdaterObservation:$RequireUpdaterObservation
     if ($result.ExitCode -ne 0) { throw "Trusted state driver failed with exit code $($result.ExitCode): $($result.StandardError)" }
     if (-not [string]::IsNullOrEmpty($result.StandardError)) { throw 'Trusted state driver wrote unexpected stderr.' }
-    $outputBytes = (New-Object Text.UTF8Encoding($false, $true)).GetBytes($result.StandardOutput)
-    if ($outputBytes.Length -lt 3 -or $outputBytes.Length -gt $script:MaximumDriverOutputBytes -or
-        $outputBytes[$outputBytes.Length - 1] -ne 0x0a -or $outputBytes -contains 0x0d) {
-        throw 'Trusted state driver stdout must be one bounded canonical UTF-8/LF JSON record.'
-    }
-    try { $record = $result.StandardOutput | ConvertFrom-Json } catch { throw 'Trusted state driver stdout is malformed JSON.' }
+    [byte[]]$outputBytes = (New-Object Text.UTF8Encoding($false, $true)).GetBytes($result.StandardOutput)
+    if ($outputBytes.Length -lt 3 -or $outputBytes.Length -gt $script:MaximumDriverOutputBytes -or $outputBytes[$outputBytes.Length - 1] -ne 0x0a -or $outputBytes -contains 0x0d) { throw 'Trusted state driver stdout must be one bounded canonical UTF-8/LF JSON record.' }
+    try { $record=$result.StandardOutput|ConvertFrom-Json } catch { throw 'Trusted state driver stdout is malformed JSON.' }
     if ((ConvertTo-CanonicalJson $record) + "`n" -cne $result.StandardOutput) { throw 'Trusted state driver stdout JSON is not canonical.' }
-    return $result.StandardOutput
+    return $result
 }
 
 function Invoke-CheckedProcess {
     param([string]$File, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 120, [switch]$ExpectFailure)
-    Assert-NoNonLoopbackNetwork | Out-Null
-    try {
-        $result = [MigrationBoundedProcessRunner]::Run($File, (ConvertTo-NativeCommandLine $Arguments), $WorkingDirectory, $TimeoutSeconds * 1000, $script:MaximumDriverOutputBytes)
-        if (-not $ExpectFailure -and $result.ExitCode -ne 0) { throw "Process failed ($($result.ExitCode)): $File`n$($result.StandardOutput)$($result.StandardError)" }
-        if ($ExpectFailure -and $result.ExitCode -eq 0) { throw "Injected failure unexpectedly succeeded: $File" }
-        return [pscustomobject]@{ ExitCode=$result.ExitCode; Output=($result.StandardOutput + $result.StandardError) }
-    } finally { Assert-NoNonLoopbackNetwork | Out-Null }
+    $result = Invoke-MonitoredProcess -File $File -Arguments $Arguments -WorkingDirectory $WorkingDirectory -TimeoutSeconds $TimeoutSeconds
+    if (-not $ExpectFailure -and $result.ExitCode -ne 0) { throw "Process failed ($($result.ExitCode)): $File`n$($result.StandardOutput)$($result.StandardError)" }
+    if ($ExpectFailure -and $result.ExitCode -eq 0) { throw "Injected failure unexpectedly succeeded: $File" }
+    return [pscustomobject]@{ ExitCode=$result.ExitCode; Output=($result.StandardOutput+$result.StandardError) }
 }
 
 function Resolve-AssetFile {
@@ -740,7 +892,7 @@ $evidence = [ordered]@{
     AssetSource = 'caller-supplied-local-directories'; AssetKind = $AssetKind; Path = $Path
     Scenario = "$AssetKind-$Path"; FailureInjection = $FailureInjection; Succeeded = $false
     FailureRollbackVerified = $false; VelopackUpdaterVersion = $null; Upgrade = $null
-    Surfaces = $null; BeforeState = $null; AfterState = $null; Error = $null
+    Surfaces = $null; BeforeState = $null; AfterState = $null; BeforeLicenseAudit=$null; AfterLicenseAudit=$null; Error = $null
 }
 
 try {
@@ -810,9 +962,11 @@ try {
     $evidence.VelopackUpdaterVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($updater).ProductVersion
 
     $commonDriverArguments = @('--run-id',$runId,'--profile-root',$profile,'--fixture',$fixturePath)
-    $beforeJson = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('seed-and-probe') + $commonDriverArguments)
-    $before = Assert-StateEvidence -StateJson $beforeJson -ProfileRoot $profile -RunId $runId
+    $beforeChallenge=New-RunChallenge
+    $beforeRun = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('seed-and-probe','--challenge',$beforeChallenge.Base64) + $commonDriverArguments)
+    $before = Assert-StateEvidence -StateJson $beforeRun.StandardOutput -ProfileRoot $profile -RunId $runId -ExpectedChallengeSha256 $beforeChallenge.Sha256 -WindowStartedUtc $beforeRun.StartedUtc -WindowCompletedUtc $beforeRun.CompletedUtc
     $evidence.BeforeState = $before
+    $evidence.BeforeLicenseAudit=Assert-IndependentLicenseAudit -State $before -ProfileRoot $profile -Fixture $fixture
 
     if ($Path -ceq 'Delta') {
         Resolve-AssetFile -Root $stagedOld -FileName ([string]$fixture.old_full_file) -Label 'Old full package' | Out-Null
@@ -823,12 +977,15 @@ try {
     $selectedAssetHash = Get-StreamingSha256 -File $selectedAsset
     $selectedAssetBytes = (Get-Item -LiteralPath $selectedAsset).Length
     $restartStarted = [DateTimeOffset]::UtcNow
-    $upgradeJson = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments @(
-        'perform-upgrade','--run-id',$runId,'--profile-root',$profile,'--fixture',$fixturePath,
+    $upgradeChallenge=New-RunChallenge
+    $upgradeRun = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments @(
+        'perform-upgrade','--challenge',$upgradeChallenge.Base64,'--run-id',$runId,'--profile-root',$profile,'--fixture',$fixturePath,
         '--old-assets',$stagedOld,'--new-assets',$stagedNew,'--install-root',$installRoot,
         '--asset',$selectedAsset,'--asset-kind',$AssetKind,'--path',$Path,'--failure-injection',$FailureInjection
-    ) -TimeoutSeconds 300
-    $upgrade = Assert-UpgradeEvidence -EvidenceJson $upgradeJson -FailureInjection $FailureInjection -ExpectedAssetSha256 $selectedAssetHash -ExpectedAssetBytes $selectedAssetBytes
+    ) -TimeoutSeconds 300 -ExpectedUpdater $updater -RequireUpdaterObservation
+    $upgrade = Assert-UpgradeEvidence -EvidenceJson $upgradeRun.StandardOutput -RunId $runId -ExpectedChallengeSha256 $upgradeChallenge.Sha256 -Scenario $evidence.Scenario -AssetKind $AssetKind -Path $Path -FailureInjection $FailureInjection `
+        -ExpectedAssetSha256 $selectedAssetHash -ExpectedAssetBytes $selectedAssetBytes -ExpectedUpdaterPath $updater -ObservedUpdaterJson (ConvertTo-CanonicalJson $upgradeRun.ObservedUpdater) `
+        -WindowStartedUtc $upgradeRun.StartedUtc -WindowCompletedUtc $upgradeRun.CompletedUtc -RunOwnedRoot $evidenceRoot
     $evidence.Upgrade = $upgrade
 
     if ($FailureInjection -cne 'None') {
@@ -836,8 +993,11 @@ try {
             throw 'Injected failure did not leave the exact old executable at version 1.1.0.'
         }
         Assert-OldVersionStillLaunches -OldExecutable $oldMain -RunId $runId | Out-Null
-        $afterJson = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('probe') + $commonDriverArguments)
-        $after = Assert-StateEvidence -StateJson $afterJson -ProfileRoot $profile -RunId $runId
+        $afterChallenge=New-RunChallenge
+        $afterRun = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('probe','--challenge',$afterChallenge.Base64) + $commonDriverArguments)
+        $after = Assert-StateEvidence -StateJson $afterRun.StandardOutput -ProfileRoot $profile -RunId $runId -ExpectedChallengeSha256 $afterChallenge.Sha256 -WindowStartedUtc $afterRun.StartedUtc -WindowCompletedUtc $afterRun.CompletedUtc
+        $evidence.AfterLicenseAudit=Assert-IndependentLicenseAudit -State $after -ProfileRoot $profile -Fixture $fixture
+        if((ConvertTo-CanonicalJson $evidence.BeforeLicenseAudit)-cne(ConvertTo-CanonicalJson $evidence.AfterLicenseAudit)){throw 'Independent license audit changed across failed upgrade.'}
         Assert-StateEvidencePreserved -Before $before -After $after
         $evidence.AfterState = $after
         $evidence.FailureRollbackVerified = $true
@@ -863,8 +1023,11 @@ try {
         finally { if ($compatProcess -and -not $compatProcess.HasExited) { Stop-OwnedProcessTree -RootProcessId $compatProcess.Id } }
         Stop-OwnedProcessTree -RootProcessId $compatTarget.Id
         $surfaces.LegacyCompatibilityForwardTarget = $compatTarget.Path
-        $afterJson = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('probe') + $commonDriverArguments)
-        $after = Assert-StateEvidence -StateJson $afterJson -ProfileRoot $profile -RunId $runId
+        $afterChallenge=New-RunChallenge
+        $afterRun = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('probe','--challenge',$afterChallenge.Base64) + $commonDriverArguments)
+        $after = Assert-StateEvidence -StateJson $afterRun.StandardOutput -ProfileRoot $profile -RunId $runId -ExpectedChallengeSha256 $afterChallenge.Sha256 -WindowStartedUtc $afterRun.StartedUtc -WindowCompletedUtc $afterRun.CompletedUtc
+        $evidence.AfterLicenseAudit=Assert-IndependentLicenseAudit -State $after -ProfileRoot $profile -Fixture $fixture
+        if((ConvertTo-CanonicalJson $evidence.BeforeLicenseAudit)-cne(ConvertTo-CanonicalJson $evidence.AfterLicenseAudit)){throw 'Independent license audit changed across successful upgrade.'}
         Assert-StateEvidencePreserved -Before $before -After $after
         $evidence.Surfaces = $surfaces
         $evidence.AfterState = $after
