@@ -515,7 +515,7 @@ function Invoke-ProductionRelease {
         try {
             $errorTask = $process.StandardError.ReadToEndAsync()
             $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($output)
-            $copyTask.GetAwaiter().GetResult()
+            [void]$copyTask.GetAwaiter().GetResult()
             $standardError = $errorTask.GetAwaiter().GetResult()
             $process.WaitForExit()
             if ($process.ExitCode -ne 0) {

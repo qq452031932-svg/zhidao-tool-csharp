@@ -194,6 +194,7 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("$startInfo.ArgumentList.Add('-z')", script, StringComparison.Ordinal);
         Assert.Contains("[Text.UTF8Encoding]::new($false, $true)", script, StringComparison.Ordinal);
         Assert.Contains(".Split([char]0", script, StringComparison.Ordinal);
+        Assert.Contains("[void]$copyTask.GetAwaiter().GetResult()", script, StringComparison.Ordinal);
         Assert.DoesNotContain("@(& git -C $Source ls-tree", script, StringComparison.Ordinal);
     }
 
