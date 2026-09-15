@@ -470,8 +470,12 @@ public sealed class OtaReleaseScriptTests
     {
         var script = ReadScript();
 
-        Assert.Equal(1, CountOccurrences(script, ". (Join-Path $PSScriptRoot 'ProductIdentity.ps1')"));
         Assert.Equal(1, CountOccurrences(script, "Get-ProductIdentity"));
+        Assert.Contains(". $IdentityScriptPath", script, StringComparison.Ordinal);
+        Assert.Contains("(Join-Path $sourceSnapshot 'scripts\\ProductIdentity.ps1')", script, StringComparison.Ordinal);
+        Assert.Contains("(Join-Path $sourceSnapshot 'eng\\ProductIdentity.props')", script, StringComparison.Ordinal);
+        Assert.Contains("(Join-Path $PSScriptRoot 'ProductIdentity.ps1')", script, StringComparison.Ordinal);
+        Assert.Contains("Production product identity inputs differ from source commit", script, StringComparison.Ordinal);
         foreach (var property in new[]
                  {
                      "ProductMainExecutableName", "ProductMainDllName", "ProductDisplayName",
@@ -636,6 +640,28 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("$process.WaitForExit(5000)", script, StringComparison.Ordinal);
         Assert.DoesNotContain("try { $process.Kill() } catch {}", script, StringComparison.Ordinal);
         Assert.Contains("$legacyLauncherProbeCanBeRemoved", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ProbeSideEffectAndCleanupFailurePreserveThePrimaryDiagnostic()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_LEGACY_LAUNCHER_SIDE_EFFECT"] = "1",
+            },
+            injectProbeCleanupFailure: true);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("unexpected dependency or side-effect file", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Probe cleanup also failed", result.Output, StringComparison.Ordinal);
+        Assert.Contains("probe directory retained", result.Output, StringComparison.OrdinalIgnoreCase);
+        var buildDirectory = Path.Combine(fixture.OutputDirectory, ".build");
+        Assert.Single(Directory.EnumerateDirectories(
+            buildDirectory, ".legacy-launcher-probe-*", SearchOption.TopDirectoryOnly));
     }
 
     [Fact]
@@ -1136,7 +1162,8 @@ public sealed class OtaReleaseScriptTests
             bool installPathOnly = false,
             IReadOnlyDictionary<string, string?>? additionalEnvironment = null,
             bool includePreviousRelease = false,
-            string? releaseNotesPath = null)
+            string? releaseNotesPath = null,
+            bool injectProbeCleanupFailure = false)
         {
             var environment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
             {
@@ -1170,8 +1197,28 @@ public sealed class OtaReleaseScriptTests
                 arguments.Add("-ReleaseNotesPath");
                 arguments.Add(releaseNotesPath);
             }
+            var script = ScriptPath();
+            if (injectProbeCleanupFailure)
+            {
+                script = Path.Combine(Root, "cleanup-failure-wrapper.ps1");
+                var buildScript = ScriptPath().Replace("'", "''", StringComparison.Ordinal);
+                File.WriteAllText(script, $$"""
+                    function Remove-Item {
+                        [CmdletBinding()]
+                        param(
+                            [Parameter(Mandatory = $true)][string]$LiteralPath,
+                            [switch]$Recurse,
+                            [switch]$Force)
+                        if ([IO.Path]::GetFileName($LiteralPath) -like '.legacy-launcher-probe-*') {
+                            throw 'Injected probe cleanup failure.'
+                        }
+                        Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
+                    }
+                    & '{{buildScript}}' @args
+                    """);
+            }
             return RunPowerShellAsync(
-                ScriptPath(),
+                script,
                 arguments.ToArray(),
                 environment,
                 OutsideWorkingDirectory);
@@ -1320,7 +1367,7 @@ if ($ToolArgs[0] -ceq 'publish') {
     [IO.Directory]::CreateDirectory($publishDirectory) | Out-Null
     if ($ToolArgs[1] -like '*BaiduBatchTransfer.LegacyLauncher*') {
         $launcherPath = Join-Path $publishDirectory 'BaiduBatchTransfer.App.exe'
-        Add-Type -TypeDefinition 'using System; using System.Diagnostics; using System.IO; using System.Threading; public static class FakeLauncher { public static int Main() { if (Environment.GetEnvironmentVariable("FAKE_OTA_LEGACY_LAUNCHER_HANG") == "1") { File.WriteAllText(Environment.GetEnvironmentVariable("FAKE_OTA_LEGACY_LAUNCHER_PID"), Process.GetCurrentProcess().Id.ToString()); Thread.Sleep(Timeout.Infinite); } return 2; } }' -Language CSharp -OutputAssembly $launcherPath -OutputType WindowsApplication
+        Add-Type -TypeDefinition 'using System; using System.Diagnostics; using System.IO; using System.Threading; public static class FakeLauncher { public static int Main() { if (Environment.GetEnvironmentVariable("FAKE_OTA_LEGACY_LAUNCHER_HANG") == "1") { File.WriteAllText(Environment.GetEnvironmentVariable("FAKE_OTA_LEGACY_LAUNCHER_PID"), Process.GetCurrentProcess().Id.ToString()); Thread.Sleep(Timeout.Infinite); } if (Environment.GetEnvironmentVariable("FAKE_OTA_LEGACY_LAUNCHER_SIDE_EFFECT") == "1") File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cleanup-side-effect.bin"), "side effect"); return 2; } }' -Language CSharp -OutputAssembly $launcherPath -OutputType WindowsApplication
     }
     else {
         . (Join-Path (Get-Location).Path 'scripts\ProductIdentity.ps1')

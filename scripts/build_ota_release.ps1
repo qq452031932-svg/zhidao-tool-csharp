@@ -21,13 +21,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-. (Join-Path $PSScriptRoot 'ProductIdentity.ps1')
-$productIdentity = Get-ProductIdentity
-$productMainExecutableName = [string]$productIdentity.ProductMainExecutableName
-$productMainDllName = [string]$productIdentity.ProductMainDllName
-$productDisplayName = [string]$productIdentity.ProductDisplayName
-$legacyLauncherExecutableName = [string]$productIdentity.ProductLegacyExecutableName
-
 $acceptancePackageId = 'SuperPan.BaiduBatchTransfer.OtaAcceptance'
 $acceptanceChannel = 'win-x64-ota-acceptance'
 $productionPackageId = 'SuperPan.BaiduBatchTransfer'
@@ -36,9 +29,21 @@ $requiredVpkVersion = '1.2.0'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts'))
 $productAppRelativeDirectory = 'src\BaiduBatchTransfer.App'
-$productIconRelativePath = Join-Path $productAppRelativeDirectory (
-    'Assets\Branding\' + [IO.Path]::GetFileNameWithoutExtension($productMainExecutableName) + '.ico')
-$productIconPath = [IO.Path]::GetFullPath((Join-Path $repoRoot $productIconRelativePath))
+
+function Initialize-ProductIdentity(
+    [string]$IdentityScriptPath,
+    [string]$IdentityPropsPath,
+    [string]$IdentityRoot) {
+    . $IdentityScriptPath
+    $script:productIdentity = Get-ProductIdentity -Path $IdentityPropsPath
+    $script:productMainExecutableName = [string]$productIdentity.ProductMainExecutableName
+    $script:productMainDllName = [string]$productIdentity.ProductMainDllName
+    $script:productDisplayName = [string]$productIdentity.ProductDisplayName
+    $script:legacyLauncherExecutableName = [string]$productIdentity.ProductLegacyExecutableName
+    $script:productIconRelativePath = Join-Path $productAppRelativeDirectory (
+        'Assets\Branding\' + [IO.Path]::GetFileNameWithoutExtension($productMainExecutableName) + '.ico')
+    $script:productIconPath = [IO.Path]::GetFullPath((Join-Path $IdentityRoot $productIconRelativePath))
+}
 
 # Acceptance remains an explicitly unsigned, local-only gate. Production is a separate
 # parameter set and has no unsigned bypass.
@@ -189,6 +194,8 @@ function Install-VerifiedLegacyLauncher(
     [IO.Directory]::CreateDirectory($legacyLauncherProbeDirectory) | Out-Null
     $legacyLauncherProbeCanBeRemoved = $true
     $legacyLauncherFailure = $null
+    $legacyLauncherPrimaryError = $null
+    $legacyLauncherCleanupError = $null
     try {
         $probeLauncher = Join-Path $legacyLauncherProbeDirectory $legacyLauncherExecutableName
         [IO.File]::Copy($launcherSource, $probeLauncher, $false)
@@ -239,21 +246,23 @@ function Install-VerifiedLegacyLauncher(
         }
         finally { $process.Dispose() }
 
-        if ($null -eq $legacyLauncherFailure -and $legacyLauncherExitCode -ne 2) {
+        if ($null -ne $legacyLauncherFailure) { throw $legacyLauncherFailure }
+        if ($legacyLauncherExitCode -ne 2) {
             throw "Legacy launcher single-file probe returned unexpected exit code $legacyLauncherExitCode."
         }
 
-        if ($null -eq $legacyLauncherFailure) {
-            $probeEntries = @([IO.Directory]::EnumerateFileSystemEntries($legacyLauncherProbeDirectory))
-            if ($probeEntries.Count -ne 1 -or
-                [IO.Path]::GetFileName($probeEntries[0]) -cne $legacyLauncherExecutableName) {
-                throw 'Legacy launcher single-file probe created an unexpected dependency or side-effect file.'
-            }
-            [IO.File]::Copy(
-                $probeLauncher,
-                (Join-Path $MainPublishDirectory $legacyLauncherExecutableName),
-                $false)
+        $probeEntries = @([IO.Directory]::EnumerateFileSystemEntries($legacyLauncherProbeDirectory))
+        if ($probeEntries.Count -ne 1 -or
+            [IO.Path]::GetFileName($probeEntries[0]) -cne $legacyLauncherExecutableName) {
+            throw 'Legacy launcher single-file probe created an unexpected dependency or side-effect file.'
         }
+        [IO.File]::Copy(
+            $probeLauncher,
+            (Join-Path $MainPublishDirectory $legacyLauncherExecutableName),
+            $false)
+    }
+    catch {
+        $legacyLauncherPrimaryError = $_
     }
     finally {
         if ($legacyLauncherProbeCanBeRemoved -and
@@ -262,12 +271,31 @@ function Install-VerifiedLegacyLauncher(
                 Remove-Item -LiteralPath $legacyLauncherProbeDirectory -Recurse -Force
             }
             catch {
-                if ($null -eq $legacyLauncherFailure) { throw }
-                $legacyLauncherFailure += " Probe cleanup also failed: $($_.Exception.Message)"
+                $legacyLauncherCleanupError = $_
             }
         }
     }
-    if ($null -ne $legacyLauncherFailure) { throw $legacyLauncherFailure }
+
+    if ($null -ne $legacyLauncherPrimaryError) {
+        $combinedMessage = [string]$legacyLauncherPrimaryError.Exception.Message
+        if ($null -ne $legacyLauncherCleanupError) {
+            $combinedMessage += " Probe cleanup also failed: $($legacyLauncherCleanupError.Exception.Message) Probe directory retained: $legacyLauncherProbeDirectory"
+        }
+        elseif (-not $legacyLauncherProbeCanBeRemoved) {
+            $combinedMessage += " Probe directory retained because process exit was not confirmed: $legacyLauncherProbeDirectory"
+        }
+        if ($combinedMessage -cne [string]$legacyLauncherPrimaryError.Exception.Message) {
+            throw [InvalidOperationException]::new(
+                $combinedMessage,
+                $legacyLauncherPrimaryError.Exception)
+        }
+        throw $legacyLauncherPrimaryError
+    }
+    if ($null -ne $legacyLauncherCleanupError) {
+        throw [InvalidOperationException]::new(
+            "Legacy launcher probe cleanup failed: $($legacyLauncherCleanupError.Exception.Message) Probe directory retained: $legacyLauncherProbeDirectory",
+            $legacyLauncherCleanupError.Exception)
+    }
 }
 
 function Test-SafeNupkgFileName([string]$FileName) {
@@ -481,6 +509,7 @@ function Invoke-ProductionRelease {
             'eng/license/ProductionLicenseTrust.targets',
             'eng/ota/SuperPan.OtaPublisher.cer',
             'eng/ota/production-source-overrides.sha256',
+            'scripts/ProductIdentity.ps1',
             'scripts/Test-OtaUploadBundle.ps1',
             'scripts/verify_managed_browser_helper_package.ps1',
             'tools/managed_browser_helper')
@@ -544,19 +573,19 @@ function Invoke-ProductionRelease {
 
     $zipPath = $null
     $reportPath = $null
-        $sourceCommitLines = @(& git -C $repoRoot rev-parse --verify 'HEAD^{commit}')
-        if ($LASTEXITCODE -ne 0 -or $sourceCommitLines.Count -ne 1 -or $sourceCommitLines[0] -cnotmatch '^[0-9a-f]{40}$') {
-            throw 'Unable to resolve exactly one production source commit SHA.'
-        }
-        $sourceCommit = [string]$sourceCommitLines[0]
+        $sourceCommit = [string]$productionSourceCommit
         $sourceSnapshot = Join-Path $buildRoot 'source'
         Copy-ProductionSourceSnapshot $repoRoot $sourceSnapshot $sourceCommit
+        Initialize-ProductIdentity `
+            (Join-Path $sourceSnapshot 'scripts\ProductIdentity.ps1') `
+            (Join-Path $sourceSnapshot 'eng\ProductIdentity.props') `
+            $sourceSnapshot
         [IO.File]::WriteAllText((Join-Path $logDirectory 'source-commit.txt'), "$sourceCommit`n", $utf8NoBomProduction)
         $appProject = Join-Path $sourceSnapshot 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'
         $legacyLauncherProject = Join-Path $sourceSnapshot 'src\BaiduBatchTransfer.LegacyLauncher\BaiduBatchTransfer.LegacyLauncher.csproj'
         $legacyLauncherPublishDirectory = Join-Path $buildRoot 'legacy-launcher-publish'
         [IO.Directory]::CreateDirectory($legacyLauncherPublishDirectory) | Out-Null
-        $productionIconPath = Join-Path $sourceSnapshot $productIconRelativePath
+        $productionIconPath = $productIconPath
         $toolManifestPath = Join-Path $sourceSnapshot '.config\dotnet-tools.json'
         $helperVerificationScript = Join-Path $sourceSnapshot 'scripts\verify_managed_browser_helper_package.ps1'
         $helperManifestSource = Join-Path $sourceSnapshot 'tools\managed_browser_helper\helper-manifest.json'
@@ -809,9 +838,29 @@ function Invoke-ProductionRelease {
 }
 
 if ($PSCmdlet.ParameterSetName -eq 'Production') {
+    $productionSourceCommitLines = @(& git -C $repoRoot rev-parse --verify 'HEAD^{commit}')
+    if ($LASTEXITCODE -ne 0 -or $productionSourceCommitLines.Count -ne 1 -or
+        $productionSourceCommitLines[0] -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'Unable to resolve exactly one production source commit SHA.'
+    }
+    $productionSourceCommit = [string]$productionSourceCommitLines[0]
+    & git -C $repoRoot diff --quiet --exit-code $productionSourceCommit -- `
+        'scripts/ProductIdentity.ps1' 'eng/ProductIdentity.props'
+    $identityDiffExitCode = $LASTEXITCODE
+    if ($identityDiffExitCode -eq 1) {
+        throw 'Production product identity inputs differ from source commit.'
+    }
+    if ($identityDiffExitCode -ne 0) {
+        throw 'Unable to verify production product identity inputs against source commit.'
+    }
     Invoke-ProductionRelease
     return
 }
+
+Initialize-ProductIdentity `
+    (Join-Path $PSScriptRoot 'ProductIdentity.ps1') `
+    (Join-Path $repoRoot 'eng\ProductIdentity.props') `
+    $repoRoot
 
 $acceptanceFeed = Resolve-AbsolutePath $AcceptanceFeedPath 'AcceptanceFeedPath'
 Assert-LocalDrivePath $acceptanceFeed 'AcceptanceFeedPath'

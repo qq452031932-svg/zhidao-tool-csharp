@@ -202,6 +202,58 @@ public sealed class OtaProductionReleaseScriptTests
     }
 
     [Fact]
+    public async Task ProductionRejectsDirtyIdentityInputsBeforeCertificateOrToolchainUse()
+    {
+        var root = Path.Combine(
+            FindRepositoryRoot(), ".artifacts", $"ota-production-identity-test-{Guid.NewGuid():N}");
+        var scripts = Path.Combine(root, "scripts");
+        var eng = Path.Combine(root, "eng");
+        Directory.CreateDirectory(scripts);
+        Directory.CreateDirectory(eng);
+        try
+        {
+            File.Copy(BuildScriptPath(), Path.Combine(scripts, "build_ota_release.ps1"));
+            File.Copy(
+                Path.Combine(FindRepositoryRoot(), "scripts", "ProductIdentity.ps1"),
+                Path.Combine(scripts, "ProductIdentity.ps1"));
+            File.Copy(
+                Path.Combine(FindRepositoryRoot(), "eng", "ProductIdentity.props"),
+                Path.Combine(eng, "ProductIdentity.props"));
+            RunGit(root, "init");
+            RunGit(root, "add", "scripts/build_ota_release.ps1", "scripts/ProductIdentity.ps1", "eng/ProductIdentity.props");
+            RunGit(root, "-c", "user.name=OTA Test", "-c", "user.email=ota@example.invalid", "commit", "-m", "fixture");
+
+            await File.AppendAllTextAsync(Path.Combine(scripts, "ProductIdentity.ps1"), "\n# dirty helper\n");
+            var propsPath = Path.Combine(eng, "ProductIdentity.props");
+            var props = await File.ReadAllTextAsync(propsPath);
+            await File.WriteAllTextAsync(
+                propsPath,
+                props.Replace("<ProductDisplayName>知道综合工具</ProductDisplayName>",
+                    "<ProductDisplayName>Dirty Display</ProductDisplayName>", StringComparison.Ordinal));
+            var output = Path.Combine(root, ".artifacts", "ota-production-dirty-identity", "release");
+
+            var result = await RunPowerShellAsync(
+                Path.Combine(scripts, "build_ota_release.ps1"),
+                "-Production", "-Version", "1.2.3", "-OutputDirectory", output,
+                "-ProductionFeedUrl", "https://ota.example.test/releases/win-x64/stable/",
+                "-SigningCertificateThumbprint", new string('A', 40),
+                "-LicenseSigningKeyId", "key-1", "-LicenseSigningPublicKey", "public-key",
+                "-LicenseCurrentSpkiPin", new string('a', 64),
+                "-LicenseNextSpkiPin", new string('b', 64),
+                "-LicenseServiceUrl", "https://license.example.test/license-api/");
+
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("product identity inputs differ from source commit", result.Output, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("signing certificate", result.Output, StringComparison.OrdinalIgnoreCase);
+            Assert.False(Directory.Exists(output));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) DeleteDirectoryTree(root);
+        }
+    }
+
+    [Fact]
     public void CanonicalManifestFixtureHasDeterministicGoldenBytesAndRawRsaSignature()
     {
         var files = new Dictionary<string, byte[]>(StringComparer.Ordinal)
@@ -454,6 +506,35 @@ public sealed class OtaProductionReleaseScriptTests
 
     private static string BuildScriptPath() => Path.Combine(FindRepositoryRoot(), "scripts", "build_ota_release.ps1");
     private static string ValidatorScriptPath() => Path.Combine(FindRepositoryRoot(), "scripts", "Test-OtaUploadBundle.ps1");
+
+    private static void RunGit(string workingDirectory, params string[] arguments)
+    {
+        var info = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        foreach (var argument in arguments) info.ArgumentList.Add(argument);
+        using var process = Process.Start(info)!;
+        var stdout = process.StandardOutput.ReadToEnd();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        Assert.True(process.ExitCode == 0, string.Join(Environment.NewLine, stdout, stderr));
+    }
+
+    private static void DeleteDirectoryTree(string root)
+    {
+        foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            File.SetAttributes(path, FileAttributes.Normal);
+        foreach (var path in Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories))
+            File.SetAttributes(path, FileAttributes.Normal);
+        File.SetAttributes(root, FileAttributes.Normal);
+        Directory.Delete(root, recursive: true);
+    }
 
     private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")
     {
