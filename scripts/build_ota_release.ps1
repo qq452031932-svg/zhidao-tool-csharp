@@ -21,6 +21,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'ProductIdentity.ps1')
+$productIdentity = Get-ProductIdentity
+$productMainExecutableName = [string]$productIdentity.ProductMainExecutableName
+$productMainDllName = [string]$productIdentity.ProductMainDllName
+$productDisplayName = [string]$productIdentity.ProductDisplayName
+$legacyLauncherExecutableName = [string]$productIdentity.ProductLegacyExecutableName
+
 $acceptancePackageId = 'SuperPan.BaiduBatchTransfer.OtaAcceptance'
 $acceptanceChannel = 'win-x64-ota-acceptance'
 $productionPackageId = 'SuperPan.BaiduBatchTransfer'
@@ -28,6 +35,10 @@ $productionChannel = 'win-x64-stable'
 $requiredVpkVersion = '1.2.0'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts'))
+$productAppRelativeDirectory = 'src\BaiduBatchTransfer.App'
+$productIconRelativePath = Join-Path $productAppRelativeDirectory (
+    'Assets\Branding\' + [IO.Path]::GetFileNameWithoutExtension($productMainExecutableName) + '.ico')
+$productIconPath = [IO.Path]::GetFullPath((Join-Path $repoRoot $productIconRelativePath))
 
 # Acceptance remains an explicitly unsigned, local-only gate. Production is a separate
 # parameter set and has no unsigned bypass.
@@ -149,6 +160,74 @@ function Get-LowerSha1([string]$Path) {
     try { $hash = $algorithm.ComputeHash($stream) }
     finally { $algorithm.Dispose(); $stream.Dispose() }
     return ([BitConverter]::ToString($hash).Replace('-', '')).ToLowerInvariant()
+}
+
+function Assert-PublishedApplicationLayout([string]$Directory, [string]$Description) {
+    $mainStem = [IO.Path]::GetFileNameWithoutExtension($productMainExecutableName)
+    foreach ($name in @(
+            $productMainExecutableName,
+            $productMainDllName,
+            "$mainStem.deps.json",
+            "$mainStem.runtimeconfig.json")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Directory $name) -PathType Leaf)) {
+            throw "$Description is missing required application file: $name"
+        }
+    }
+}
+
+function Install-VerifiedLegacyLauncher(
+    [string]$LauncherPublishDirectory,
+    [string]$MainPublishDirectory,
+    [string]$ProbeParent) {
+    $launcherSource = Join-Path $LauncherPublishDirectory $legacyLauncherExecutableName
+    if (-not (Test-Path -LiteralPath $launcherSource -PathType Leaf)) {
+        throw 'Published legacy launcher executable is missing.'
+    }
+
+    $legacyLauncherProbeDirectory = Join-Path $ProbeParent (
+        '.legacy-launcher-probe-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($legacyLauncherProbeDirectory) | Out-Null
+    try {
+        $probeLauncher = Join-Path $legacyLauncherProbeDirectory $legacyLauncherExecutableName
+        [IO.File]::Copy($launcherSource, $probeLauncher, $false)
+        if (Test-Path -LiteralPath (Join-Path $legacyLauncherProbeDirectory $productMainExecutableName)) {
+            throw 'Legacy launcher probe directory unexpectedly contains the main application.'
+        }
+
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $probeLauncher
+        $startInfo.WorkingDirectory = $legacyLauncherProbeDirectory
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.EnvironmentVariables['BAIDU_BATCH_TRANSFER_LEGACY_LAUNCHER_SUPPRESS_DIALOG'] = '1'
+        $process = [Diagnostics.Process]::Start($startInfo)
+        try {
+            if (-not $process.WaitForExit(15000)) {
+                try { $process.Kill() } catch {}
+                throw 'Legacy launcher single-file probe timed out.'
+            }
+            $legacyLauncherExitCode = $process.ExitCode
+        }
+        finally { $process.Dispose() }
+        if ($legacyLauncherExitCode -ne 2) {
+            throw "Legacy launcher single-file probe returned unexpected exit code $legacyLauncherExitCode."
+        }
+
+        $probeEntries = @([IO.Directory]::EnumerateFileSystemEntries($legacyLauncherProbeDirectory))
+        if ($probeEntries.Count -ne 1 -or
+            [IO.Path]::GetFileName($probeEntries[0]) -cne $legacyLauncherExecutableName) {
+            throw 'Legacy launcher single-file probe created an unexpected dependency or side-effect file.'
+        }
+        [IO.File]::Copy(
+            $probeLauncher,
+            (Join-Path $MainPublishDirectory $legacyLauncherExecutableName),
+            $false)
+    }
+    finally {
+        if (Test-Path -LiteralPath $legacyLauncherProbeDirectory) {
+            Remove-Item -LiteralPath $legacyLauncherProbeDirectory -Recurse -Force
+        }
+    }
 }
 
 function Test-SafeNupkgFileName([string]$FileName) {
@@ -358,6 +437,7 @@ function Invoke-ProductionRelease {
             'global.json',
             'NuGet.Config',
             '.config/dotnet-tools.json',
+            'eng/ProductIdentity.props',
             'eng/license/ProductionLicenseTrust.targets',
             'eng/ota/SuperPan.OtaPublisher.cer',
             'eng/ota/production-source-overrides.sha256',
@@ -433,13 +513,17 @@ function Invoke-ProductionRelease {
         Copy-ProductionSourceSnapshot $repoRoot $sourceSnapshot $sourceCommit
         [IO.File]::WriteAllText((Join-Path $logDirectory 'source-commit.txt'), "$sourceCommit`n", $utf8NoBomProduction)
         $appProject = Join-Path $sourceSnapshot 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'
+        $legacyLauncherProject = Join-Path $sourceSnapshot 'src\BaiduBatchTransfer.LegacyLauncher\BaiduBatchTransfer.LegacyLauncher.csproj'
+        $legacyLauncherPublishDirectory = Join-Path $buildRoot 'legacy-launcher-publish'
+        [IO.Directory]::CreateDirectory($legacyLauncherPublishDirectory) | Out-Null
+        $productionIconPath = Join-Path $sourceSnapshot $productIconRelativePath
         $toolManifestPath = Join-Path $sourceSnapshot '.config\dotnet-tools.json'
         $helperVerificationScript = Join-Path $sourceSnapshot 'scripts\verify_managed_browser_helper_package.ps1'
         $helperManifestSource = Join-Path $sourceSnapshot 'tools\managed_browser_helper\helper-manifest.json'
         $helperSourceDirectory = Join-Path $sourceSnapshot 'tools\managed_browser_helper'
         $bundleValidator = Join-Path $sourceSnapshot 'scripts\Test-OtaUploadBundle.ps1'
         $publisherCertificate = Join-Path $sourceSnapshot 'eng\ota\SuperPan.OtaPublisher.cer'
-        foreach ($required in @($appProject,$toolManifestPath,$helperVerificationScript,$helperManifestSource,$bundleValidator,$publisherCertificate)) {
+        foreach ($required in @($appProject,$legacyLauncherProject,$productionIconPath,$toolManifestPath,$helperVerificationScript,$helperManifestSource,$bundleValidator,$publisherCertificate)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required production input is missing: $required" }
         }
         $toolManifest = [IO.File]::ReadAllText($toolManifestPath) | ConvertFrom-Json
@@ -497,14 +581,19 @@ function Invoke-ProductionRelease {
             "-p:VersionPrefix=$Version","-p:UpdateFeedUrl=$normalizedFeedUrl",'-p:OtaAcceptanceBuild=false','-p:OtaAcceptanceFeedPath=',
             "-p:UpdateChannel=$productionChannel","-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory") + $licenseProperties
         Invoke-ProductionCommand 'dotnet-restore-locked' 'dotnet' (@('restore',$appProject,'--locked-mode') + $restoreProperties) $sourceSnapshot
+        Invoke-ProductionCommand 'dotnet-restore-legacy-launcher-locked' 'dotnet' @(
+            'restore',$legacyLauncherProject,'--locked-mode','-r','win-x64','-p:RuntimeIdentifier=win-x64','-p:SelfContained=true') $sourceSnapshot
         Invoke-ProductionCommand 'dotnet-publish' 'dotnet' (@(
             'publish',$appProject,'-c','Release','-r','win-x64','--self-contained','true','--no-restore','-o',$publishDirectory,
             "-p:VersionPrefix=$Version",'-p:RuntimeIdentifier=win-x64','-p:SelfContained=true',"-p:UpdateFeedUrl=$normalizedFeedUrl",
             '-p:OtaAcceptanceBuild=false','-p:OtaAcceptanceFeedPath=',"-p:UpdateChannel=$productionChannel",
             "-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory") + $licenseProperties) $sourceSnapshot
-        if (-not (Test-Path -LiteralPath (Join-Path $publishDirectory 'BaiduBatchTransfer.App.exe') -PathType Leaf)) { throw 'Published production main executable is missing.' }
-        $publishedAssemblyPath = Join-Path $publishDirectory 'BaiduBatchTransfer.App.dll'
-        if (-not (Test-Path -LiteralPath $publishedAssemblyPath -PathType Leaf)) { throw 'Published production metadata assembly is missing.' }
+        Invoke-ProductionCommand 'dotnet-publish-legacy-launcher' 'dotnet' @(
+            'publish',$legacyLauncherProject,'-c','Release','-r','win-x64','--self-contained','true','--no-restore',
+            '-o',$legacyLauncherPublishDirectory,"-p:VersionPrefix=$Version",'-p:RuntimeIdentifier=win-x64','-p:SelfContained=true') $sourceSnapshot
+        Assert-PublishedApplicationLayout $publishDirectory 'Published production application'
+        Install-VerifiedLegacyLauncher $legacyLauncherPublishDirectory $publishDirectory $buildRoot
+        $publishedAssemblyPath = Join-Path $publishDirectory $productMainDllName
         $publishedAssembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($publishedAssemblyPath))
         $publishedMetadata = @{}
         foreach ($attribute in $publishedAssembly.GetCustomAttributes([Reflection.AssemblyMetadataAttribute], $false)) {
@@ -523,9 +612,20 @@ function Invoke-ProductionRelease {
 
         $signParams = "/sha1 $thumbprint /fd SHA256"
         if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) { $signParams += " /tr $TimestampUrl /td SHA256" }
-        Invoke-ProductionCommand 'vpk-pack' 'dotnet' @('tool','run','vpk','--','pack','--packId',$productionPackageId,
-            '--packVersion',$Version,'--packDir',$publishDirectory,'--mainExe','BaiduBatchTransfer.App.exe','--channel',$productionChannel,
-            '--runtime','win-x64','--outputDir',$assetDirectory,'--releaseNotes',$notesPath,'--signParams',$signParams) $sourceSnapshot
+        $productionVpkArguments = @(
+            'tool', 'run', 'vpk', '--', 'pack',
+            '--packId', $productionPackageId,
+            '--packVersion', $Version,
+            '--packDir', $publishDirectory,
+            '--mainExe', $productMainExecutableName,
+            '--packTitle', $productDisplayName,
+            '--icon', $productionIconPath,
+            '--channel', $productionChannel,
+            '--runtime', 'win-x64',
+            '--outputDir', $assetDirectory,
+            '--releaseNotes', $notesPath,
+            '--signParams', $signParams)
+        Invoke-ProductionCommand 'vpk-pack' 'dotnet' $productionVpkArguments $sourceSnapshot
 
         # Velopack includes the channel in generated filenames. The signed-feed contract
         # intentionally exposes stable canonical names so client and server validators do
@@ -826,11 +926,12 @@ if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
 }
 
 $appProject = Join-Path $repoRoot 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'
+$legacyLauncherProject = Join-Path $repoRoot 'src\BaiduBatchTransfer.LegacyLauncher\BaiduBatchTransfer.LegacyLauncher.csproj'
 $toolManifestPath = Join-Path $repoRoot '.config\dotnet-tools.json'
 $helperVerificationScript = Join-Path $repoRoot 'scripts\verify_managed_browser_helper_package.ps1'
 $helperManifestSource = Join-Path $repoRoot 'tools\managed_browser_helper\helper-manifest.json'
 $helperSourceDirectory = Join-Path $repoRoot 'tools\managed_browser_helper'
-foreach ($requiredInput in @($appProject, $toolManifestPath, $helperVerificationScript, $helperManifestSource)) {
+foreach ($requiredInput in @($appProject, $legacyLauncherProject, $productIconPath, $toolManifestPath, $helperVerificationScript, $helperManifestSource)) {
     if (-not (Test-Path -LiteralPath $requiredInput -PathType Leaf)) {
         throw "Required release input is missing: $requiredInput"
     }
@@ -844,8 +945,10 @@ if ([string]$toolManifest.tools.vpk.version -cne $requiredVpkVersion) {
 [IO.Directory]::CreateDirectory($outputPath) | Out-Null
 $workingDirectory = Join-Path $outputPath '.build'
 $publishDirectory = Join-Path $workingDirectory 'publish'
+$legacyLauncherPublishDirectory = Join-Path $workingDirectory 'legacy-launcher-publish'
 $logDirectory = Join-Path $workingDirectory 'logs'
 [IO.Directory]::CreateDirectory($publishDirectory) | Out-Null
+[IO.Directory]::CreateDirectory($legacyLauncherPublishDirectory) | Out-Null
 [IO.Directory]::CreateDirectory($logDirectory) | Out-Null
 $commandLogPath = Join-Path $logDirectory 'commands.jsonl'
 $utf8NoBom = New-Object Text.UTF8Encoding($false)
@@ -971,7 +1074,7 @@ if ($vpkDescriptionMarkers.Count -ne 1 -or $requiredVpkTokenMatches.Count -ne 1)
 $vpkHelpArguments = @('tool', 'run', 'vpk', '--', 'pack', '--help')
 $vpkHelp = Invoke-RecordedCommand 'vpk-pack-help' 'dotnet' $vpkHelpArguments
 foreach ($requiredOption in @('--packId', '--packVersion', '--packDir', '--mainExe',
-        '--channel', '--runtime', '--outputDir', '--releaseNotes')) {
+        '--packTitle', '--icon', '--channel', '--runtime', '--outputDir', '--releaseNotes')) {
     if ($vpkHelp.Stdout.IndexOf($requiredOption, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
         $vpkHelp.Stderr.IndexOf($requiredOption, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
         throw "Locked vpk 1.2.0 help does not advertise required option $requiredOption."
@@ -992,6 +1095,15 @@ $restoreArguments = @(
 )
 [void](Invoke-RecordedCommand 'dotnet-restore' 'dotnet' $restoreArguments)
 
+$legacyLauncherRestoreArguments = @(
+    'restore', $legacyLauncherProject,
+    '--locked-mode',
+    '-r', 'win-x64',
+    '-p:RuntimeIdentifier=win-x64',
+    '-p:SelfContained=true'
+)
+[void](Invoke-RecordedCommand 'dotnet-restore-legacy-launcher' 'dotnet' $legacyLauncherRestoreArguments)
+
 $publishArguments = @(
     'publish', $appProject,
     '-c', 'Release',
@@ -1009,10 +1121,22 @@ $publishArguments = @(
 )
 [void](Invoke-RecordedCommand 'dotnet-publish' 'dotnet' $publishArguments)
 
-$publishedAssembly = Join-Path $publishDirectory 'BaiduBatchTransfer.App.dll'
-if (-not (Test-Path -LiteralPath $publishedAssembly -PathType Leaf)) {
-    throw 'Published application assembly is missing.'
-}
+$legacyLauncherPublishArguments = @(
+    'publish', $legacyLauncherProject,
+    '-c', 'Release',
+    '-r', 'win-x64',
+    '--self-contained', 'true',
+    '--no-restore',
+    '-o', $legacyLauncherPublishDirectory,
+    "-p:VersionPrefix=$Version",
+    '-p:RuntimeIdentifier=win-x64',
+    '-p:SelfContained=true'
+)
+[void](Invoke-RecordedCommand 'dotnet-publish-legacy-launcher' 'dotnet' $legacyLauncherPublishArguments)
+
+Assert-PublishedApplicationLayout $publishDirectory 'Published acceptance application'
+Install-VerifiedLegacyLauncher $legacyLauncherPublishDirectory $publishDirectory $workingDirectory
+$publishedAssembly = Join-Path $publishDirectory $productMainDllName
 $metadataProjectDirectory = Join-Path $workingDirectory 'metadata-verifier'
 [IO.Directory]::CreateDirectory($metadataProjectDirectory) | Out-Null
 $metadataProject = Join-Path $metadataProjectDirectory 'MetadataVerifier.csproj'
@@ -1095,7 +1219,9 @@ $vpkArguments = @(
     '--packId', $acceptancePackageId,
     '--packVersion', $Version,
     '--packDir', $publishDirectory,
-    '--mainExe', 'BaiduBatchTransfer.App.exe',
+    '--mainExe', $productMainExecutableName,
+    '--packTitle', $productDisplayName,
+    '--icon', $productIconPath,
     '--channel', $acceptanceChannel,
     '--runtime', 'win-x64',
     '--outputDir', $outputPath,

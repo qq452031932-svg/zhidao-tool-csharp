@@ -129,7 +129,7 @@ public sealed class OtaProductionReleaseScriptTests
 
         Assert.Contains("$productionPackageId = 'SuperPan.BaiduBatchTransfer'", script, StringComparison.Ordinal);
         Assert.Contains("$productionChannel = 'win-x64-stable'", script, StringComparison.Ordinal);
-        Assert.Contains("'--signParams',$signParams", script, StringComparison.Ordinal);
+        Assert.Contains("'--signParams', $signParams", script, StringComparison.Ordinal);
         Assert.Contains("$timestampUri.AbsoluteUri -cne 'http://timestamp.digicert.com/'", script, StringComparison.Ordinal);
         Assert.Contains("approved DigiCert RFC 3161 endpoint", script, StringComparison.Ordinal);
         Assert.Contains("RSASignaturePadding]::Pkcs1", script, StringComparison.Ordinal);
@@ -183,6 +183,22 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("Publisher certificate SPKI pin does not match", validator, StringComparison.Ordinal);
         Assert.Contains("Upload ZIP contains a directory or nested entry", validator, StringComparison.Ordinal);
         Assert.Contains("duplicate or case-colliding file", validator, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ProductionVpkArgumentsUseCanonicalBrandingAndKeepStableDistributionIdentity()
+    {
+        var script = File.ReadAllText(BuildScriptPath());
+
+        Assert.Contains("$productionVpkArguments = @(", script, StringComparison.Ordinal);
+        Assert.Contains("'--packId', $productionPackageId", script, StringComparison.Ordinal);
+        Assert.Contains("'--mainExe', $productMainExecutableName", script, StringComparison.Ordinal);
+        Assert.Contains("'--packTitle', $productDisplayName", script, StringComparison.Ordinal);
+        Assert.Contains("'--icon', $productionIconPath", script, StringComparison.Ordinal);
+        Assert.Contains("$productionPackageId = 'SuperPan.BaiduBatchTransfer'", script, StringComparison.Ordinal);
+        Assert.Contains("$productionChannel = 'win-x64-stable'", script, StringComparison.Ordinal);
+        Assert.Contains("$productionPackageId-Setup.exe", script, StringComparison.Ordinal);
+        Assert.Contains("$productionPackageId-Portable.zip", script, StringComparison.Ordinal);
     }
 
     [Fact]

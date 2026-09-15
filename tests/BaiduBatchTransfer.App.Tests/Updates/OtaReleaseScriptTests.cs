@@ -454,7 +454,7 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("'-p:UpdateFeedUrl='", script, StringComparison.Ordinal);
         Assert.Contains("'-p:OtaAcceptanceBuild=true'", script, StringComparison.Ordinal);
         Assert.Contains("'-p:UpdateChannel=win-x64-ota-acceptance'", script, StringComparison.Ordinal);
-        Assert.Contains("'--packId',$productionPackageId", script, StringComparison.Ordinal);
+        Assert.Contains("'--packId', $productionPackageId", script, StringComparison.Ordinal);
         Assert.Contains("verify_managed_browser_helper_package.ps1", script, StringComparison.Ordinal);
         Assert.Contains("$vpkArguments = @(", script, StringComparison.Ordinal);
         Assert.Contains("'tool', 'run', 'vpk', 'pack'", script, StringComparison.Ordinal);
@@ -462,7 +462,37 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("'--channel', $acceptanceChannel", script, StringComparison.Ordinal);
         Assert.Contains("'--runtime', 'win-x64'", script, StringComparison.Ordinal);
         Assert.Contains("'--releaseNotes', $effectiveReleaseNotesPath", script, StringComparison.Ordinal);
-        Assert.Contains("'--signParams',$signParams", script, StringComparison.Ordinal);
+        Assert.Contains("'--signParams', $signParams", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ScriptPackagesCanonicalApplicationIdentityAndVerifiedLegacyLauncher()
+    {
+        var script = ReadScript();
+
+        Assert.Equal(1, CountOccurrences(script, ". (Join-Path $PSScriptRoot 'ProductIdentity.ps1')"));
+        Assert.Equal(1, CountOccurrences(script, "Get-ProductIdentity"));
+        foreach (var property in new[]
+                 {
+                     "ProductMainExecutableName", "ProductMainDllName", "ProductDisplayName",
+                     "ProductLegacyExecutableName",
+                 })
+            Assert.Contains("$productIdentity." + property, script, StringComparison.Ordinal);
+        Assert.Contains("$productIconPath", script, StringComparison.Ordinal);
+        Assert.Contains("$legacyLauncherProject", script, StringComparison.Ordinal);
+        Assert.Contains("$legacyLauncherPublishDirectory", script, StringComparison.Ordinal);
+        Assert.Contains("$legacyLauncherProbeDirectory", script, StringComparison.Ordinal);
+        Assert.Contains("BAIDU_BATCH_TRANSFER_LEGACY_LAUNCHER_SUPPRESS_DIALOG", script, StringComparison.Ordinal);
+        Assert.Contains("$legacyLauncherExitCode -ne 2", script, StringComparison.Ordinal);
+        Assert.Contains("$productMainExecutableName", script, StringComparison.Ordinal);
+        Assert.Contains("$productMainDllName", script, StringComparison.Ordinal);
+        Assert.Contains("$productDisplayName", script, StringComparison.Ordinal);
+        Assert.Contains("$legacyLauncherExecutableName", script, StringComparison.Ordinal);
+        Assert.Contains("'--mainExe', $productMainExecutableName", script, StringComparison.Ordinal);
+        Assert.Contains("'--packTitle', $productDisplayName", script, StringComparison.Ordinal);
+        Assert.Contains("'--icon', $productIconPath", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("知道综合工具", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("'--mainExe', 'BaiduBatchTransfer.App.exe'", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -535,6 +565,8 @@ public sealed class OtaReleaseScriptTests
                 "dotnet|tool run vpk -- --help",
                 "dotnet|tool run vpk -- pack --help",
                 "dotnet|restore",
+                "dotnet|restore",
+                "dotnet|publish",
                 "dotnet|publish",
                 "dotnet|run --project",
                 "powershell|-NoProfile -ExecutionPolicy Bypass -File",
@@ -551,6 +583,9 @@ public sealed class OtaReleaseScriptTests
         Assert.DoesNotContain("-p:PackageId=", combinedCommands, StringComparison.Ordinal);
         Assert.Contains("--packId" + UnitSeparator + "SuperPan.BaiduBatchTransfer.OtaAcceptance", combinedCommands, StringComparison.Ordinal);
         Assert.Contains("--channel" + UnitSeparator + "win-x64-ota-acceptance", combinedCommands, StringComparison.Ordinal);
+        Assert.Contains("--mainExe" + UnitSeparator + "知道综合工具.exe", combinedCommands, StringComparison.Ordinal);
+        Assert.Contains("--packTitle" + UnitSeparator + "知道综合工具", combinedCommands, StringComparison.Ordinal);
+        Assert.Contains("--icon" + UnitSeparator, combinedCommands, StringComparison.Ordinal);
 
         var manifestPath = Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256");
         Assert.True(File.Exists(manifestPath));
@@ -882,6 +917,9 @@ public sealed class OtaReleaseScriptTests
     }
 
     private const char UnitSeparator = (char)31;
+
+    private static int CountOccurrences(string text, string value) =>
+        (text.Length - text.Replace(value, string.Empty, StringComparison.Ordinal).Length) / value.Length;
 
     private static string ParseCommandPrefix(string line)
     {
@@ -1230,15 +1268,30 @@ if ($joined -ceq 'tool run vpk -- --help') {
     exit 0
 }
 if ($joined -ceq 'tool run vpk -- pack --help') {
-    Write-Output '--packId --packVersion --packDir --mainExe --channel --runtime --outputDir --releaseNotes'
+    Write-Output '--packId --packVersion --packDir --mainExe --packTitle --icon --channel --runtime --outputDir --releaseNotes'
     exit 0
 }
 if ($ToolArgs[0] -ceq 'restore') { Write-Output 'fake locked restore'; exit 0 }
 if ($ToolArgs[0] -ceq 'publish') {
     $publishDirectory = Get-ArgumentValue '-o'
     [IO.Directory]::CreateDirectory($publishDirectory) | Out-Null
-    [IO.File]::WriteAllBytes((Join-Path $publishDirectory 'BaiduBatchTransfer.App.dll'), [byte[]](1, 2, 3))
-    [IO.Directory]::CreateDirectory((Join-Path $publishDirectory 'managed-browser-helper')) | Out-Null
+    if ($ToolArgs[1] -like '*BaiduBatchTransfer.LegacyLauncher*') {
+        $launcherPath = Join-Path $publishDirectory 'BaiduBatchTransfer.App.exe'
+        Add-Type -TypeDefinition 'public static class FakeLauncher { public static int Main() { return 2; } }' -Language CSharp -OutputAssembly $launcherPath -OutputType WindowsApplication
+    }
+    else {
+        . (Join-Path (Get-Location).Path 'scripts\ProductIdentity.ps1')
+        $fakeIdentity = Get-ProductIdentity
+        $fakeMainStem = [IO.Path]::GetFileNameWithoutExtension([string]$fakeIdentity.ProductMainExecutableName)
+        foreach ($name in @(
+                [string]$fakeIdentity.ProductMainExecutableName,
+                [string]$fakeIdentity.ProductMainDllName,
+                "$fakeMainStem.deps.json",
+                "$fakeMainStem.runtimeconfig.json")) {
+            [IO.File]::WriteAllBytes((Join-Path $publishDirectory $name), [byte[]](1, 2, 3))
+        }
+        [IO.Directory]::CreateDirectory((Join-Path $publishDirectory 'managed-browser-helper')) | Out-Null
+    }
     Write-Output 'fake publish'
     exit 0
 }
