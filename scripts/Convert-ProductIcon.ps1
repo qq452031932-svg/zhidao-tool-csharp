@@ -305,9 +305,26 @@ function Read-AndValidateIcon {
 
 $canonicalFullPath = [System.IO.Path]::GetFullPath($CanonicalPngPath)
 $iconFullPath = [System.IO.Path]::GetFullPath($IconPath)
+$sourceFullPath = if ($SourceJpegPath) { [System.IO.Path]::GetFullPath($SourceJpegPath) } else { $null }
+$pathArguments = @(
+    [pscustomobject]@{ Name = 'CanonicalPngPath'; Path = $canonicalFullPath },
+    [pscustomobject]@{ Name = 'IconPath'; Path = $iconFullPath }
+)
+if ($sourceFullPath) {
+    $pathArguments += [pscustomobject]@{ Name = 'SourceJpegPath'; Path = $sourceFullPath }
+}
+for ($leftIndex = 0; $leftIndex -lt $pathArguments.Count; $leftIndex++) {
+    for ($rightIndex = $leftIndex + 1; $rightIndex -lt $pathArguments.Count; $rightIndex++) {
+        if ([string]::Equals(
+                $pathArguments[$leftIndex].Path,
+                $pathArguments[$rightIndex].Path,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "SourceJpegPath, CanonicalPngPath, and IconPath must be pairwise distinct; $($pathArguments[$leftIndex].Name) and $($pathArguments[$rightIndex].Name) resolve to the same path."
+        }
+    }
+}
 
 if ($SourceJpegPath) {
-    $sourceFullPath = [System.IO.Path]::GetFullPath($SourceJpegPath)
     if (-not (Test-Path -LiteralPath $sourceFullPath -PathType Leaf)) {
         throw "Source JPEG does not exist: $sourceFullPath"
     }
@@ -322,8 +339,7 @@ if ($SourceJpegPath) {
     $sourceDimensions = "$($sourceBitmap.PixelWidth)x$($sourceBitmap.PixelHeight)"
 }
 else {
-    $actualSourceHash = $ExpectedSourceSha256
-    $sourceDimensions = '640x640'
+    $sourceDimensions = 'not-verified'
 }
 
 if (-not $VerifyOnly) {
@@ -362,7 +378,14 @@ if ($SourceJpegPath -and (Get-PixelSha256 -Bitmap $sourceBitmap) -ne (Get-PixelS
     throw 'Canonical PNG pixels do not exactly match the decoded user JPEG.'
 }
 
-Write-Output "Source JPEG SHA256: $actualSourceHash"
+Write-Output "ExpectedSourceJpegSha256=$ExpectedSourceSha256"
+if ($SourceJpegPath) {
+    Write-Output "SourceJpegSha256=$actualSourceHash"
+    Write-Output 'SourceVerification=verified'
+}
+else {
+    Write-Output 'SourceVerification=not-performed'
+}
 Write-Output "Canonical PNG SHA256: $canonicalHash"
 Write-Output "ICO SHA256: $iconHash"
 Write-Output "SourceDimensions=$sourceDimensions"
