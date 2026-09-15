@@ -438,6 +438,9 @@
           "xunit.extensibility.core": "[2.9.3]"
         }
       },
+      "BaiduBatchTransfer.App": {
+        "type": "Project"
+      },
       "baidubatchtransfer.application": {
         "type": "Project",
         "dependencies": {
