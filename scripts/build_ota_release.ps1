@@ -496,6 +496,46 @@ function Invoke-ProductionRelease {
         }
     }
 
+    function Get-TrackedGitPaths([string]$Source, [string]$Commit, [string[]]$Pathspecs) {
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = 'git'
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        foreach ($argument in @('-C',$Source,'ls-tree','-r')) {
+            $startInfo.ArgumentList.Add($argument)
+        }
+        $startInfo.ArgumentList.Add('-z')
+        foreach ($argument in @('--name-only',$Commit,'--')) { $startInfo.ArgumentList.Add($argument) }
+        foreach ($pathspec in $Pathspecs) { $startInfo.ArgumentList.Add($pathspec) }
+
+        $process = [Diagnostics.Process]::Start($startInfo)
+        if ($null -eq $process) { throw 'Unable to start git while enumerating production source.' }
+        $output = [IO.MemoryStream]::new()
+        try {
+            $errorTask = $process.StandardError.ReadToEndAsync()
+            $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($output)
+            $copyTask.GetAwaiter().GetResult()
+            $standardError = $errorTask.GetAwaiter().GetResult()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) {
+                throw "Unable to enumerate the commit-pinned production source allowlist ($standardError)"
+            }
+            try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($output.ToArray()) }
+            catch { throw 'Git returned a production source path list that is not strict UTF-8.' }
+        }
+        finally {
+            $output.Dispose()
+            $process.Dispose()
+        }
+        if ([string]::IsNullOrEmpty($text) -or $text[$text.Length - 1] -ne [char]0) {
+            throw 'Git returned a non-canonical production source path list.'
+        }
+        $payload = $text.Substring(0, $text.Length - 1)
+        if ($payload.Length -eq 0) { return @() }
+        return @($payload.Split([char]0, [StringSplitOptions]::None))
+    }
+
     function Copy-ProductionSourceSnapshot([string]$Source, [string]$Destination, [string]$Commit) {
         $sourcePathspecs = @(
             'src',
@@ -513,8 +553,8 @@ function Invoke-ProductionRelease {
             'scripts/Test-OtaUploadBundle.ps1',
             'scripts/verify_managed_browser_helper_package.ps1',
             'tools/managed_browser_helper')
-        $tracked = @(& git -C $Source ls-tree -r --name-only $Commit -- @sourcePathspecs)
-        if ($LASTEXITCODE -ne 0 -or $tracked.Count -eq 0) { throw 'Unable to enumerate the commit-pinned production source allowlist.' }
+        $tracked = @(Get-TrackedGitPaths $Source $Commit $sourcePathspecs)
+        if ($tracked.Count -eq 0) { throw 'Unable to enumerate the commit-pinned production source allowlist.' }
         foreach ($relativePath in $tracked) {
             if ([string]::IsNullOrWhiteSpace($relativePath) -or $relativePath.Contains('..') -or [IO.Path]::IsPathRooted($relativePath)) {
                 throw 'Git returned an unsafe commit-pinned production path.'

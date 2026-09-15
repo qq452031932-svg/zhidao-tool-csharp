@@ -186,6 +186,18 @@ public sealed class OtaProductionReleaseScriptTests
     }
 
     [Fact]
+    public void ProductionSnapshotEnumeratesGitPathsAsNulDelimitedStrictUtf8()
+    {
+        var script = File.ReadAllText(BuildScriptPath());
+
+        Assert.Contains("function Get-TrackedGitPaths", script, StringComparison.Ordinal);
+        Assert.Contains("$startInfo.ArgumentList.Add('-z')", script, StringComparison.Ordinal);
+        Assert.Contains("[Text.UTF8Encoding]::new($false, $true)", script, StringComparison.Ordinal);
+        Assert.Contains(".Split([char]0", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("@(& git -C $Source ls-tree", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void UploadValidatorUsesCentralIdentityAndKeepsStableOuterAliases()
     {
         var validator = File.ReadAllText(ValidatorScriptPath());
