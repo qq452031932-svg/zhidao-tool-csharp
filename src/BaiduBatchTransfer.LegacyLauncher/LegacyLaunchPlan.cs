@@ -10,6 +10,12 @@ public enum LegacyPathState
     ReparsePoint,
 }
 
+public sealed record LegacyPathInspection(
+    LegacyPathState State,
+    string? FinalPath,
+    uint LinkCount,
+    bool HasReparsePoint);
+
 public sealed class LegacyLaunchPlan
 {
     private const string VelopackArgumentPrefix = "--veloapp-";
@@ -38,7 +44,7 @@ public sealed class LegacyLaunchPlan
     public static bool TryCreate(
         string? launcherProcessPath,
         IReadOnlyList<string> arguments,
-        Func<string, LegacyPathState> inspectPath,
+        Func<string, LegacyPathInspection> inspectPath,
         out LegacyLaunchPlan? plan,
         out string error) =>
         TryCreateForTargetLeaf(
@@ -53,7 +59,7 @@ public sealed class LegacyLaunchPlan
         string? launcherProcessPath,
         string? targetExecutableLeaf,
         IReadOnlyList<string> arguments,
-        Func<string, LegacyPathState> inspectPath,
+        Func<string, LegacyPathInspection> inspectPath,
         out LegacyLaunchPlan? plan,
         out string error)
     {
@@ -109,15 +115,43 @@ public sealed class LegacyLaunchPlan
                 return false;
             }
 
-            if (inspectPath(launcherPath) != LegacyPathState.RegularFile)
+            var launcherInspection = inspectPath(launcherPath);
+            if (launcherInspection.State != LegacyPathState.RegularFile ||
+                launcherInspection.HasReparsePoint ||
+                string.IsNullOrWhiteSpace(launcherInspection.FinalPath) ||
+                !Path.IsPathFullyQualified(launcherInspection.FinalPath))
             {
                 error = "旧版启动器路径不安全。";
                 return false;
             }
 
-            if (inspectPath(targetPath) != LegacyPathState.RegularFile)
+            var targetInspection = inspectPath(targetPath);
+            if (targetInspection.State != LegacyPathState.RegularFile ||
+                targetInspection.HasReparsePoint ||
+                targetInspection.LinkCount != 1 ||
+                string.IsNullOrWhiteSpace(targetInspection.FinalPath) ||
+                !Path.IsPathFullyQualified(targetInspection.FinalPath))
             {
                 error = $"未找到安全的新版程序：{targetExecutableLeaf}";
+                return false;
+            }
+
+            var finalLauncherPath = Path.GetFullPath(launcherInspection.FinalPath);
+            var finalTargetPath = Path.GetFullPath(targetInspection.FinalPath);
+            var finalLauncherDirectory = Path.GetDirectoryName(finalLauncherPath);
+            var finalTargetDirectory = Path.GetDirectoryName(finalTargetPath);
+            if (string.IsNullOrEmpty(finalLauncherDirectory) ||
+                string.IsNullOrEmpty(finalTargetDirectory) ||
+                !string.Equals(
+                    finalLauncherDirectory,
+                    finalTargetDirectory,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(
+                    targetExecutableLeaf,
+                    Path.GetFileName(finalTargetPath),
+                    StringComparison.Ordinal))
+            {
+                error = "新版程序解析后的路径不安全。";
                 return false;
             }
 

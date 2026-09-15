@@ -24,6 +24,8 @@
     <ProjectReference Include="..\..\src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj" />
     <ProjectReference Include="..\..\src\BaiduBatchTransfer.Application\BaiduBatchTransfer.Application.csproj" />
     <ProjectReference Include="..\..\src\BaiduBatchTransfer.LegacyLauncher\BaiduBatchTransfer.LegacyLauncher.csproj" />
+    <ProjectReference Include="..\BaiduBatchTransfer.LegacyLauncher.Probe\BaiduBatchTransfer.LegacyLauncher.Probe.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

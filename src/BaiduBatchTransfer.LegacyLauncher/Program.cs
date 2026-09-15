@@ -14,16 +14,27 @@ internal static class Program
         "BAIDU_BATCH_TRANSFER_LEGACY_LAUNCHER_SUPPRESS_DIALOG";
 
     [STAThread]
-    private static int Main(string[] args)
+    private static int Main(string[] args) => Run(Environment.ProcessPath, args, ShowError);
+
+    // Trust boundary: package validation/signing establishes the publisher identity of shipped
+    // files, and the per-user Velopack install ACL is trusted against other Windows principals.
+    // These checks block accidental/path redirection, reparse points, and hard-link aliases. They
+    // do not claim to defeat malicious code already executing as this same Windows user, including
+    // the unavoidable validation-to-CreateProcess swap. Package-time same-publisher verification
+    // remains mandatory and is implemented by the later packaging validation work.
+    internal static int Run(
+        string? launcherProcessPath,
+        IReadOnlyList<string> args,
+        Action<string> showError)
     {
         if (!LegacyLaunchPlan.TryCreate(
-                Environment.ProcessPath,
+                launcherProcessPath,
                 args,
-                InspectPath,
+                WindowsPathInspector.Inspect,
                 out var plan,
                 out var error))
         {
-            ShowError(error);
+            showError(error);
             return PlanFailureExitCode;
         }
 
@@ -32,7 +43,7 @@ internal static class Program
             using var child = Process.Start(plan!.CreateStartInfo());
             if (child is null)
             {
-                ShowError("无法启动新版程序。");
+                showError("无法启动新版程序。");
                 return LaunchFailureExitCode;
             }
 
@@ -47,31 +58,8 @@ internal static class Program
             exception is InvalidOperationException or Win32Exception or IOException or
             UnauthorizedAccessException or NotSupportedException)
         {
-            ShowError($"无法启动新版程序：{exception.Message}");
+            showError($"无法启动新版程序：{exception.Message}");
             return LaunchFailureExitCode;
-        }
-    }
-
-    private static LegacyPathState InspectPath(string path)
-    {
-        try
-        {
-            var attributes = File.GetAttributes(path);
-            if ((attributes & FileAttributes.ReparsePoint) != 0)
-            {
-                return LegacyPathState.ReparsePoint;
-            }
-
-            return (attributes & FileAttributes.Directory) != 0
-                ? LegacyPathState.Directory
-                : LegacyPathState.RegularFile;
-        }
-        catch (Exception exception) when (
-            exception is FileNotFoundException or DirectoryNotFoundException or
-            UnauthorizedAccessException or IOException or ArgumentException or
-            NotSupportedException)
-        {
-            return LegacyPathState.Missing;
         }
     }
 
