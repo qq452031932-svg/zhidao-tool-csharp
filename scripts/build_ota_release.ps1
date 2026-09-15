@@ -744,7 +744,27 @@ function Invoke-ProductionRelease {
         $assetCatalogPath = Join-Path $assetDirectory "assets.$productionChannel.json"
         $releasesIndexPath = Join-Path $assetDirectory "RELEASES-$productionChannel"
         $releaseFeed = [IO.File]::ReadAllText($releaseFeedPath) | ConvertFrom-Json
-        $releaseAssets = @($releaseFeed.Assets)
+        # Historical Delta packages are not carried into the new production bundle.
+        # The authenticated previous Full remains the sole migration base; only the
+        # freshly generated current Delta is published and reconstructed below.
+        $historicalDeltas = @($releaseFeed.Assets | Where-Object {
+                [string]$_.Type -ceq 'Delta' -and [version][string]$_.Version -lt [version]$Version
+            })
+        foreach ($historicalDelta in $historicalDeltas) {
+            $historicalDeltaName = [string]$historicalDelta.FileName
+            if (-not (Test-SafeNupkgFileName $historicalDeltaName)) {
+                throw 'Velopack produced an unsafe historical Delta asset name.'
+            }
+            $historicalDeltaPath = Join-Path $assetDirectory $historicalDeltaName
+            if (-not (Test-Path -LiteralPath $historicalDeltaPath -PathType Leaf)) {
+                throw 'Velopack feed references a missing historical Delta asset.'
+            }
+            Remove-Item -LiteralPath $historicalDeltaPath -Force
+        }
+        $releaseAssets = @($releaseFeed.Assets | Where-Object {
+                -not ([string]$_.Type -ceq 'Delta' -and [version][string]$_.Version -lt [version]$Version)
+            })
+        $releaseFeed.Assets = $releaseAssets
         if ($releaseAssets.Count -eq 0) { throw 'Velopack production feed contains no assets.' }
         foreach ($asset in $releaseAssets) {
             $assetVersion = [string]$asset.Version

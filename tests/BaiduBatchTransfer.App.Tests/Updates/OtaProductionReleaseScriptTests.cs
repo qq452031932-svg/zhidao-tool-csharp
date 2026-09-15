@@ -155,6 +155,7 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("Published production metadata", script, StringComparison.Ordinal);
         Assert.Contains("Previous production upload ZIP", script, StringComparison.Ordinal);
         Assert.Contains("Previous production generation directory must contain exactly one canonical upload ZIP.", script, StringComparison.Ordinal);
+        Assert.Contains("Historical Delta packages are not carried into the new production bundle.", script, StringComparison.Ordinal);
         Assert.Contains("-ExpectedVersion '1.1.0' -HistoricalProductIdentity", script, StringComparison.Ordinal);
         Assert.Contains("[switch]$HistoricalProductIdentity", validator, StringComparison.Ordinal);
         Assert.Contains("HistoricalProductIdentity is restricted to the signed 1.1.0 migration base.", validator, StringComparison.Ordinal);
