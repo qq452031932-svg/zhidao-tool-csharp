@@ -13,6 +13,13 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+. (Join-Path $PSScriptRoot 'ProductIdentity.ps1')
+$productIdentity = Get-ProductIdentity -Path (Join-Path $repo 'eng\ProductIdentity.props')
+if ([string]::IsNullOrWhiteSpace($productIdentity.ProductMainAssemblyName) -or
+    $productIdentity.ProductMainExecutableName -cne "$($productIdentity.ProductMainAssemblyName).exe") {
+    throw 'Product identity does not define the expected main application executable.'
+}
 function Assert-NoReparsePointAncestors([string]$Path) {
     $cursor = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path)))
     while ($null -ne $cursor) {
@@ -37,7 +44,6 @@ try {
     if ($read -ne $der.Length -or $ec.KeySize -ne 256 -or [Convert]::ToBase64String($ec.ExportSubjectPublicKeyInfo()) -cne $LicenseSigningPublicKey) { throw 'noncanonical' }
 } catch { throw 'LicenseSigningPublicKey must be canonical ECDSA P-256 SPKI DER base64.' } finally { if ($null -ne $ec) { $ec.Dispose() } }
 
-$repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $helperPackage = [IO.Path]::GetFullPath($ManagedBrowserHelperPackageDirectory)
 Assert-LocalDrivePath $helperPackage
 Assert-NoReparsePointAncestors $helperPackage
@@ -83,7 +89,7 @@ try {
     & dotnet publish (Join-Path $buildRepo 'tools\license_production_boundary_probe\SuperPan.Licensing.ProductionBoundaryProbe.csproj') -o $probe @common; if ($LASTEXITCODE -ne 0) { throw 'Boundary probe publish failed.' }
     Remove-Item -LiteralPath $buildRepo -Recurse -Force
 
-    $artifacts = @((Join-Path $superpan 'BaiduBatchTransfer.App.exe'),(Join-Path $smoke 'SuperPan.Licensing.ProductionSmoke.NonShipping.exe'),(Join-Path $probe 'SuperPan.Licensing.BOUNDARY-PROBE-NONSHIPPING.exe'))
+    $artifacts = @((Join-Path $superpan $productIdentity.ProductMainExecutableName),(Join-Path $smoke 'SuperPan.Licensing.ProductionSmoke.NonShipping.exe'),(Join-Path $probe 'SuperPan.Licensing.BOUNDARY-PROBE-NONSHIPPING.exe'))
     $signtool = (Get-Command signtool.exe -ErrorAction Stop).Source
     $manifest = @()
     foreach ($artifact in $artifacts) {

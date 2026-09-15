@@ -5,6 +5,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+. (Join-Path $PSScriptRoot 'ProductIdentity.ps1')
+$productIdentity = Get-ProductIdentity -Path (Join-Path $repositoryRoot 'eng\ProductIdentity.props')
+if ([string]::IsNullOrWhiteSpace($productIdentity.ProductMainAssemblyName) -or
+    $productIdentity.ProductMainDllName -cne "$($productIdentity.ProductMainAssemblyName).dll") {
+    throw 'Product identity does not define the expected main application assembly.'
+}
 $runScript = Join-Path $PSScriptRoot 'run_local_license_stack.ps1'
 $stopScript = Join-Path $PSScriptRoot 'stop_local_license_stack.ps1'
 $harnessProject = Join-Path $repositoryRoot 'tools\license_client_harness\SuperPan.Licensing.AcceptanceHarness.csproj'
@@ -13,7 +19,7 @@ $runtimeRoot = Join-Path $repositoryRoot '.tmp\license-local'
 $clientConfig = Join-Path $runtimeRoot 'client.json'
 $adminPasswordPath = Join-Path $runtimeRoot 'admin-password.txt'
 $acceptanceOutput = Join-Path $repositoryRoot '.artifacts\license-acceptance'
-$acceptanceAssembly = Join-Path $acceptanceOutput 'BaiduBatchTransfer.App.dll'
+$acceptanceAssembly = Join-Path $acceptanceOutput $productIdentity.ProductMainDllName
 $adminOrigin = 'http://127.0.0.1:19090'
 $productFixture = '11111111-2222-4333-8444-555555555555'
 $userAStore = Join-Path $runtimeRoot 'acceptance-user-a'

@@ -8,6 +8,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+. (Join-Path $PSScriptRoot 'ProductIdentity.ps1')
+$productIdentity = Get-ProductIdentity -Path (Join-Path $repositoryRoot 'eng\ProductIdentity.props')
+if ([string]::IsNullOrWhiteSpace($productIdentity.ProductMainAssemblyName) -or
+    $productIdentity.ProductMainDllName -cne "$($productIdentity.ProductMainAssemblyName).dll") {
+    throw 'Product identity does not define the expected main application assembly.'
+}
 $projectPath = Join-Path $repositoryRoot 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'
 if ([string]::IsNullOrWhiteSpace($AcceptanceConfigPath)) {
     $AcceptanceConfigPath = Join-Path $repositoryRoot '.tmp\license-local\client.json'
@@ -47,7 +53,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Local license acceptance publish failed with exit code $LASTEXITCODE."
 }
 
-$assemblyPath = Join-Path $outputPath 'BaiduBatchTransfer.App.dll'
+$assemblyPath = Join-Path $outputPath $productIdentity.ProductMainDllName
 if (-not (Test-Path -LiteralPath $assemblyPath -PathType Leaf)) {
     throw 'Local license acceptance output is missing the application assembly.'
 }

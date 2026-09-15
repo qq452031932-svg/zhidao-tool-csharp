@@ -7,6 +7,20 @@ namespace BaiduBatchTransfer.App.Tests.Updates;
 
 public sealed class LicenseLocalStackScriptTests
 {
+    [Theory]
+    [InlineData("build_local_license_acceptance.ps1")]
+    [InlineData("test_local_license_stack.ps1")]
+    public void AcceptanceScriptsLoadCanonicalMainAssemblyIdentityOnce(string scriptName)
+    {
+        var script = File.ReadAllText(ScriptPath(scriptName));
+
+        Assert.Equal(1, CountOccurrences(script, ". (Join-Path $PSScriptRoot 'ProductIdentity.ps1')"));
+        Assert.Equal(1, CountOccurrences(script, "Get-ProductIdentity"));
+        Assert.Contains("$productIdentity.ProductMainDllName", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("知道综合工具", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("BaiduBatchTransfer.App.dll", script, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void LocalScriptsUseIsolatedLoopbackRuntimeAndExactProcessIdentity()
     {

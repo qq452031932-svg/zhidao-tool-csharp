@@ -47,6 +47,20 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("\"-p:ManagedBrowserHelperPackageDirectory=$helperPackage\"", script, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("build_production_license_clients.ps1", "$productIdentity.ProductMainExecutableName")]
+    [InlineData("test_license_spki_rotation.ps1", "$productIdentity.ProductMainExecutableName")]
+    public void ProductionScriptsLoadCanonicalProductIdentityOnce(string scriptName, string expectedIdentityUse)
+    {
+        var script = File.ReadAllText(Path.Combine(Root(), "scripts", scriptName));
+
+        Assert.Equal(1, CountOccurrences(script, ". (Join-Path $PSScriptRoot 'ProductIdentity.ps1')"));
+        Assert.Equal(1, CountOccurrences(script, "Get-ProductIdentity"));
+        Assert.Contains(expectedIdentityUse, script, StringComparison.Ordinal);
+        Assert.DoesNotContain("知道综合工具", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("BaiduBatchTransfer.App.exe", script, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void RotationRehearsalIsFailClosedAndRedacted()
     {
@@ -71,7 +85,7 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("Invoke-ExactSmoke", script, StringComparison.Ordinal);
         Assert.Contains("ApprovedSigningCertificateThumbprint", script, StringComparison.Ordinal);
         Assert.Contains("CheckSignature($false)", script, StringComparison.Ordinal);
-        Assert.Contains("BaiduBatchTransfer.App.exe", script, StringComparison.Ordinal);
+        Assert.Contains("$productIdentity.ProductMainExecutableName", script, StringComparison.Ordinal);
         Assert.Contains("signtool.exe", script, StringComparison.Ordinal);
         Assert.Contains("Assert-NoReparseContainedPath", script, StringComparison.Ordinal);
         Assert.Contains("$cursor=$cursor.Parent", script, StringComparison.Ordinal);
@@ -85,4 +99,7 @@ public sealed class ProductionLicenseBuildScriptTests
 
     private static string Root([CallerFilePath] string path = "") =>
         Directory.GetParent(path)!.Parent!.Parent!.Parent!.FullName;
+
+    private static int CountOccurrences(string text, string value) =>
+        (text.Length - text.Replace(value, string.Empty, StringComparison.Ordinal).Length) / value.Length;
 }

@@ -13,6 +13,13 @@ param(
     [ValidateRange(10,3600)][int]$PhaseTimeoutSeconds = 900
 )
 $ErrorActionPreference = 'Stop'; Set-StrictMode -Version Latest
+$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+. (Join-Path $PSScriptRoot 'ProductIdentity.ps1')
+$productIdentity = Get-ProductIdentity -Path (Join-Path $repositoryRoot 'eng\ProductIdentity.props')
+if ([string]::IsNullOrWhiteSpace($productIdentity.ProductMainAssemblyName) -or
+    $productIdentity.ProductMainExecutableName -cne "$($productIdentity.ProductMainAssemblyName).exe") {
+    throw 'Product identity does not define the expected main application executable.'
+}
 
 function Read-VerifiedClientRoot([string]$Root) {
     $root = [IO.Path]::GetFullPath($Root); $manifestPath = Join-Path $root 'production-license-clients.json'; $signaturePath = $manifestPath + '.p7s'
@@ -27,7 +34,7 @@ function Read-VerifiedClientRoot([string]$Root) {
         $value.nextTlsSpki -cnotmatch '^[0-9a-f]{64}$' -or $value.currentTlsSpki -ceq $value.nextTlsSpki -or
         $value.artifacts.Count -ne 3) { throw 'Signed client manifest identity is invalid.' }
     $requiredArtifacts = @{
-        'superpan/BaiduBatchTransfer.App.exe' = $false
+        "superpan/$($productIdentity.ProductMainExecutableName)" = $false
         'smoke-nonshipping/SuperPan.Licensing.ProductionSmoke.NonShipping.exe' = $false
         'boundary-probe-nonshipping/SuperPan.Licensing.BOUNDARY-PROBE-NONSHIPPING.exe' = $false
     }
