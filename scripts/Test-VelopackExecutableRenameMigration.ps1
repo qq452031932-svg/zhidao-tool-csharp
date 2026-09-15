@@ -458,19 +458,25 @@ function ConvertTo-CanonicalJson {
     return ((ConvertTo-CanonicalNode $Value) | ConvertTo-Json -Depth 20 -Compress)
 }
 
+function Get-CanonicalJsonBytes {
+    param([Parameter(Mandatory = $true)]$Value)
+    return (New-Object Text.UTF8Encoding($false)).GetBytes((ConvertTo-CanonicalJson $Value) + "`n")
+}
+
+function Write-FrozenBytes {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes,[Parameter(Mandatory = $true)][string]$Destination,[switch]$CreateNew)
+    $mode = if ($CreateNew) { [IO.FileMode]::CreateNew } else { [IO.FileMode]::Create }
+    $stream = [IO.File]::Open($Destination, $mode, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $stream.Write($Bytes, 0, $Bytes.Length);$stream.Flush($true) } finally { $stream.Dispose() }
+}
+
 function Write-CanonicalJson {
     param(
         [Parameter(Mandatory = $true)]$Value,
         [Parameter(Mandatory = $true)][string]$Destination,
         [switch]$CreateNew
     )
-    $json = ConvertTo-CanonicalJson $Value
-    $mode = if ($CreateNew) { [IO.FileMode]::CreateNew } else { [IO.FileMode]::Create }
-    $stream = [IO.File]::Open($Destination, $mode, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try {
-        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($json + "`n")
-        $stream.Write($bytes, 0, $bytes.Length)
-    } finally { $stream.Dispose() }
+    Write-FrozenBytes -Bytes (Get-CanonicalJsonBytes $Value) -Destination $Destination -CreateNew:$CreateNew
 }
 
 function Copy-BoundedLockedAsset {
@@ -891,18 +897,72 @@ function Get-FileInventory {
     return @($records)
 }
 
+function Get-ByteArraySha256 {
+    param([byte[]]$Bytes)
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try{return (($sha.ComputeHash($Bytes)|ForEach-Object{$_.ToString('x2')})-join '')}finally{$sha.Dispose()}
+}
+
+function Get-FrozenEvidenceInventory {
+    param([string]$EvidenceRoot,[string]$EvidencePath,[string]$InventoryPath,[byte[]]$EvidenceBytes)
+    $evidenceFull=[IO.Path]::GetFullPath($EvidencePath);$inventoryFull=[IO.Path]::GetFullPath($InventoryPath)
+    $records=New-Object Collections.Generic.List[object];$foundEvidence=$false
+    foreach($record in @(Get-FileInventory -Roots @($EvidenceRoot))){
+        $recordFull=[IO.Path]::GetFullPath([string]$record.Path)
+        if([string]::Equals($recordFull,$inventoryFull,[StringComparison]::OrdinalIgnoreCase)){continue}
+        if([string]::Equals($recordFull,$evidenceFull,[StringComparison]::OrdinalIgnoreCase)){
+            $records.Add([ordered]@{Path=$evidenceFull;Length=[long]$EvidenceBytes.Length;Sha256=(Get-ByteArraySha256 -Bytes $EvidenceBytes)});$foundEvidence=$true
+        }else{$records.Add($record)}
+    }
+    if(-not$foundEvidence){throw 'Evidence inventory did not contain the pending evidence file.'}
+    return @($records)
+}
+
 function Write-TerminalMigrationEvidence {
     param($Evidence,[string]$EvidenceRoot,[string]$RunId,[Collections.Generic.List[string]]$Failures)
     $evidencePath=Join-Path $EvidenceRoot 'evidence.json';$inventoryPath=Join-Path $EvidenceRoot 'files.sha256.json'
-    $setTerminalState={
-        $Evidence.FinishedUtc=[DateTimeOffset]::UtcNow.ToString('O')
-        if($Failures.Count-ne 0){$Evidence.Succeeded=$false;$Evidence.Error=(@($Failures|Select-Object -Unique)-join ' | ')}
+    $intendedSuccess=([bool]$Evidence.Succeeded-and$Failures.Count-eq 0);$successfulError=$Evidence.Error
+    $Evidence.FinishedUtc=[DateTimeOffset]::UtcNow.ToString('O')
+
+    if($intendedSuccess){
+        # A durable success is the commit record. Keep a pessimistic record on disk until
+        # its frozen bytes have been hashed and the corresponding inventory is durable.
+        $Evidence.Succeeded=$false;$Evidence.Error='Terminal evidence publication pending.'
+        try{Write-FrozenBytes -Bytes (Get-CanonicalJsonBytes $Evidence) -Destination $evidencePath}catch{throw ('Evidence pending record is not writable; migration result is failed and must not be reported as success: '+($_.Exception.Message))}
+        $Evidence.Succeeded=$true;$Evidence.Error=$successfulError;$successBytes=Get-CanonicalJsonBytes $Evidence
+        try{
+            $hashes=@(Get-FrozenEvidenceInventory -EvidenceRoot $EvidenceRoot -EvidencePath $evidencePath -InventoryPath $inventoryPath -EvidenceBytes $successBytes)
+            $inventoryBytes=Get-CanonicalJsonBytes ([ordered]@{SchemaVersion=1;RunId=$RunId;Files=$hashes})
+            Write-FrozenBytes -Bytes $inventoryBytes -Destination $inventoryPath
+        }catch{
+            $Failures.Add('Evidence inventory finalization failed: '+$_.Exception.Message)
+            if(Test-Path -LiteralPath $inventoryPath){try{Remove-Item -LiteralPath $inventoryPath -Force}catch{$Failures.Add('Incomplete evidence inventory could not be removed: '+$_.Exception.Message)}}
+            $Evidence.Succeeded=$false;$Evidence.Error=(@($Failures|Select-Object -Unique)-join ' | ')
+            try{Write-FrozenBytes -Bytes (Get-CanonicalJsonBytes $Evidence) -Destination $evidencePath}catch{throw ('Evidence terminal failure record could not be written; the durable pending record is not success: '+($_.Exception.Message))}
+            return
+        }
+        try{Write-FrozenBytes -Bytes $successBytes -Destination $evidencePath}
+        catch{
+            $Failures.Add('Frozen success evidence publication failed: '+$_.Exception.Message)
+            if(Test-Path -LiteralPath $inventoryPath){try{Remove-Item -LiteralPath $inventoryPath -Force}catch{$Failures.Add('Uncommitted success inventory could not be removed: '+$_.Exception.Message)}}
+            $Evidence.Succeeded=$false;$Evidence.Error=(@($Failures|Select-Object -Unique)-join ' | ')
+            try{Write-FrozenBytes -Bytes (Get-CanonicalJsonBytes $Evidence) -Destination $evidencePath}catch{throw ('Evidence success publication and failure record both failed; no success may be reported: '+($_.Exception.Message))}
+            throw ('Evidence success publication failed and was replaced by failure evidence: '+(@($Failures|Select-Object -Unique)-join ' | '))
+        }
+        return
     }
-    & $setTerminalState
-    try{Write-CanonicalJson -Value $Evidence -Destination $evidencePath}catch{throw ('Evidence terminal record is not writable; migration result is failed and must not be reported as success: '+($_.Exception.Message))}
-    try{$hashes=@(Get-FileInventory -Roots @($EvidenceRoot));Write-CanonicalJson -Value ([ordered]@{SchemaVersion=1;RunId=$RunId;Files=$hashes}) -Destination $inventoryPath}
-    catch{$Failures.Add('Evidence inventory finalization failed: '+$_.Exception.Message);& $setTerminalState;try{Write-CanonicalJson -Value $Evidence -Destination $evidencePath}catch{throw ('Evidence terminal failure record could not be rewritten: '+($_.Exception.Message))}}
-    if($Failures.Count-ne 0){& $setTerminalState;try{Write-CanonicalJson -Value $Evidence -Destination $evidencePath}catch{throw ('Evidence aggregated terminal failure record could not be written: '+($_.Exception.Message))}}
+
+    $Evidence.Succeeded=$false;$Evidence.Error=(@($Failures|Select-Object -Unique)-join ' | ');$failureBytes=Get-CanonicalJsonBytes $Evidence
+    try{Write-FrozenBytes -Bytes $failureBytes -Destination $evidencePath}catch{throw ('Evidence terminal failure record is not writable: '+($_.Exception.Message))}
+    try{
+        $hashes=@(Get-FrozenEvidenceInventory -EvidenceRoot $EvidenceRoot -EvidencePath $evidencePath -InventoryPath $inventoryPath -EvidenceBytes $failureBytes)
+        Write-FrozenBytes -Bytes (Get-CanonicalJsonBytes ([ordered]@{SchemaVersion=1;RunId=$RunId;Files=$hashes})) -Destination $inventoryPath
+    }catch{
+        $Failures.Add('Evidence inventory finalization failed: '+$_.Exception.Message)
+        if(Test-Path -LiteralPath $inventoryPath){try{Remove-Item -LiteralPath $inventoryPath -Force}catch{$Failures.Add('Incomplete evidence inventory could not be removed: '+$_.Exception.Message)}}
+        $Evidence.Error=(@($Failures|Select-Object -Unique)-join ' | ')
+        try{Write-FrozenBytes -Bytes (Get-CanonicalJsonBytes $Evidence) -Destination $evidencePath}catch{throw ('Evidence inventory failed and its terminal failure record could not be written: '+($_.Exception.Message))}
+    }
 }
 
 $runId = New-RunId

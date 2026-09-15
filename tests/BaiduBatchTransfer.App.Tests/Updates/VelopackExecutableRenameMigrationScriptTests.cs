@@ -578,7 +578,7 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
     [InlineData("post-offline")]
     [InlineData("cleanup")]
     [InlineData("inventory")]
-    public async Task TerminalEvidenceRewritesPriorSuccessForBodyCleanupAndInventoryFailures(string mode)
+    public async Task TerminalEvidenceFreezesFailureBytesBeforePublishingTheirInventory(string mode)
     {
         var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-terminal-{Guid.NewGuid():N}"); Directory.CreateDirectory(root);
         var harness = System.IO.Path.Combine(root, "harness.ps1"); var evidenceRoot = System.IO.Path.Combine(root, "evidence"); Directory.CreateDirectory(evidenceRoot);
@@ -589,7 +589,11 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
                 $ErrorActionPreference='Stop';Import-Module Microsoft.PowerShell.Utility;$tokens=$null;$errors=$null
                 $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
                 foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
-                if($Mode-ceq'inventory'){function Get-FileInventory{throw 'forced inventory failure'}}
+                Set-Item function:Original-GetFileInventory (Get-Command Get-FileInventory).ScriptBlock
+                function Get-FileInventory{param([string[]]$Roots)
+                    if($Mode-ceq'inventory'){throw 'forced inventory failure'}
+                    $result=@(Original-GetFileInventory -Roots $Roots);Start-Sleep -Milliseconds 50;return $result
+                }
                 $evidence=[ordered]@{SchemaVersion=2;RunId='RUN';FinishedUtc=$null;Succeeded=$true;Error=$null}
                 $failures=New-Object Collections.Generic.List[string]
                 if($Mode-ceq'post-offline'){$failures.Add('Post-body offline assertion failed.')}
@@ -604,6 +608,53 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             Assert.True(process.ExitCode == 23, output);
             using var document = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(System.IO.Path.Combine(evidenceRoot, "evidence.json")));
             Assert.False(document.RootElement.GetProperty("Succeeded").GetBoolean()); Assert.False(string.IsNullOrWhiteSpace(document.RootElement.GetProperty("Error").GetString()));
+            var inventoryPath = System.IO.Path.Combine(evidenceRoot, "files.sha256.json");
+            if (File.Exists(inventoryPath))
+            {
+                var evidencePath = System.IO.Path.Combine(evidenceRoot, "evidence.json");
+                using var inventory = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(inventoryPath));
+                var evidenceRecord = inventory.RootElement.GetProperty("Files").EnumerateArray()
+                    .Single(record => string.Equals(record.GetProperty("Path").GetString(), evidencePath, StringComparison.OrdinalIgnoreCase));
+                var evidenceBytes = await File.ReadAllBytesAsync(evidencePath);
+                Assert.Equal(evidenceBytes.LongLength, evidenceRecord.GetProperty("Length").GetInt64());
+                Assert.Equal(Convert.ToHexString(SHA256.HashData(evidenceBytes)).ToLowerInvariant(), evidenceRecord.GetProperty("Sha256").GetString());
+            }
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task InventoryFailureAndFailureRecordWriteFailureNeverLeavesDurableSuccess()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-terminal-publish-{Guid.NewGuid():N}"); Directory.CreateDirectory(root);
+        var harness = System.IO.Path.Combine(root, "harness.ps1"); var evidenceRoot = System.IO.Path.Combine(root, "evidence"); Directory.CreateDirectory(evidenceRoot);
+        try
+        {
+            await File.WriteAllTextAsync(harness, """
+                param([string]$ScriptPath,[string]$EvidenceRoot)
+                $ErrorActionPreference='Stop';Import-Module Microsoft.PowerShell.Utility;$tokens=$null;$errors=$null
+                $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
+                foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
+                Set-Item function:Original-WriteFrozenBytes (Get-Command Write-FrozenBytes).ScriptBlock
+                $script:evidenceWrites=0
+                function Write-FrozenBytes{param([byte[]]$Bytes,[string]$Destination,[switch]$CreateNew)
+                    if([IO.Path]::GetFileName($Destination)-ceq'evidence.json'){$script:evidenceWrites++;if($script:evidenceWrites-ge 2){throw 'forced failure-record write failure'}}
+                    Original-WriteFrozenBytes -Bytes $Bytes -Destination $Destination -CreateNew:$CreateNew
+                }
+                function Get-FileInventory{throw 'forced inventory failure'}
+                $evidence=[ordered]@{SchemaVersion=2;RunId='RUN';FinishedUtc=$null;Succeeded=$true;Error=$null}
+                $failures=New-Object Collections.Generic.List[string]
+                try{Write-TerminalMigrationEvidence -Evidence $evidence -EvidenceRoot $EvidenceRoot -RunId 'RUN' -Failures $failures;exit 91}catch{exit 23}
+                """, new UTF8Encoding(false));
+            var start = PowerShell(); foreach (var value in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-EvidenceRoot", evidenceRoot }) start.ArgumentList.Add(value);
+            using var process = Process.Start(start)!; var output = await process.StandardOutput.ReadToEndAsync() + await process.StandardError.ReadToEndAsync(); await process.WaitForExitAsync();
+            Assert.True(process.ExitCode == 23, output);
+            var evidencePath = System.IO.Path.Combine(evidenceRoot, "evidence.json");
+            if (File.Exists(evidencePath))
+            {
+                using var document = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(evidencePath));
+                Assert.False(document.RootElement.GetProperty("Succeeded").GetBoolean());
+            }
         }
         finally { Directory.Delete(root, recursive: true); }
     }
