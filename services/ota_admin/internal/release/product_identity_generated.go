@@ -13,4 +13,5 @@ const (
 	productPackageID            = "SuperPan.BaiduBatchTransfer"
 	productDataDirectoryName    = "BaiduBatchTransfer"
 	productLicenseProductID     = "8270e8d7-1791-487d-ad76-0da7a0cbed12"
+	productIconSHA256           = "0cc6a91abed05fae671c4635e8903b9f2db3e6931b72bdad907b57840d7f97fa"
 )

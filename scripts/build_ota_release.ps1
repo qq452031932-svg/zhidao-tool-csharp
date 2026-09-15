@@ -360,6 +360,10 @@ function Invoke-ProductionRelease {
         throw 'ProductionFeedUrl must be an absolute HTTPS URL without credentials, query, or fragment.'
     }
     $normalizedFeedUrl = $feedUri.AbsoluteUri.TrimEnd('/') + '/'
+    $approvedProductionFeedUrl = 'https://ota.fanfh.cn/releases/win-x64/stable/'
+    if ($normalizedFeedUrl -cne $approvedProductionFeedUrl) {
+        throw "ProductionFeedUrl must be the exact approved production feed: $approvedProductionFeedUrl"
+    }
     if ($SigningCertificateThumbprint -cnotmatch '^[0-9A-Fa-f]{40}$') {
         throw 'SigningCertificateThumbprint must be exactly 40 hexadecimal characters.'
     }

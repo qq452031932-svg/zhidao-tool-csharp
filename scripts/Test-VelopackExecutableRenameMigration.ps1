@@ -141,6 +141,7 @@ $script:NewMainExecutableName = $script:ChineseDisplayName + '.exe'
 $script:FixtureName = 'migration-gate-fixture.json'
 $script:FixtureSignatureName = 'migration-gate-fixture.json.sig'
 $script:ExpectedPublisherSpkiSha256 = 'f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff'
+$script:RequiredVelopackUpdaterVersion = '1.2.0'
 $script:PublisherCertificatePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'eng\ota\SuperPan.OtaPublisher.cer'
 $script:MaximumFixtureBytes = 65536
 $script:MaximumDriverOutputBytes = 1048576
@@ -1083,6 +1084,7 @@ try {
     Assert-PublisherExecutable -Executable $oldMain
     if (-not (Test-Path -LiteralPath $updater -PathType Leaf)) { throw 'Velopack Update.exe is missing from the fixed install root.' }
     $updaterLock=Open-ArtifactReadLock -File $updater -Label 'Installed Velopack updater';Assert-PublisherExecutable -Executable $updater
+    Assert-ExactThreePartVersion -Executable $updater -Expected $script:RequiredVelopackUpdaterVersion
     $evidence.VelopackUpdaterVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($updater).ProductVersion
 
     $commonDriverArguments = @('--run-id',$runId,'--profile-root',$profile,'--fixture',$fixturePath)

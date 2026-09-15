@@ -97,6 +97,18 @@ public sealed class ProductIconTests
     }
 
     [Fact]
+    public void CanonicalIcoHashMatchesProductIdentityContract()
+    {
+        var identity = XDocument.Load(Path.Combine(RepositoryRoot(), "eng", "ProductIdentity.props"));
+        var expected = identity.Descendants()
+            .Single(element => element.Name.LocalName == "ProductIconSha256")
+            .Value;
+        var actual = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(IconPath()))).ToLowerInvariant();
+
+        Assert.Equal(expected, actual);
+    }
+
+    [Fact]
     public async Task VerifyOnlyWithoutSourceReportsLockedExpectationButNoObservedSource()
     {
         var root = RepositoryRoot();

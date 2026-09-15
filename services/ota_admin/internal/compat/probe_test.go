@@ -1546,7 +1546,7 @@ func readRepositoryFile(t *testing.T, pathParts ...string) string {
 	if err != nil {
 		t.Fatalf("os.ReadFile(%q) error = %v", path, err)
 	}
-	return string(contents)
+	return strings.ReplaceAll(string(contents), "\r\n", "\n")
 }
 
 func countCall(calls []string, want string) int {

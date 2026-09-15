@@ -62,7 +62,7 @@ public sealed class OtaProductionReleaseScriptTests
         var output = Path.Combine(root, ".artifacts", $"ota-production-version-test-{Guid.NewGuid():N}");
         var result = await RunProductionPowerShellAsync(
             "-Production", "-Version", version, "-OutputDirectory", output,
-            "-ProductionFeedUrl", "https://ota.example.test/releases/win-x64/stable/",
+            "-ProductionFeedUrl", "https://ota.fanfh.cn/releases/win-x64/stable/",
             "-SigningCertificateThumbprint", new string('A', 40));
 
         Assert.NotEqual(0, result.ExitCode);
@@ -89,6 +89,23 @@ public sealed class OtaProductionReleaseScriptTests
     }
 
     [Theory]
+    [InlineData("https://ota.example.test/releases/win-x64/stable/")]
+    [InlineData("https://ota.fanfh.cn/releases/win-x64/stable/other/")]
+    public async Task ProductionRejectsAnyFeedExceptExactApprovedProductionFeedBeforeOutput(string feedUrl)
+    {
+        var root = FindRepositoryRoot();
+        var output = Path.Combine(root, ".artifacts", $"ota-production-fixed-feed-test-{Guid.NewGuid():N}");
+        var result = await RunProductionPowerShellAsync(
+            "-Production", "-Version", "1.2.3", "-OutputDirectory", output,
+            "-ProductionFeedUrl", feedUrl,
+            "-SigningCertificateThumbprint", new string('A', 40));
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("approved production feed", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(output));
+    }
+
+    [Theory]
     [InlineData("https://timestamp.example.test/path;Injected=true")]
     [InlineData("https://timestamp.example.test/path,Injected=true")]
     [InlineData("https://timestamp.example.test/path%3bInjected=true")]
@@ -99,7 +116,7 @@ public sealed class OtaProductionReleaseScriptTests
         var output = Path.Combine(root, ".artifacts", $"ota-production-timestamp-test-{Guid.NewGuid():N}");
         var result = await RunProductionPowerShellAsync(
             "-Production", "-Version", "1.2.3", "-OutputDirectory", output,
-            "-ProductionFeedUrl", "https://ota.example.test/releases/win-x64/stable/",
+            "-ProductionFeedUrl", "https://ota.fanfh.cn/releases/win-x64/stable/",
             "-SigningCertificateThumbprint", new string('A', 40),
             "-TimestampUrl", timestampUrl);
 
@@ -295,7 +312,7 @@ public sealed class OtaProductionReleaseScriptTests
             var result = await RunPowerShellAsync(
                 Path.Combine(scripts, "build_ota_release.ps1"),
                 "-Production", "-Version", "1.2.3", "-OutputDirectory", output,
-                "-ProductionFeedUrl", "https://ota.example.test/releases/win-x64/stable/",
+                "-ProductionFeedUrl", "https://ota.fanfh.cn/releases/win-x64/stable/",
                 "-SigningCertificateThumbprint", new string('A', 40),
                 "-LicenseSigningKeyId", "key-1", "-LicenseSigningPublicKey", "public-key",
                 "-LicenseCurrentSpkiPin", new string('a', 64),

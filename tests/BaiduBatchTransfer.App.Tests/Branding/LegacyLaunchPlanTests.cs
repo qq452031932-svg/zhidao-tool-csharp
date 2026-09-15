@@ -21,7 +21,6 @@ public sealed class LegacyLaunchPlanTests
         Assert.True(result, error);
         Assert.NotNull(plan);
         Assert.Equal(expectedTarget, plan.TargetPath, ignoreCase: true);
-        Assert.Equal(Path.GetDirectoryName(launcher), plan.WorkingDirectory, ignoreCase: true);
         Assert.Equal("知道综合工具.exe", Path.GetFileName(plan.TargetPath));
     }
 
@@ -175,7 +174,7 @@ public sealed class LegacyLaunchPlanTests
         ProcessStartInfo startInfo = plan.CreateStartInfo();
 
         Assert.Equal(plan.TargetPath, startInfo.FileName);
-        Assert.Equal(plan.WorkingDirectory, startInfo.WorkingDirectory);
+        Assert.Empty(startInfo.WorkingDirectory);
         Assert.False(startInfo.UseShellExecute);
         Assert.Equal(arguments, startInfo.ArgumentList);
         Assert.Empty(startInfo.Arguments);

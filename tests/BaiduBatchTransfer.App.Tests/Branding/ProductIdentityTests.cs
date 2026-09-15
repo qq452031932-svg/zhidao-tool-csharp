@@ -33,6 +33,9 @@ public sealed class ProductIdentityTests
         Assert.Equal("SuperPan.BaiduBatchTransfer", properties["ProductPackageId"]);
         Assert.Equal("BaiduBatchTransfer", properties["ProductDataDirectoryName"]);
         Assert.Equal("8270e8d7-1791-487d-ad76-0da7a0cbed12", properties["ProductLicenseProductId"]);
+        Assert.Equal(
+            "0cc6a91abed05fae671c4635e8903b9f2db3e6931b72bdad907b57840d7f97fa",
+            properties["ProductIconSha256"]);
     }
 
     [Fact]
@@ -280,6 +283,20 @@ public sealed class ProductIdentityTests
         Assert.NotEqual(0, result.ExitCode);
     }
 
+    [Theory]
+    [InlineData("0CC6A91ABED05FAE671C4635E8903B9F2DB3E6931B72BDAD907B57840D7F97FA")]
+    [InlineData("xyz")]
+    [InlineData("0cc6a91abed05fae671c4635e8903b9f2db3e6931b72bdad907b57840d7f97f")]
+    public async Task LoaderRejectsNonCanonicalProductIconSha256(string value)
+    {
+        var result = await RunGeneratorWithOverridesAsync(new Dictionary<string, string>
+        {
+            ["ProductIconSha256"] = value,
+        });
+
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
     [Fact]
     public async Task EvaluatedProductionMsBuildIdentityMatchesCanonicalSource()
     {
@@ -345,6 +362,10 @@ public sealed class ProductIdentityTests
             Assert.Contains($"internal const string Description = \"{expectedEscapedDescription}\";", mainCSharp, StringComparison.Ordinal);
             Assert.Contains("productDisplayName          = \"{ProductDescription}\"", go, StringComparison.Ordinal);
             Assert.Contains($"productDescription          = \"{expectedEscapedDescription}\"", go, StringComparison.Ordinal);
+            Assert.Contains(
+                "productIconSHA256           = \"0cc6a91abed05fae671c4635e8903b9f2db3e6931b72bdad907b57840d7f97fa\"",
+                go,
+                StringComparison.Ordinal);
 
             var compileResult = await CompileGeneratedCSharpAsync(fixtureRoot, mainCSharpPath);
             Assert.True(compileResult.ExitCode == 0, compileResult.Output);

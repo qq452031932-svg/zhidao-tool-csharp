@@ -36,8 +36,9 @@ type fixtureAsset struct {
 }
 
 const (
-	fixtureLayoutLegacy  = "legacy"
-	fixtureLayoutRenamed = "renamed"
+	fixtureLayoutLegacy      = "legacy"
+	fixtureLayoutRenamed     = "renamed"
+	fixtureProductIconSHA256 = "0cc6a91abed05fae671c4635e8903b9f2db3e6931b72bdad907b57840d7f97fa"
 )
 
 type bundleFixture struct {
@@ -180,6 +181,9 @@ func makeNupkg(t *testing.T, version, kind, packageChannel, layout, baseLayout s
 			entries["lib/app/"+productLegacyExecutableName] = makeSetupImage()
 		}
 		entries["lib/app/Squirrel.exe"] = makeSetupImage()
+		if layout == fixtureLayoutRenamed {
+			entries["setup.ico"] = canonicalProductIcon(t)
+		}
 	} else {
 		if baseLayout == fixtureLayoutLegacy {
 			entries["lib/app/"+productLegacyExecutableName+".diff"] = []byte("real patch bytes")
@@ -213,7 +217,24 @@ func makePortable(t *testing.T, version, packageChannel string) []byte {
 }
 
 func packageMetadata(version, packageChannel, mainExecutable string) string {
-	return fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?><package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd"><metadata><id>%s</id><version>%s</version><channel>%s</channel><mainExe>%s</mainExe><os>win</os><rid>win-x64</rid><machineArchitecture>x64</machineArchitecture></metadata></package>`, packageID, version, packageChannel, mainExecutable)
+	title, description := productDisplayName, productDescription
+	if mainExecutable == productLegacyExecutableName {
+		title, description = packageID, packageID
+	}
+	return fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?><package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd"><metadata><id>%s</id><version>%s</version><title>%s</title><description>%s</description><authors>%s</authors><channel>%s</channel><mainExe>%s</mainExe><os>win</os><rid>win-x64</rid><machineArchitecture>x64</machineArchitecture></metadata></package>`, packageID, version, title, description, packageID, packageChannel, mainExecutable)
+}
+
+func canonicalProductIcon(t *testing.T) []byte {
+	t.Helper()
+	path := filepath.Join("..", "..", "..", "..", "src", "BaiduBatchTransfer.App", "Assets", "Branding", productMainAssemblyName+".ico")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read canonical product icon: %v", err)
+	}
+	if actual := sha256Hex(data); actual != fixtureProductIconSHA256 {
+		t.Fatalf("canonical product icon SHA-256 = %s, want %s", actual, fixtureProductIconSHA256)
+	}
+	return data
 }
 
 func zipBytes(t *testing.T, entries map[string][]byte) []byte {
@@ -380,6 +401,165 @@ func TestValidatorAcceptsExactProductionClosureAndReportsCurrentVersion(t *testi
 	}
 	if len(report.Files) != len(fixture.files)-2 || report.PublisherSPKISHA256 == "" {
 		t.Fatalf("report files/trust = %#v", report)
+	}
+}
+
+func TestValidatorRequiresExactNuspecBrandingAndArchitecture(t *testing.T) {
+	tests := []struct {
+		name        string
+		packageName string
+		oldValue    string
+		newValue    string
+	}{
+		{"current Full title", packageID + "-1.2.3-full.nupkg", "<title>" + productDisplayName + "</title>", "<title>wrong</title>"},
+		{"current Full description", packageID + "-1.2.3-full.nupkg", "<description>" + productDescription + "</description>", "<description>wrong</description>"},
+		{"current Full authors", packageID + "-1.2.3-full.nupkg", "<authors>" + packageID + "</authors>", "<authors>wrong</authors>"},
+		{"current Full architecture", packageID + "-1.2.3-full.nupkg", "<machineArchitecture>x64</machineArchitecture>", "<machineArchitecture>arm64</machineArchitecture>"},
+		{"current Delta title", packageID + "-1.2.3-delta.nupkg", "<title>" + productDisplayName + "</title>", "<title>wrong</title>"},
+		{"current Delta description", packageID + "-1.2.3-delta.nupkg", "<description>" + productDescription + "</description>", "<description>wrong</description>"},
+		{"current Delta authors", packageID + "-1.2.3-delta.nupkg", "<authors>" + packageID + "</authors>", "<authors>wrong</authors>"},
+		{"current Delta architecture", packageID + "-1.2.3-delta.nupkg", "<machineArchitecture>x64</machineArchitecture>", "<machineArchitecture>arm64</machineArchitecture>"},
+		{"historical legacy title", packageID + "-1.2.2-full.nupkg", "<title>" + packageID + "</title>", "<title>wrong</title>"},
+		{"historical legacy description", packageID + "-1.2.2-full.nupkg", "<description>" + packageID + "</description>", "<description>wrong</description>"},
+		{"historical legacy authors", packageID + "-1.2.2-full.nupkg", "<authors>" + packageID + "</authors>", "<authors>wrong</authors>"},
+		{"historical legacy architecture", packageID + "-1.2.2-full.nupkg", "<machineArchitecture>x64</machineArchitecture>", "<machineArchitecture>x86</machineArchitecture>"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newBundleFixture(t, "1.2.3", true)
+			entries := readZipBytes(t, fixture.files[test.packageName])
+			metadataName := packageID + ".nuspec"
+			updated := bytes.Replace(entries[metadataName], []byte(test.oldValue), []byte(test.newValue), 1)
+			if bytes.Equal(updated, entries[metadataName]) {
+				t.Fatalf("fixture metadata did not contain %q", test.oldValue)
+			}
+			entries[metadataName] = updated
+			fixture.replaceReleaseAsset(test.packageName, zipBytes(t, entries))
+			if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+				t.Fatalf("error = %v, want %v", err, ErrMetadata)
+			}
+		})
+	}
+}
+
+func TestValidatorRequiresCanonicalIconInCurrentRenamedFull(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(map[string][]byte)
+	}{
+		{"missing", func(entries map[string][]byte) { delete(entries, "setup.ico") }},
+		{"wrong bytes", func(entries map[string][]byte) {
+			entries["setup.ico"] = append([]byte(nil), canonicalProductIcon(t)[:64]...)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newBundleFixture(t, "1.2.3", false)
+			name := packageID + "-1.2.3-full.nupkg"
+			entries := readZipBytes(t, fixture.files[name])
+			test.edit(entries)
+			fixture.replaceReleaseAsset(name, zipBytes(t, entries))
+			if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+				t.Fatalf("error = %v, want %v", err, ErrMetadata)
+			}
+		})
+	}
+}
+
+func TestValidatorAcceptsPairedEmptyDeltaPlaceholderForUnchangedNonCriticalFile(t *testing.T) {
+	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
+		{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutRenamed},
+	})
+	name := packageID + "-1.2.4-delta.nupkg"
+	entries := readZipBytes(t, fixture.files[name])
+	entries["lib/app/Squirrel.exe.diff"] = []byte{}
+	entries["lib/app/Squirrel.exe.shasum"] = []byte{}
+	fixture.replaceReleaseAsset(name, zipBytes(t, entries))
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidatorAcceptsKnownManagedHelperExecutablePatch(t *testing.T) {
+	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
+		{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
+		{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutRenamed},
+	})
+	const helper = "lib/app/managed-browser-helper/python.exe"
+	for _, version := range []string{"1.2.3", "1.2.4"} {
+		name := packageID + "-" + version + "-full.nupkg"
+		entries := readZipBytes(t, fixture.files[name])
+		entries[helper] = makeSetupImage()
+		fixture.replaceReleaseAsset(name, zipBytes(t, entries))
+	}
+	deltaName := packageID + "-1.2.4-delta.nupkg"
+	entries := readZipBytes(t, fixture.files[deltaName])
+	entries[helper+".zsdiff"] = []byte("helper patch")
+	entries[helper+".shasum"] = []byte("target")
+	fixture.replaceReleaseAsset(deltaName, zipBytes(t, entries))
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidatorRejectsUnsafeEmptyDeltaPlaceholders(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*bundleFixture, map[string][]byte)
+	}{
+		{"identity critical", func(_ *bundleFixture, entries map[string][]byte) {
+			entries["lib/app/"+productMainExecutableName+".diff"] = []byte{}
+			entries["lib/app/"+productMainExecutableName+".shasum"] = []byte{}
+		}},
+		{"patch only empty", func(_ *bundleFixture, entries map[string][]byte) {
+			entries["lib/app/Squirrel.exe.diff"] = []byte{}
+			entries["lib/app/Squirrel.exe.shasum"] = []byte("not empty")
+		}},
+		{"shasum only empty", func(_ *bundleFixture, entries map[string][]byte) {
+			entries["lib/app/Squirrel.exe.diff"] = []byte("not empty")
+			entries["lib/app/Squirrel.exe.shasum"] = []byte{}
+		}},
+		{"missing from Full packages", func(_ *bundleFixture, entries map[string][]byte) {
+			entries["lib/app/not-present.txt.diff"] = []byte{}
+			entries["lib/app/not-present.txt.shasum"] = []byte{}
+		}},
+		{"changed in current Full", func(fixture *bundleFixture, entries map[string][]byte) {
+			currentName := packageID + "-1.2.4-full.nupkg"
+			currentEntries := readZipBytes(t, fixture.files[currentName])
+			currentEntries["lib/app/Squirrel.exe"] = append(currentEntries["lib/app/Squirrel.exe"], byte(1))
+			fixture.replaceReleaseAsset(currentName, zipBytes(t, currentEntries))
+			entries["lib/app/Squirrel.exe.diff"] = []byte{}
+			entries["lib/app/Squirrel.exe.shasum"] = []byte{}
+		}},
+		{"direct and placeholder", func(_ *bundleFixture, entries map[string][]byte) {
+			entries["lib/app/Squirrel.exe"] = makeSetupImage()
+			entries["lib/app/Squirrel.exe.diff"] = []byte{}
+			entries["lib/app/Squirrel.exe.shasum"] = []byte{}
+		}},
+		{"both patch encodings", func(_ *bundleFixture, entries map[string][]byte) {
+			entries["lib/app/Squirrel.exe.diff"] = []byte{}
+			entries["lib/app/Squirrel.exe.zsdiff"] = []byte{}
+			entries["lib/app/Squirrel.exe.shasum"] = []byte{}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
+				{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+				{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
+				{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutRenamed},
+			})
+			name := packageID + "-1.2.4-delta.nupkg"
+			entries := readZipBytes(t, fixture.files[name])
+			test.edit(fixture, entries)
+			fixture.replaceReleaseAsset(name, zipBytes(t, entries))
+			if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+				t.Fatalf("error = %v, want %v", err, ErrMetadata)
+			}
+		})
 	}
 }
 

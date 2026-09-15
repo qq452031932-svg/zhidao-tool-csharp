@@ -386,6 +386,21 @@ public sealed class OtaBuildConfigurationTests
                 "PackageId=SuperPan.BaiduBatchTransfer",
                 "UpdateChannel=win-x64-stable",
             ]);
+        data.Add(
+            [
+                "VersionPrefix=1.2.3",
+                "UpdateFeedUrl=https://updates.example.test/stable/",
+                "PackageId=SuperPan.BaiduBatchTransfer",
+                "UpdateChannel=win-x64-stable",
+            ]);
+        data.Add(
+            [
+                "VersionPrefix=1.2.3",
+                "UpdateFeedUrl=https://updates.example.test/stable/",
+                "PackageId=SuperPan.BaiduBatchTransfer",
+                "UpdateChannel=win-x64-stable",
+                "_UpdateFeedUrlIsApprovedProduction=True",
+            ]);
         return data;
     }
 
@@ -396,7 +411,7 @@ public sealed class OtaBuildConfigurationTests
         data.Add(
             [
                 "VersionPrefix=1.2.3",
-                "UpdateFeedUrl=https://updates.example.test/stable/",
+                "UpdateFeedUrl=https://ota.fanfh.cn/releases/win-x64/stable/",
                 "PackageId=SuperPan.BaiduBatchTransfer",
                 "UpdateChannel=win-x64-stable",
             ]);

@@ -102,6 +102,10 @@ public sealed class LegacyLauncherIntegrationTests
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2));
         Assert.True(SpinWait.SpinUntil(() => File.Exists(output), TimeSpan.FromSeconds(5)));
         Assert.Equal(forwarded, JsonSerializer.Deserialize<string[]>(File.ReadAllText(output)));
+        Assert.Equal(
+            Path.GetFullPath(Environment.CurrentDirectory),
+            Path.GetFullPath(File.ReadAllText(output + ".cwd")),
+            ignoreCase: true);
         Assert.False(File.Exists(output + ".done"));
         Assert.True(SpinWait.SpinUntil(() => File.Exists(output + ".done"), TimeSpan.FromSeconds(5)));
         Assert.True(WaitForProbeExit(output), "Probe process did not exit in time.");

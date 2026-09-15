@@ -151,6 +151,7 @@ $go = @(
     ("`tproductPackageID            = `"{0}`"" -f $goValues.ProductPackageId)
     ("`tproductDataDirectoryName    = `"{0}`"" -f $goValues.ProductDataDirectoryName)
     ("`tproductLicenseProductID     = `"{0}`"" -f $goValues.ProductLicenseProductId)
+    ("`tproductIconSHA256           = `"{0}`"" -f $goValues.ProductIconSha256)
     ')'
 ) -join "`n"
 $go += "`n"

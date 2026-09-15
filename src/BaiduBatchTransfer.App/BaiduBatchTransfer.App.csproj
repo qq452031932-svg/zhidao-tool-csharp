@@ -1,5 +1,5 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk"
-         TreatAsLocalProperty="_ExpectedProductVersion;_ExpectedInformationalVersion;_ExpectedFileVersion;_VersionPrefixIsValid;_ExpectedProductMajor;_ExpectedAssemblyVersion;_UpdateFeedUrlIsValid;_AcceptanceFeedIsAbsolute;LicenseRuntimeMode">
+         TreatAsLocalProperty="_ExpectedProductVersion;_ExpectedInformationalVersion;_ExpectedFileVersion;_VersionPrefixIsValid;_ExpectedProductMajor;_ExpectedAssemblyVersion;_UpdateFeedUrlIsValid;_UpdateFeedUrlIsApprovedProduction;_AcceptanceFeedIsAbsolute;LicenseRuntimeMode">
 
   <Import Project="..\..\eng\ProductIdentity.props" />
 
@@ -46,6 +46,8 @@
 
   <PropertyGroup>
     <_UpdateFeedUrlIsValid Condition="'$(UpdateFeedUrl)' != ''">$([System.Text.RegularExpressions.Regex]::IsMatch('$(UpdateFeedUrl)', '(?i)^https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*(?::(?:[0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:/[^?#\s]*)?$'))</_UpdateFeedUrlIsValid>
+    <_UpdateFeedUrlIsApprovedProduction>False</_UpdateFeedUrlIsApprovedProduction>
+    <_UpdateFeedUrlIsApprovedProduction Condition="'$(UpdateFeedUrl)' == 'https://ota.fanfh.cn/releases/win-x64/stable/'">True</_UpdateFeedUrlIsApprovedProduction>
     <_AcceptanceFeedIsAbsolute Condition="'$(OtaAcceptanceFeedPath)' != ''">$([System.IO.Path]::IsPathFullyQualified('$(OtaAcceptanceFeedPath)'))</_AcceptanceFeedIsAbsolute>
     <_LicenseServiceUrlIsAcceptanceLoopback Condition="'$(LicenseServiceUrl)' != ''">$([System.Text.RegularExpressions.Regex]::IsMatch('$(LicenseServiceUrl)', '^http://127\.0\.0\.1(?::[0-9]{1,5})?/?$'))</_LicenseServiceUrlIsAcceptanceLoopback>
     <_LicenseAcceptanceConfigIsAbsolute Condition="'$(LicenseAcceptanceConfigPath)' != ''">$([System.IO.Path]::IsPathFullyQualified('$(LicenseAcceptanceConfigPath)'))</_LicenseAcceptanceConfigIsAbsolute>
@@ -282,6 +284,8 @@ public sealed class ValidateLicenseProductionTrust : Task
            Text="OTA production builds require the dedicated production package ID." />
     <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(UpdateFeedUrl)' != '' and '$(_UpdateFeedUrlIsValid)' != 'True'"
            Text="OTA production feed must be an absolute HTTPS URL without credentials, query, or fragment." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(UpdateFeedUrl)' != '' and '$(_UpdateFeedUrlIsApprovedProduction)' != 'True'"
+           Text="OTA production feed must be the exact approved production URL." />
     <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(UpdateChannel)' != 'win-x64-stable'"
            Text="OTA production builds require the win-x64-stable channel." />
   </Target>

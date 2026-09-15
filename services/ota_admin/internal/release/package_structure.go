@@ -3,7 +3,10 @@ package release
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -34,6 +37,9 @@ type nuspecDocument struct {
 type nuspecMetadata struct {
 	ID                  []string `xml:"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd id"`
 	Version             []string `xml:"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd version"`
+	Title               []string `xml:"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd title"`
+	Description         []string `xml:"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd description"`
+	Authors             []string `xml:"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd authors"`
 	Channel             []string `xml:"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd channel"`
 	MainExecutable      []string `xml:"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd mainExe"`
 	OS                  []string `xml:"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd os"`
@@ -73,7 +79,7 @@ const (
 	packageLayoutRenamed
 )
 
-func classifyFullPackageStructure(file *verifiedFile, expectedVersion string) (packageLayout, error) {
+func classifyFullPackageStructure(file *verifiedFile, expectedVersion string, current bool) (packageLayout, error) {
 	inner, err := openInnerArchive(file)
 	if err != nil {
 		return 0, err
@@ -84,6 +90,11 @@ func classifyFullPackageStructure(file *verifiedFile, expectedVersion string) (p
 		return packageLayoutLegacy, nil
 	}
 	if renamedErr == nil && legacyErr != nil {
+		if current {
+			if err := validateCanonicalPackageIcon(inner); err != nil {
+				return 0, err
+			}
+		}
 		return packageLayoutRenamed, nil
 	}
 	return 0, errors.New("Full package does not match exactly one supported application layout")
@@ -109,7 +120,11 @@ func validateFullLayout(inner *innerArchive, expectedVersion string, layout pack
 			"lib/app/Squirrel.exe",
 		}
 	}
-	if err := validatePackageEnvelope(inner, expectedVersion, mainExecutable); err != nil {
+	expectedTitle, expectedDescription := packageID, packageID
+	if layout == packageLayoutRenamed {
+		expectedTitle, expectedDescription = productDisplayName, productDescription
+	}
+	if err := validatePackageEnvelope(inner, expectedVersion, mainExecutable, expectedTitle, expectedDescription); err != nil {
 		return err
 	}
 	for _, required := range []string{
@@ -142,16 +157,16 @@ func validateFullLayout(inner *innerArchive, expectedVersion string, layout pack
 	})
 }
 
-func validatePackageEnvelope(inner *innerArchive, expectedVersion, mainExecutable string) error {
+func validatePackageEnvelope(inner *innerArchive, expectedVersion, mainExecutable, expectedTitle, expectedDescription string) error {
 	for _, required := range []string{"[Content_Types].xml", "_rels/.rels", packageID + ".nuspec"} {
 		if _, ok := inner.entries[required]; !ok {
 			return fmt.Errorf("package is missing %s", required)
 		}
 	}
-	return validateNuspec(inner.entries[packageID+".nuspec"], expectedVersion, mainExecutable, false)
+	return validateNuspec(inner.entries[packageID+".nuspec"], expectedVersion, mainExecutable, expectedTitle, expectedDescription)
 }
 
-func validateDeltaPackageStructure(file *verifiedFile, expectedVersion string, baseLayout, targetLayout packageLayout) error {
+func validateDeltaPackageStructure(file *verifiedFile, expectedVersion string, baseFull, currentFull *verifiedFile, baseLayout, targetLayout packageLayout) error {
 	inner, err := openInnerArchive(file)
 	if err != nil {
 		return err
@@ -159,16 +174,29 @@ func validateDeltaPackageStructure(file *verifiedFile, expectedVersion string, b
 	if targetLayout != packageLayoutRenamed || (baseLayout != packageLayoutLegacy && baseLayout != packageLayoutRenamed) {
 		return errors.New("Delta package layout transition is unsupported")
 	}
-	if err := validatePackageEnvelope(inner, expectedVersion, productMainExecutableName); err != nil {
+	if err := validatePackageEnvelope(inner, expectedVersion, productMainExecutableName, productDisplayName, productDescription); err != nil {
 		return err
+	}
+	if baseFull == nil || currentFull == nil {
+		return errors.New("Delta package has no exact Full-package base and target")
+	}
+	baseInner, err := openInnerArchive(baseFull)
+	if err != nil {
+		return fmt.Errorf("Delta base Full package is invalid: %w", err)
+	}
+	currentInner, err := openInnerArchive(currentFull)
+	if err != nil {
+		return fmt.Errorf("Delta current Full package is invalid: %w", err)
 	}
 	allowedPatchExecutables := map[string]struct{}{
 		"lib/app/" + productMainExecutableName:                      {},
 		"lib/app/" + productMainAssemblyName + "_ExecutionStub.exe": {},
 		"lib/app/" + productLegacyExecutableName:                    {},
 		"lib/app/Squirrel.exe":                                      {},
+		"lib/app/managed-browser-helper/python.exe":                 {},
+		"lib/app/managed-browser-helper/pythonw.exe":                {},
 	}
-	patches, err := validateDeltaPatches(inner, allowedPatchExecutables)
+	patches, err := validateDeltaPatches(inner, allowedPatchExecutables, baseInner, currentInner)
 	if err != nil {
 		return err
 	}
@@ -233,8 +261,16 @@ func appendPresentExecutables(inner *innerArchive, required []string, names ...s
 	return required
 }
 
-func validateDeltaPatches(inner *innerArchive, allowedExecutableBases map[string]struct{}) (map[string]struct{}, error) {
+func validateDeltaPatches(inner *innerArchive, allowedExecutableBases map[string]struct{}, baseFull, currentFull *innerArchive) (map[string]struct{}, error) {
 	patches := make(map[string]struct{})
+	identityCritical := map[string]struct{}{
+		"lib/app/" + productLegacyExecutableName:                     {},
+		"lib/app/" + productMainExecutableName:                       {},
+		"lib/app/" + productMainDLLName:                              {},
+		"lib/app/" + productMainAssemblyName + ".deps.json":          {},
+		"lib/app/" + productMainAssemblyName + ".runtimeconfig.json": {},
+		"lib/app/" + productMainAssemblyName + "_ExecutionStub.exe":  {},
+	}
 	for name, entry := range inner.entries {
 		base := ""
 		if strings.HasPrefix(name, "lib/app/") && strings.HasSuffix(name, ".zsdiff") {
@@ -248,11 +284,23 @@ func validateDeltaPatches(inner *innerArchive, allowedExecutableBases map[string
 		if _, duplicate := patches[base]; duplicate {
 			return nil, fmt.Errorf("Delta package has multiple patches for %s", base)
 		}
-		if entry.UncompressedSize64 == 0 || inner.entries[base+".shasum"] == nil {
-			return nil, fmt.Errorf("Delta patch is empty or has no shasum: %s", name)
-		}
 		if _, direct := inner.entries[base]; direct {
 			return nil, fmt.Errorf("Delta package both replaces and patches %s", base)
+		}
+		shasum := inner.entries[base+".shasum"]
+		if shasum == nil {
+			return nil, fmt.Errorf("Delta patch has no shasum: %s", name)
+		}
+		if entry.UncompressedSize64 == 0 || shasum.UncompressedSize64 == 0 {
+			if _, critical := identityCritical[base]; critical {
+				return nil, fmt.Errorf("Delta package identity-critical patch payload is empty: %s", base)
+			}
+			if entry.UncompressedSize64 != 0 || shasum.UncompressedSize64 != 0 {
+				return nil, fmt.Errorf("Delta package placeholder patch and shasum must both be empty: %s", base)
+			}
+			if err := validateEmptyDeltaPlaceholder(base, baseFull, currentFull); err != nil {
+				return nil, err
+			}
 		}
 		if strings.HasSuffix(strings.ToLower(base), ".exe") {
 			if _, allowed := allowedExecutableBases[base]; !allowed {
@@ -261,7 +309,55 @@ func validateDeltaPatches(inner *innerArchive, allowedExecutableBases map[string
 		}
 		patches[base] = struct{}{}
 	}
+	for name, entry := range inner.entries {
+		if !strings.HasPrefix(name, "lib/app/") || !strings.HasSuffix(name, ".shasum") || entry.UncompressedSize64 != 0 {
+			continue
+		}
+		base := strings.TrimSuffix(name, ".shasum")
+		_, diff := inner.entries[base+".diff"]
+		_, zsdiff := inner.entries[base+".zsdiff"]
+		if diff == zsdiff {
+			return nil, fmt.Errorf("Delta package empty shasum is not paired with exactly one patch: %s", name)
+		}
+	}
 	return patches, nil
+}
+
+func validateEmptyDeltaPlaceholder(base string, baseFull, currentFull *innerArchive) error {
+	baseEntry := baseFull.entries[base]
+	currentEntry := currentFull.entries[base]
+	if baseEntry == nil || currentEntry == nil {
+		return fmt.Errorf("Delta package empty placeholder has no exact Full-package base and target: %s", base)
+	}
+	if baseEntry.UncompressedSize64 != currentEntry.UncompressedSize64 {
+		return fmt.Errorf("Delta package empty placeholder refers to changed Full-package content: %s", base)
+	}
+	baseHash, err := zipEntrySHA1(baseEntry)
+	if err != nil {
+		return fmt.Errorf("Delta package base Full target is unreadable: %s", base)
+	}
+	currentHash, err := zipEntrySHA1(currentEntry)
+	if err != nil {
+		return fmt.Errorf("Delta package current Full target is unreadable: %s", base)
+	}
+	if baseHash != currentHash {
+		return fmt.Errorf("Delta package empty placeholder refers to changed Full-package content: %s", base)
+	}
+	return nil
+}
+
+func zipEntrySHA1(entry *zip.File) (string, error) {
+	stream, err := entry.Open()
+	if err != nil {
+		return "", err
+	}
+	defer stream.Close()
+	hash := sha1.New()
+	written, err := io.Copy(hash, stream)
+	if err != nil || written < 0 || uint64(written) != entry.UncompressedSize64 {
+		return "", errors.New("ZIP entry length or checksum differs")
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func validatePortableStructure(file *verifiedFile, expectedVersion string) error {
@@ -280,7 +376,7 @@ func validatePortableStructure(file *verifiedFile, expectedVersion string) error
 			return fmt.Errorf("Portable archive is missing %s", required)
 		}
 	}
-	if err := validateNuspec(inner.entries["current/sq.version"], expectedVersion, productMainExecutableName, true); err != nil {
+	if err := validateNuspec(inner.entries["current/sq.version"], expectedVersion, productMainExecutableName, productDisplayName, productDescription); err != nil {
 		return err
 	}
 	return validateExecutableSet(inner, []string{
@@ -580,7 +676,7 @@ func isASCIIAlpha(value byte) bool {
 	return value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
 }
 
-func validateNuspec(entry *zip.File, expectedVersion, expectedMainExecutable string, requireMachineArchitecture bool) error {
+func validateNuspec(entry *zip.File, expectedVersion, expectedMainExecutable, expectedTitle, expectedDescription string) error {
 	data, err := readZipEntry(entry, maxNuspecBytes)
 	if err != nil {
 		return errors.New("package metadata is oversized or unreadable")
@@ -606,12 +702,24 @@ func validateNuspec(entry *zip.File, expectedVersion, expectedMainExecutable str
 	}
 	metadata := document.Metadata[0]
 	if !exactSingle(metadata.ID, packageID) || !exactSingle(metadata.Version, expectedVersion) || !exactSingle(metadata.Channel, channel) ||
-		!exactSingle(metadata.MainExecutable, expectedMainExecutable) || !exactSingle(metadata.OS, "win") || !exactSingle(metadata.RID, "win-x64") {
+		!exactSingle(metadata.MainExecutable, expectedMainExecutable) || !exactSingle(metadata.OS, "win") || !exactSingle(metadata.RID, "win-x64") ||
+		!exactSingle(metadata.Title, expectedTitle) || !exactSingle(metadata.Description, expectedDescription) || !exactSingle(metadata.Authors, packageID) {
 		return errors.New("package metadata identity, version, channel, or RID differs")
 	}
-	if requireMachineArchitecture && !exactSingle(metadata.MachineArchitecture, "x64") ||
-		!requireMachineArchitecture && (len(metadata.MachineArchitecture) > 1 || len(metadata.MachineArchitecture) == 1 && metadata.MachineArchitecture[0] != "x64") {
+	if !exactSingle(metadata.MachineArchitecture, "x64") {
 		return errors.New("package metadata machine architecture differs")
+	}
+	return nil
+}
+
+func validateCanonicalPackageIcon(inner *innerArchive) error {
+	data, err := readZipEntry(inner.entries["setup.ico"], 16<<20)
+	if err != nil {
+		return errors.New("current Full package is missing or has an unreadable setup.ico")
+	}
+	digest := sha256.Sum256(data)
+	if hex.EncodeToString(digest[:]) != productIconSHA256 {
+		return errors.New("current Full package setup.ico differs from the product identity contract")
 	}
 	return nil
 }

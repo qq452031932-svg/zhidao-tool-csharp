@@ -71,6 +71,7 @@ function Get-ProductIdentity {
         'ProductPackageId',
         'ProductDataDirectoryName',
         'ProductLicenseProductId'
+        'ProductIconSha256'
     )
     $rootElements = @($document.Root.Elements())
     if ($rootElements.Count -ne 1) {
@@ -139,6 +140,9 @@ function Get-ProductIdentity {
     $licenseProductId = [guid]::Empty
     if (-not [guid]::TryParseExact($values.ProductLicenseProductId, 'D', [ref]$licenseProductId)) {
         throw [System.IO.InvalidDataException]::new('ProductLicenseProductId must be a canonical GUID.')
+    }
+    if ($values.ProductIconSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw [System.IO.InvalidDataException]::new('ProductIconSha256 must be a lowercase SHA-256 value.')
     }
 
     return [pscustomobject]$values

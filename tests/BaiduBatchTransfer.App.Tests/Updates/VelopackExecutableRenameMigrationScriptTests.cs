@@ -92,6 +92,8 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
     {
         var script = ReadScript();
 
+        Assert.Contains("$script:RequiredVelopackUpdaterVersion = '1.2.0'", script, StringComparison.Ordinal);
+        Assert.Contains("Assert-ExactThreePartVersion -Executable $updater -Expected $script:RequiredVelopackUpdaterVersion", script, StringComparison.Ordinal);
         Assert.DoesNotContain("'perform-upgrade'", script, StringComparison.Ordinal);
         Assert.Contains("MigrationContainedRunner", script, StringComparison.Ordinal);
         Assert.Contains("CREATE_SUSPENDED", script, StringComparison.Ordinal);

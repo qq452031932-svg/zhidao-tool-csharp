@@ -164,7 +164,7 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 		if *asset.Type != "Full" {
 			continue
 		}
-		layout, layoutErr := classifyFullPackageStructure(files[*asset.FileName], *asset.Version)
+		layout, layoutErr := classifyFullPackageStructure(files[*asset.FileName], *asset.Version, *asset.Version == currentVersion)
 		if layoutErr != nil {
 			return Report{}, fmt.Errorf("%w: %s: %v", ErrMetadata, *asset.FileName, layoutErr)
 		}
@@ -180,12 +180,14 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 	currentParsed, _ := parseVersion(currentVersion)
 	baseVersion := version{}
 	baseLayout := packageLayout(0)
+	baseFullName := ""
 	for _, full := range fullAssets {
 		if full.parsed.compare(currentParsed) >= 0 || baseLayout != 0 && full.parsed.compare(baseVersion) <= 0 {
 			continue
 		}
 		baseVersion = full.parsed
 		baseLayout = fullLayouts[*releaseFiles[full.name].Version]
+		baseFullName = full.name
 	}
 	for _, asset := range feed.Assets {
 		if *asset.Type != "Delta" {
@@ -194,7 +196,8 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 		if *asset.Version != currentVersion {
 			return Report{}, fmt.Errorf("%w: historical Delta packages are not allowed", ErrMetadata)
 		}
-		if err := validateDeltaPackageStructure(files[*asset.FileName], *asset.Version, baseLayout, currentLayout); err != nil {
+		currentFullName := fmt.Sprintf("%s-%s-full.nupkg", packageID, currentVersion)
+		if err := validateDeltaPackageStructure(files[*asset.FileName], *asset.Version, files[baseFullName], files[currentFullName], baseLayout, currentLayout); err != nil {
 			return Report{}, fmt.Errorf("%w: %s: %v", ErrMetadata, *asset.FileName, err)
 		}
 	}

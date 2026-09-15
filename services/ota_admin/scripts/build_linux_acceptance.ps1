@@ -22,8 +22,8 @@ Assert-NoUntrackedModuleFiles
 function Get-AcceptanceSourcePaths {
     [string[]] $paths = @(Get-TrackedSourcePaths)
     $fixtures = [ordered]@{
-        'services/ota_admin/cmd/ota-admin-acceptance/testdata/valid-upload.zip' = @('007430324b90fff97b835b46e4b51c5a9e31502f', '30b96617dfb888b5ce6daf0e8d3b7bd2b1a94c09d37021919d0b313720148916')
-        'services/ota_admin/cmd/ota-admin-acceptance/testdata/publisher.cer' = @('86d490d04699624c2f5504acbed7fe499a20ae10', 'eed6657913e5bf86caac9b8f23928648b83a50b9b06f1e2c738cbb2a13dbc2d5')
+        'services/ota_admin/cmd/ota-admin-acceptance/testdata/valid-upload.zip' = @('66ae377c458123e21316288ecd9fbf10b70e28f0', 'f316baa2bca7f1aca3daf3ef15d00a0d60f4ecfb2ef72e05c95fd09d4db640a7')
+        'services/ota_admin/cmd/ota-admin-acceptance/testdata/publisher.cer' = @('e059776cbe3cbd63e41ce52a6f5b8883a32e355a', '5493930ce96ebeed969a53274bc1ea0df117ec9686f603948c39c6102d2c79b0')
     }
     foreach ($path in $fixtures.Keys) {
         $blob = (& git -C $RepositoryRoot rev-parse "HEAD:$path") -join "`n"
@@ -41,8 +41,8 @@ New-Item -ItemType Directory -Path $AcceptanceStagingDirectory | Out-Null
 try {
     New-GitObjectSourceSnapshot -SourcePaths $acceptanceSourcePaths -DestinationRoot $AcceptanceSnapshotDirectory
     $snapshotFixtures = [ordered]@{
-        'cmd/ota-admin-acceptance/testdata/valid-upload.zip' = '30b96617dfb888b5ce6daf0e8d3b7bd2b1a94c09d37021919d0b313720148916'
-        'cmd/ota-admin-acceptance/testdata/publisher.cer' = 'eed6657913e5bf86caac9b8f23928648b83a50b9b06f1e2c738cbb2a13dbc2d5'
+        'cmd/ota-admin-acceptance/testdata/valid-upload.zip' = 'f316baa2bca7f1aca3daf3ef15d00a0d60f4ecfb2ef72e05c95fd09d4db640a7'
+        'cmd/ota-admin-acceptance/testdata/publisher.cer' = '5493930ce96ebeed969a53274bc1ea0df117ec9686f603948c39c6102d2c79b0'
     }
     foreach ($relativePath in $snapshotFixtures.Keys) {
         $fixturePath = Join-Path $AcceptanceSnapshotDirectory $relativePath

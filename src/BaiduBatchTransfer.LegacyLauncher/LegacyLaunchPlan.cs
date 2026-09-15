@@ -23,19 +23,15 @@ public sealed class LegacyLaunchPlan
 
     private LegacyLaunchPlan(
         string targetPath,
-        string workingDirectory,
         IReadOnlyList<string> arguments)
     {
         TargetPath = targetPath;
-        WorkingDirectory = workingDirectory;
         _arguments = arguments.ToArray();
         WaitForExit = _arguments.Any(argument =>
             argument.StartsWith(VelopackArgumentPrefix, StringComparison.OrdinalIgnoreCase));
     }
 
     public string TargetPath { get; }
-
-    public string WorkingDirectory { get; }
 
     public IReadOnlyList<string> Arguments => Array.AsReadOnly(_arguments);
 
@@ -155,7 +151,7 @@ public sealed class LegacyLaunchPlan
                 return false;
             }
 
-            plan = new LegacyLaunchPlan(targetPath, launcherDirectory, arguments);
+            plan = new LegacyLaunchPlan(targetPath, arguments);
             return true;
         }
         catch (Exception exception) when (
@@ -171,7 +167,6 @@ public sealed class LegacyLaunchPlan
         var startInfo = new ProcessStartInfo
         {
             FileName = TargetPath,
-            WorkingDirectory = WorkingDirectory,
             UseShellExecute = false,
         };
 

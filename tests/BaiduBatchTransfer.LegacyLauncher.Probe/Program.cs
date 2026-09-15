@@ -11,6 +11,7 @@ var exitCode = int.Parse(args[2]);
 var forwardedArguments = args.Skip(3).ToArray();
 
 File.WriteAllText(outputPath + ".pid", Environment.ProcessId.ToString());
+File.WriteAllText(outputPath + ".cwd", Environment.CurrentDirectory);
 File.WriteAllText(outputPath, JsonSerializer.Serialize(forwardedArguments));
 Thread.Sleep(delayMilliseconds);
 File.WriteAllText(outputPath + ".done", "done");
