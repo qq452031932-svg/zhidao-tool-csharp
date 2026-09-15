@@ -201,6 +201,7 @@ func validateLegacyToRenamedDelta(inner *innerArchive, patches map[string]struct
 	if legacyReplacement {
 		requiredExecutables = append(requiredExecutables, legacyBase)
 	}
+	requiredExecutables = appendPresentExecutables(inner, requiredExecutables, "lib/app/Squirrel.exe")
 	return validateExecutableSet(inner, requiredExecutables, nil)
 }
 
@@ -211,40 +212,25 @@ func validateRenamedToRenamedDelta(inner *innerArchive, patches map[string]struc
 	if mainReplacement == mainPatch {
 		return errors.New("Delta package must replace or uniquely patch the renamed main executable")
 	}
-	legacyBase := "lib/app/" + productLegacyExecutableName
-	_, legacyReplacement := inner.entries[legacyBase]
-	_, legacyPatch := patches[legacyBase]
-	if (legacyReplacement || legacyPatch) && containsAllEntries(inner,
-		mainBase,
-		"lib/app/"+productMainAssemblyName+"_ExecutionStub.exe",
-		"lib/app/"+productMainDLLName,
-		"lib/app/"+productMainAssemblyName+".deps.json",
-		"lib/app/"+productMainAssemblyName+".runtimeconfig.json",
-	) {
-		return errors.New("Delta package replays a legacy-to-renamed migration against a renamed base")
-	}
 	requiredExecutables := []string(nil)
 	if mainReplacement {
 		requiredExecutables = append(requiredExecutables, mainBase)
 	}
-	for _, optionalExecutable := range []string{
-		"lib/app/" + productMainAssemblyName + "_ExecutionStub.exe",
-		"lib/app/" + productLegacyExecutableName,
-	} {
-		if _, present := inner.entries[optionalExecutable]; present {
-			requiredExecutables = append(requiredExecutables, optionalExecutable)
-		}
-	}
+	requiredExecutables = appendPresentExecutables(inner, requiredExecutables,
+		"lib/app/"+productMainAssemblyName+"_ExecutionStub.exe",
+		"lib/app/"+productLegacyExecutableName,
+		"lib/app/Squirrel.exe",
+	)
 	return validateExecutableSet(inner, requiredExecutables, nil)
 }
 
-func containsAllEntries(inner *innerArchive, names ...string) bool {
+func appendPresentExecutables(inner *innerArchive, required []string, names ...string) []string {
 	for _, name := range names {
-		if _, ok := inner.entries[name]; !ok {
-			return false
+		if _, present := inner.entries[name]; present {
+			required = append(required, name)
 		}
 	}
-	return true
+	return required
 }
 
 func validateDeltaPatches(inner *innerArchive, allowedExecutableBases map[string]struct{}) (map[string]struct{}, error) {

@@ -399,15 +399,86 @@ func TestValidatorAcceptsRenamedHistoricalFullAndRoutineCurrentDelta(t *testing.
 	}
 }
 
-func TestValidatorRejectsDeltaThatDoesNotMatchHighestLowerFullLayout(t *testing.T) {
+func TestValidatorAcceptsFullReplacementForRenamedBase(t *testing.T) {
 	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
 		{version: "1.2.2", kind: "Full", layout: fixtureLayoutLegacy},
 		{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
 		{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
 		{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutLegacy},
 	})
-	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
-		t.Fatalf("error = %v, want %v", err, ErrMetadata)
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidatorAcceptsDirectSquirrelInBothDeltaEpochs(t *testing.T) {
+	tests := []struct {
+		name    string
+		fixture func(*testing.T) *bundleFixture
+		version string
+	}{
+		{"legacy to renamed", func(t *testing.T) *bundleFixture { return newBundleFixture(t, "1.2.3", true) }, "1.2.3"},
+		{"renamed to renamed", func(t *testing.T) *bundleFixture {
+			return newBundleFixtureWithAssets(t, []fixtureAsset{
+				{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+				{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
+				{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutRenamed},
+			})
+		}, "1.2.4"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := test.fixture(t)
+			name := fmt.Sprintf("%s-%s-delta.nupkg", packageID, test.version)
+			entries := readZipBytes(t, fixture.files[name])
+			entries["lib/app/Squirrel.exe"] = makeSetupImage()
+			fixture.replaceReleaseAsset(name, zipBytes(t, entries))
+			if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestValidatorRejectsEmptyOrAmbiguousDirectSquirrelInDelta(t *testing.T) {
+	epochs := []struct {
+		name    string
+		fixture func(*testing.T) *bundleFixture
+		version string
+	}{
+		{"legacy to renamed", func(t *testing.T) *bundleFixture { return newBundleFixture(t, "1.2.3", true) }, "1.2.3"},
+		{"renamed to renamed", func(t *testing.T) *bundleFixture {
+			return newBundleFixtureWithAssets(t, []fixtureAsset{
+				{version: "1.2.3", kind: "Full", layout: fixtureLayoutRenamed},
+				{version: "1.2.4", kind: "Full", layout: fixtureLayoutRenamed},
+				{version: "1.2.4", kind: "Delta", layout: fixtureLayoutRenamed, baseLayout: fixtureLayoutRenamed},
+			})
+		}, "1.2.4"},
+	}
+	cases := []struct {
+		name string
+		edit func(map[string][]byte)
+	}{
+		{"empty Squirrel", func(entries map[string][]byte) { entries["lib/app/Squirrel.exe"] = []byte{} }},
+		{"direct and patch Squirrel", func(entries map[string][]byte) {
+			entries["lib/app/Squirrel.exe"] = makeSetupImage()
+			entries["lib/app/Squirrel.exe.diff"] = []byte("ambiguous patch")
+			entries["lib/app/Squirrel.exe.shasum"] = []byte(strings.Repeat("0", 64))
+		}},
+	}
+	for _, epoch := range epochs {
+		for _, test := range cases {
+			t.Run(epoch.name+"/"+test.name, func(t *testing.T) {
+				fixture := epoch.fixture(t)
+				name := fmt.Sprintf("%s-%s-delta.nupkg", packageID, epoch.version)
+				entries := readZipBytes(t, fixture.files[name])
+				test.edit(entries)
+				fixture.replaceReleaseAsset(name, zipBytes(t, entries))
+				if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+					t.Fatalf("error = %v, want %v", err, ErrMetadata)
+				}
+			})
+		}
 	}
 }
 
