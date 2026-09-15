@@ -11,7 +11,28 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$packageId = 'SuperPan.BaiduBatchTransfer'
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+. (Join-Path $PSScriptRoot 'ProductIdentity.ps1')
+$productIdentity = Get-ProductIdentity -Path (Join-Path $repoRoot 'eng\ProductIdentity.props')
+$productDisplayName = [string]$productIdentity.ProductDisplayName
+$productDescription = [string]$productIdentity.ProductDescription
+$productMainAssemblyName = [string]$productIdentity.ProductMainAssemblyName
+$productMainExecutableName = [string]$productIdentity.ProductMainExecutableName
+$productMainDllName = [string]$productIdentity.ProductMainDllName
+$productMainStem = [IO.Path]::GetFileNameWithoutExtension($productMainExecutableName)
+$productLegacyAssemblyName = [string]$productIdentity.ProductLegacyAssemblyName
+$productLegacyExecutableName = [string]$productIdentity.ProductLegacyExecutableName
+$productIconPath = [IO.Path]::GetFullPath((Join-Path $repoRoot (
+    'src\BaiduBatchTransfer.App\Assets\Branding\' + $productMainStem + '.ico')))
+$packageId = [string]$productIdentity.ProductPackageId
+if ($packageId -cne 'SuperPan.BaiduBatchTransfer' -or
+    $productLegacyExecutableName -cne 'BaiduBatchTransfer.App.exe') {
+    throw 'Product identity changed a stable OTA compatibility identifier.'
+}
+if (-not (Test-Path -LiteralPath $productIconPath -PathType Leaf) -or
+    (([IO.File]::GetAttributes($productIconPath) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    throw 'Canonical product icon is missing or unsafe.'
+}
 $channel = 'win-x64-stable'
 $manifestName = 'upload-manifest.sha256'
 $signatureName = 'upload-manifest.sha256.sig'
@@ -21,10 +42,30 @@ $releasesName = "RELEASES-$channel"
 $utf8Strict = [Text.UTF8Encoding]::new($false, $true)
 $signatureEvidence = [Collections.Generic.List[object]]::new()
 
-Add-Type -AssemblyName System.Security.Cryptography.Pkcs
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
+    Add-Type -AssemblyName System.Security
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+} else {
+    Add-Type -AssemblyName System.Security.Cryptography.Pkcs
+}
+
+function ConvertTo-LowerHex([byte[]]$Bytes) {
+    return ([BitConverter]::ToString($Bytes)).Replace('-', '').ToLowerInvariant()
+}
+
+function Test-FixedBytesEqual([byte[]]$Left, [byte[]]$Right) {
+    if ($Left.Length -ne $Right.Length) { return $false }
+    $difference = 0
+    for ($index = 0; $index -lt $Left.Length; $index++) {
+        $difference = $difference -bor ($Left[$index] -bxor $Right[$index])
+    }
+    return $difference -eq 0
+}
 
 function Get-LowerHash([Security.Cryptography.HashAlgorithm]$Algorithm, [IO.Stream]$Stream) {
-    try { return ([Convert]::ToHexString($Algorithm.ComputeHash($Stream))).ToLowerInvariant() }
+    try { return ConvertTo-LowerHex $Algorithm.ComputeHash($Stream) }
     finally { $Algorithm.Dispose(); $Stream.Dispose() }
 }
 
@@ -33,7 +74,81 @@ function Get-FileSha256([string]$Path) {
 }
 
 function Get-BytesSha256([byte[]]$Bytes) {
-    return ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes))).ToLowerInvariant()
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return ConvertTo-LowerHex $algorithm.ComputeHash($Bytes) }
+    finally { $algorithm.Dispose() }
+}
+
+function New-DerLength([int]$Length) {
+    if ($Length -lt 0) { throw 'DER length is invalid.' }
+    if ($Length -lt 128) { return ,([byte[]]@([byte]$Length)) }
+    $bytes = [Collections.Generic.List[byte]]::new()
+    while ($Length -gt 0) { $bytes.Insert(0, [byte]($Length -band 0xff)); $Length = $Length -shr 8 }
+    return ,([byte[]](@([byte](0x80 -bor $bytes.Count)) + $bytes.ToArray()))
+}
+
+function New-DerValue([byte]$Tag, [byte[]]$Content) {
+    return ,([byte[]](@($Tag) + (New-DerLength $Content.Length) + $Content))
+}
+
+function Read-DerValue([byte[]]$Bytes, [ref]$Offset, [byte]$ExpectedTag, [string]$Description) {
+    $start = [int]$Offset.Value
+    if ($start -ge $Bytes.Length -or $Bytes[$start] -ne $ExpectedTag) { throw "$Description has an unexpected ASN.1 tag." }
+    $start++
+    if ($start -ge $Bytes.Length) { throw "$Description has a truncated ASN.1 length." }
+    $firstLength = $Bytes[$start]; $start++
+    if ($firstLength -eq 0x80) { throw "$Description uses an indefinite ASN.1 length." }
+    if (($firstLength -band 0x80) -eq 0) { $length = [int]$firstLength }
+    else {
+        $count = $firstLength -band 0x7f
+        if ($count -lt 1 -or $count -gt 4 -or $start + $count -gt $Bytes.Length -or $Bytes[$start] -eq 0) {
+            throw "$Description has an invalid ASN.1 length."
+        }
+        $length = 0
+        for ($index = 0; $index -lt $count; $index++) { $length = ($length -shl 8) -bor $Bytes[$start + $index] }
+        $start += $count
+        if ($length -lt 128) { throw "$Description has a non-canonical ASN.1 length." }
+    }
+    if ($length -lt 0 -or $start + $length -gt $Bytes.Length) { throw "$Description is truncated." }
+    $content = [byte[]]::new($length)
+    if ($length -gt 0) { [Array]::Copy($Bytes, $start, $content, 0, $length) }
+    $Offset.Value = $start + $length
+    return ,$content
+}
+
+function Assert-NoDerRemainder([byte[]]$Bytes, [int]$Offset, [string]$Description) {
+    if ($Offset -ne $Bytes.Length) { throw "$Description has trailing ASN.1 data." }
+}
+
+function Get-AuthenticodeDigest([byte[]]$Content) {
+    $offset = 0
+    $root = Read-DerValue $Content ([ref]$offset) 0x30 'Authenticode content'
+    Assert-NoDerRemainder $Content $offset 'Authenticode content'
+    $rootOffset = 0
+    $imageData = Read-DerValue $root ([ref]$rootOffset) 0x30 'Authenticode image data'
+    $imageOffset = 0
+    $imageOid = Read-DerValue $imageData ([ref]$imageOffset) 0x06 'Authenticode image data OID'
+    $spcPeImageDataOid = '1.3.6.1.4.1.311.2.1.15'
+    if ((ConvertTo-LowerHex $imageOid) -cne '2b06010401823702010f') {
+        throw "Executable Authenticode content is not bound to PE-image data ($spcPeImageDataOid)."
+    }
+    $digestInfo = Read-DerValue $root ([ref]$rootOffset) 0x30 'Authenticode digest info'
+    Assert-NoDerRemainder $root $rootOffset 'Authenticode content'
+    $digestOffset = 0
+    $algorithm = Read-DerValue $digestInfo ([ref]$digestOffset) 0x30 'Authenticode digest algorithm'
+    $algorithmOffset = 0
+    $algorithmOid = Read-DerValue $algorithm ([ref]$algorithmOffset) 0x06 'Authenticode digest algorithm OID'
+    if ($algorithmOffset -lt $algorithm.Length) {
+        $nullValue = Read-DerValue $algorithm ([ref]$algorithmOffset) 0x05 'Authenticode digest algorithm parameters'
+        if ($nullValue.Length -ne 0) { throw 'Authenticode digest algorithm parameters are invalid.' }
+    }
+    Assert-NoDerRemainder $algorithm $algorithmOffset 'Authenticode digest algorithm'
+    $digest = Read-DerValue $digestInfo ([ref]$digestOffset) 0x04 'Authenticode image digest'
+    Assert-NoDerRemainder $digestInfo $digestOffset 'Authenticode digest info'
+    if ((ConvertTo-LowerHex $algorithmOid) -cne '608648016503040201' -or $digest.Length -ne 32) {
+        throw 'Executable Authenticode image digest metadata is unsupported.'
+    }
+    return ,$digest
 }
 
 function Test-CanonicalVersion([string]$Value) {
@@ -86,29 +201,340 @@ function Read-LimitedStream([IO.Stream]$Stream, [long]$Limit, [string]$Descripti
 function Get-CertificateSpki([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
     $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Certificate)
     if ($null -eq $rsa -or $rsa.KeySize -ne 3072) { throw 'Publisher certificate must use RSA-3072.' }
-    try { return Get-BytesSha256 $rsa.ExportSubjectPublicKeyInfo() }
+    try { return Get-RsaCertificateSpki $Certificate }
     finally { $rsa.Dispose() }
+}
+
+function Copy-FileBounded([string]$Source, [string]$Destination, [long]$Limit, [string]$Description) {
+    $sourceInfo = [IO.FileInfo]::new($Source)
+    if (-not $sourceInfo.Exists -or ($sourceInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $sourceInfo.Length -lt 1 -or $sourceInfo.Length -gt $Limit) { throw "$Description has an invalid size or file type." }
+    $input = [IO.File]::Open($sourceInfo.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $output = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $buffer = [byte[]]::new(65536)
+    [long]$total = 0
+    try {
+        while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            if ($total -gt $Limit - $read) { throw "$Description exceeds the allowed size." }
+            $output.Write($buffer, 0, $read)
+            $total += $read
+        }
+        if ($total -ne $sourceInfo.Length) { throw "$Description changed while it was being copied." }
+    }
+    finally { $output.Dispose(); $input.Dispose() }
+}
+
+function Initialize-OtaJobRunner {
+    if ('OtaJobRunner' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public sealed class OtaContainedResult {
+    public int ExitCode;
+    public string Failure;
+    public bool SafeToCleanup;
+}
+
+public static class OtaJobRunner {
+    const uint CREATE_SUSPENDED = 0x00000004;
+    const uint CREATE_NO_WINDOW = 0x08000000;
+    const uint STARTF_USESTDHANDLES = 0x00000100;
+    const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    const uint JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200;
+    const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008;
+    const uint HANDLE_FLAG_INHERIT = 0x00000001;
+    const uint WAIT_OBJECT_0 = 0;
+    const uint STILL_ACTIVE = 259;
+
+    [StructLayout(LayoutKind.Sequential)] struct STARTUPINFO {
+        public uint cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+        public uint dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION {
+        public IntPtr hProcess, hThread; public uint dwProcessId, dwThreadId;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit;
+        public UIntPtr Affinity; public uint PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct IO_COUNTERS {
+        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation; public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+        public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+    }
+
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, out uint returnedLength);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool CreateProcess(string applicationName, StringBuilder commandLine, IntPtr processAttributes,
+        IntPtr threadAttributes, bool inheritHandles, uint creationFlags, IntPtr environment,
+        string currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GetStdHandle(int id);
+
+    static string Quote(string value) {
+        if (value == null) throw new ArgumentNullException("value");
+        StringBuilder b = new StringBuilder(); b.Append('"'); int slashes = 0;
+        foreach (char c in value) {
+            if (c == '\\') { slashes++; continue; }
+            if (c == '"') { b.Append('\\', slashes * 2 + 1); b.Append('"'); }
+            else { if (slashes != 0) b.Append('\\', slashes); b.Append(c); }
+            slashes = 0;
+        }
+        if (slashes != 0) b.Append('\\', slashes * 2); b.Append('"'); return b.ToString();
+    }
+    static uint ActiveProcesses(IntPtr job) {
+        int size = Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+        IntPtr memory = Marshal.AllocHGlobal(size);
+        try {
+            uint returned;
+            if (!QueryInformationJobObject(job, 1, memory, (uint)size, out returned)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return ((JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(memory, typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION))).ActiveProcesses;
+        } finally { Marshal.FreeHGlobal(memory); }
+    }
+    static bool WaitForEmpty(IntPtr job, IntPtr process, int milliseconds) {
+        Stopwatch timer = Stopwatch.StartNew();
+        while (timer.ElapsedMilliseconds < milliseconds) {
+            bool mainDone = process == IntPtr.Zero || WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+            if (mainDone && ActiveProcesses(job) == 0) return true;
+            System.Threading.Thread.Sleep(50);
+        }
+        return false;
+    }
+
+    public static OtaContainedResult Run(string executable, string[] arguments, string workingDirectory,
+        string stdoutPath, string stderrPath, int timeoutMilliseconds, long maximumLogBytes,
+        string monitoredOutputPath, long maximumMonitoredOutputBytes, long jobMemoryLimitBytes,
+        uint activeProcessLimit) {
+        if (jobMemoryLimitBytes < 1 || jobMemoryLimitBytes > 1073741824L) throw new ArgumentOutOfRangeException("jobMemoryLimitBytes");
+        if (activeProcessLimit < 1 || activeProcessLimit > 8) throw new ArgumentOutOfRangeException("activeProcessLimit");
+        OtaContainedResult result = new OtaContainedResult { ExitCode = -1, SafeToCleanup = false };
+        IntPtr job = IntPtr.Zero; PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+        FileStream stdout = null, stderr = null; bool assigned = false;
+        try {
+            job = CreateJobObject(IntPtr.Zero, null); if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+                JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = activeProcessLimit;
+            limits.JobMemoryLimit = new UIntPtr((ulong)jobMemoryLimitBytes);
+            int limitSize = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+            IntPtr limitMemory = Marshal.AllocHGlobal(limitSize);
+            try { Marshal.StructureToPtr(limits, limitMemory, false); if (!SetInformationJobObject(job, 9, limitMemory, (uint)limitSize)) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            finally { Marshal.FreeHGlobal(limitMemory); }
+            stdout = new FileStream(stdoutPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+            stderr = new FileStream(stderrPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+            if (!SetHandleInformation(stdout.SafeFileHandle.DangerousGetHandle(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) ||
+                !SetHandleInformation(stderr.SafeFileHandle.DangerousGetHandle(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            StringBuilder commandLine = new StringBuilder(Quote(executable));
+            foreach (string argument in arguments) { commandLine.Append(' ').Append(Quote(argument)); }
+            STARTUPINFO startup = new STARTUPINFO(); startup.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFO));
+            startup.dwFlags = STARTF_USESTDHANDLES; startup.hStdInput = GetStdHandle(-10);
+            startup.hStdOutput = stdout.SafeFileHandle.DangerousGetHandle(); startup.hStdError = stderr.SafeFileHandle.DangerousGetHandle();
+            if (!CreateProcess(executable, commandLine, IntPtr.Zero, IntPtr.Zero, true, CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                IntPtr.Zero, workingDirectory, ref startup, out pi)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!AssignProcessToJobObject(job, pi.hProcess)) { TerminateProcess(pi.hProcess, 0xEE01); WaitForSingleObject(pi.hProcess, 5000); throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            assigned = true;
+            if (ResumeThread(pi.hThread) == UInt32.MaxValue) { TerminateJobObject(job, 0xEE02); throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            CloseHandle(pi.hThread); pi.hThread = IntPtr.Zero;
+            Stopwatch timer = Stopwatch.StartNew();
+            while (true) {
+                bool mainDone = WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0;
+                long outLength = stdout.Length, errorLength = stderr.Length;
+                if (outLength > maximumLogBytes || errorLength > maximumLogBytes || outLength > maximumLogBytes - errorLength)
+                    result.Failure = "Contained process exceeded the output limit.";
+                else if (monitoredOutputPath != null && File.Exists(monitoredOutputPath) &&
+                    new FileInfo(monitoredOutputPath).Length > maximumMonitoredOutputBytes)
+                    result.Failure = "Contained process output file exceeded the allowed size.";
+                else if (timer.ElapsedMilliseconds > timeoutMilliseconds)
+                    result.Failure = "Contained process timed out.";
+                if (result.Failure != null) { TerminateJobObject(job, 0xEE03); break; }
+                if (mainDone) {
+                    if (ActiveProcesses(job) == 0) break;
+                    if (timer.ElapsedMilliseconds > timeoutMilliseconds) { result.Failure = "Contained process left active child processes."; TerminateJobObject(job, 0xEE04); break; }
+                }
+            }
+            result.SafeToCleanup = WaitForEmpty(job, pi.hProcess, 5000);
+            uint exitCode;
+            if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, out exitCode)) result.ExitCode = unchecked((int)exitCode);
+            if (result.Failure == null && result.ExitCode != 0)
+                result.Failure = "Contained reconstruction process failed; configured job resource limits remained enforced.";
+            return result;
+        } catch (Exception error) {
+            if (assigned && job != IntPtr.Zero) TerminateJobObject(job, 0xEE05);
+            else if (pi.hProcess != IntPtr.Zero) TerminateProcess(pi.hProcess, 0xEE06);
+            try { if (job != IntPtr.Zero) result.SafeToCleanup = WaitForEmpty(job, pi.hProcess, 5000); }
+            catch { result.SafeToCleanup = false; }
+            result.Failure = "Contained process setup failed: " + error.Message;
+            return result;
+        } finally {
+            if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
+            if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
+            if (job != IntPtr.Zero) CloseHandle(job);
+            if (stdout != null) { SetHandleInformation(stdout.SafeFileHandle.DangerousGetHandle(), HANDLE_FLAG_INHERIT, 0); stdout.Dispose(); }
+            if (stderr != null) { SetHandleInformation(stderr.SafeFileHandle.DangerousGetHandle(), HANDLE_FLAG_INHERIT, 0); stderr.Dispose(); }
+        }
+    }
+}
+'@
+}
+
+function Invoke-ContainedProcess(
+    [string]$ExecutablePath, [string[]]$Arguments, [string]$WorkingDirectory,
+    [string]$StandardOutputPath, [string]$StandardErrorPath,
+    [int]$TimeoutMilliseconds, [long]$MaximumLogBytes,
+    [string]$MonitoredOutputPath, [long]$MaximumMonitoredOutputBytes,
+    [long]$JobMemoryLimitBytes, [uint32]$ActiveProcessLimit) {
+    Initialize-OtaJobRunner
+    return [OtaJobRunner]::Run($ExecutablePath, $Arguments, $WorkingDirectory, $StandardOutputPath,
+        $StandardErrorPath, $TimeoutMilliseconds, $MaximumLogBytes, $MonitoredOutputPath, $MaximumMonitoredOutputBytes,
+        $JobMemoryLimitBytes, $ActiveProcessLimit)
+}
+
+function Assert-DeltaReconstructsFull(
+    [string]$BasePackagePath,
+    [string]$DeltaPackagePath,
+    [string]$CurrentFullPackagePath,
+    [string]$ToolManifestPath) {
+    $resolvedManifest = [IO.Path]::GetFullPath($ToolManifestPath)
+    if (-not [IO.File]::Exists($resolvedManifest) -or [IO.Path]::GetFileName($resolvedManifest) -cne 'dotnet-tools.json' -or
+        [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($resolvedManifest)) -cne '.config') {
+        throw 'Locked vpk tool manifest is unavailable.'
+    }
+    try { $toolManifest = [IO.File]::ReadAllText($resolvedManifest, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json }
+    catch { throw 'Locked vpk tool manifest is invalid.' }
+    $toolProperties = @($toolManifest.tools.PSObject.Properties)
+    if ($toolProperties.Count -ne 1 -or $toolProperties[0].Name -cne 'vpk' -or
+        [string]$toolManifest.tools.vpk.version -cne '1.2.0' -or
+        @($toolManifest.tools.vpk.commands).Count -ne 1 -or [string]$toolManifest.tools.vpk.commands[0] -cne 'vpk') {
+        throw 'Locked vpk tool manifest must pin exactly vpk 1.2.0.'
+    }
+    $repoRoot = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($resolvedManifest))
+    $dotnetCommands = @(Get-Command dotnet -CommandType Application -ErrorAction SilentlyContinue)
+    if ($dotnetCommands.Count -lt 1) { throw 'dotnet is unavailable for locked vpk Delta reconstruction.' }
+    $dotnetPath = [IO.Path]::GetFullPath([string]$dotnetCommands[0].Source)
+    $dotnetInfo = [IO.FileInfo]::new($dotnetPath)
+    if (-not $dotnetInfo.Exists -or ($dotnetInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'dotnet executable path is unsafe for locked vpk Delta reconstruction.'
+    }
+
+    $reconstructionRoot = Join-Path ([IO.Path]::GetTempPath()) ("superpan-delta-reconstruct-" + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($reconstructionRoot) | Out-Null
+    $safeToDelete = $true
+    $primaryError = $null
+    $cleanupError = $null
+    try {
+        $baseCopy = Join-Path $reconstructionRoot 'base.nupkg'
+        $deltaCopy = Join-Path $reconstructionRoot 'delta.nupkg'
+        $currentCopy = Join-Path $reconstructionRoot 'current.nupkg'
+        $reconstructed = Join-Path $reconstructionRoot 'reconstructed.nupkg'
+        Copy-FileBounded $BasePackagePath $baseCopy 2GB 'Delta base Full package'
+        Copy-FileBounded $DeltaPackagePath $deltaCopy 2GB 'Current Delta package'
+        Copy-FileBounded $CurrentFullPackagePath $currentCopy 2GB 'Current Full package'
+
+        # dotnet tool run resolves the already-restored local tool from WorkingDirectory's
+        # .config manifest; it has no restore operation and performs no implicit download.
+        $arguments = @('tool','run','vpk','--','delta','patch',
+            '--base',$baseCopy,'--patch',$deltaCopy,'--output',$reconstructed)
+        $stdoutPath = Join-Path $reconstructionRoot 'vpk.stdout.log'
+        $stderrPath = Join-Path $reconstructionRoot 'vpk.stderr.log'
+        $execution = Invoke-ContainedProcess $dotnetPath $arguments $repoRoot $stdoutPath $stderrPath `
+            45000 1048576 $reconstructed 2GB 1GB 8
+        $safeToDelete = $execution.SafeToCleanup
+        if (-not $safeToDelete -and [string]::IsNullOrEmpty([string]$execution.Failure)) {
+            throw "Locked vpk process containment did not become empty. Temporary files retained at: $reconstructionRoot"
+        }
+        if (-not [string]::IsNullOrEmpty([string]$execution.Failure)) {
+            $diagnostic = ''
+            if ([IO.File]::Exists($stderrPath) -and ([IO.FileInfo]::new($stderrPath)).Length -le 1048576) {
+                $diagnosticBytes = Read-LimitedStream ([IO.File]::OpenRead($stderrPath)) 1048576 'Locked vpk error log'
+                $diagnostic = ([Text.UTF8Encoding]::new($false, $true)).GetString($diagnosticBytes).Trim()
+                if ($diagnostic.Length -gt 2048) { $diagnostic = $diagnostic.Substring(0, 2048) }
+            }
+            $retentionNote = if ($safeToDelete) { '' } else { " Temporary files retained at: $reconstructionRoot" }
+            throw "Locked vpk could not apply the current Delta package. $($execution.Failure) $diagnostic$retentionNote"
+        }
+        $reconstructedInfo = [IO.FileInfo]::new($reconstructed)
+        $currentInfo = [IO.FileInfo]::new($currentCopy)
+        if (-not $reconstructedInfo.Exists -or $reconstructedInfo.Length -lt 1 -or $reconstructedInfo.Length -gt 2GB -or
+            $reconstructedInfo.Length -ne $currentInfo.Length -or (Get-FileSha256 $reconstructed) -cne (Get-FileSha256 $currentCopy)) {
+            throw 'Delta reconstruction differs from the current Full package.'
+        }
+    }
+    catch { $primaryError = $_.Exception }
+    finally {
+        if ($safeToDelete -and (Test-Path -LiteralPath $reconstructionRoot)) {
+            for ($cleanupAttempt = 0; $cleanupAttempt -lt 8; $cleanupAttempt++) {
+                try { Remove-Item -LiteralPath $reconstructionRoot -Recurse -Force -ErrorAction Stop; break }
+                catch {
+                    if ($cleanupAttempt -eq 7) { $cleanupError = $_.Exception; break }
+                    Start-Sleep -Milliseconds (50 * ($cleanupAttempt + 1))
+                }
+            }
+        }
+    }
+    if ($null -ne $primaryError) {
+        if ($null -ne $cleanupError) {
+            throw "$($primaryError.Message) Delta reconstruction cleanup also failed; temporary files retained at: $reconstructionRoot ($($cleanupError.Message))"
+        }
+        throw $primaryError
+    }
+    if ($null -ne $cleanupError) {
+        throw "Delta reconstruction cleanup failed; temporary files retained at: $reconstructionRoot ($($cleanupError.Message))"
+    }
 }
 
 function Get-AnyCertificateSpki([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
     $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Certificate)
     if ($null -eq $rsa) { throw 'Executable signer certificate must use RSA.' }
-    try { return Get-BytesSha256 $rsa.ExportSubjectPublicKeyInfo() }
+    try { return Get-RsaCertificateSpki $Certificate }
     finally { $rsa.Dispose() }
 }
 
+function Get-RsaCertificateSpki([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
+    if ($Certificate.PublicKey.Oid.Value -cne '1.2.840.113549.1.1.1') { throw 'Executable signer certificate must use RSA.' }
+    $algorithmIdentifier = [byte[]](0x30,0x0d,0x06,0x09,0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x01,0x05,0x00)
+    $bitString = New-DerValue 0x03 ([byte[]](@(0) + $Certificate.PublicKey.EncodedKeyValue.RawData))
+    return Get-BytesSha256 (New-DerValue 0x30 ([byte[]]($algorithmIdentifier + $bitString)))
+}
+
 function Add-AuthenticodeHashRange(
-    [Security.Cryptography.IncrementalHash]$Hash,
+    [Security.Cryptography.HashAlgorithm]$Hash,
     [IO.FileStream]$Stream,
     [long]$Offset,
     [long]$Count) {
-    if ($Count -lt 0 -or $Offset -lt 0 -or $Offset + $Count -gt $Stream.Length) { throw 'Authenticode image range is invalid.' }
+    if ($Count -lt 0 -or $Offset -lt 0 -or $Offset -gt $Stream.Length - $Count) { throw 'Authenticode image range is invalid.' }
     $Stream.Position = $Offset
     $buffer = [byte[]]::new(1048576)
     while ($Count -gt 0) {
         $read = $Stream.Read($buffer, 0, [int][Math]::Min($buffer.Length, $Count))
         if ($read -le 0) { throw 'Authenticode image ended unexpectedly.' }
-        $Hash.AppendData($buffer, 0, $read)
+        [void]$Hash.TransformBlock($buffer, 0, $read, $buffer, 0)
         $Count -= $read
     }
 }
@@ -138,27 +564,36 @@ function Get-AuthenticodeTimestampUtc([Security.Cryptography.Pkcs.SignerInfo]$Si
                 $timestampCms.SignerInfos.Count -ne 1 -or $null -eq $timestampCms.SignerInfos[0].Certificate) {
                 throw 'Authenticode RFC3161 timestamp token is ambiguous or has the wrong content type.'
             }
-            $reader = [System.Formats.Asn1.AsnReader]::new(
-                $timestampCms.ContentInfo.Content,
-                [System.Formats.Asn1.AsnEncodingRules]::DER)
-            $sequence = $reader.ReadSequence()
-            [void]$sequence.ReadInteger()
-            [void]$sequence.ReadObjectIdentifier()
-            $messageImprint = $sequence.ReadSequence()
-            $imprintAlgorithm = $messageImprint.ReadSequence()
-            $imprintOid = $imprintAlgorithm.ReadObjectIdentifier()
-            if ($imprintAlgorithm.HasData) { $imprintAlgorithm.ReadNull() }
-            $expectedImprint = $messageImprint.ReadOctetString()
-            if ($imprintOid -cne '2.16.840.1.101.3.4.2.1' -or $messageImprint.HasData) {
+            $timestampOffset = 0
+            $sequence = Read-DerValue $timestampCms.ContentInfo.Content ([ref]$timestampOffset) 0x30 'RFC3161 timestamp'
+            Assert-NoDerRemainder $timestampCms.ContentInfo.Content $timestampOffset 'RFC3161 timestamp'
+            $sequenceOffset = 0
+            [void](Read-DerValue $sequence ([ref]$sequenceOffset) 0x02 'RFC3161 version')
+            [void](Read-DerValue $sequence ([ref]$sequenceOffset) 0x06 'RFC3161 policy')
+            $messageImprint = Read-DerValue $sequence ([ref]$sequenceOffset) 0x30 'RFC3161 message imprint'
+            $imprintOffset = 0
+            $imprintAlgorithm = Read-DerValue $messageImprint ([ref]$imprintOffset) 0x30 'RFC3161 imprint algorithm'
+            $algorithmOffset = 0
+            $imprintOid = Read-DerValue $imprintAlgorithm ([ref]$algorithmOffset) 0x06 'RFC3161 imprint algorithm OID'
+            if ($algorithmOffset -lt $imprintAlgorithm.Length) { [void](Read-DerValue $imprintAlgorithm ([ref]$algorithmOffset) 0x05 'RFC3161 algorithm parameters') }
+            Assert-NoDerRemainder $imprintAlgorithm $algorithmOffset 'RFC3161 imprint algorithm'
+            $expectedImprint = Read-DerValue $messageImprint ([ref]$imprintOffset) 0x04 'RFC3161 message imprint'
+            Assert-NoDerRemainder $messageImprint $imprintOffset 'RFC3161 message imprint'
+            if ((ConvertTo-LowerHex $imprintOid) -cne '608648016503040201' -or $expectedImprint.Length -ne 32) {
                 throw 'Authenticode timestamp uses an unsupported message imprint.'
             }
-            $actualImprint = [Security.Cryptography.SHA256]::HashData($SignerInfo.GetSignature())
-            if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($actualImprint, $expectedImprint)) {
+            $imprintHash = [Security.Cryptography.SHA256]::Create()
+            try { $actualImprint = $imprintHash.ComputeHash($SignerInfo.GetSignature()) }
+            finally { $imprintHash.Dispose() }
+            if (-not (Test-FixedBytesEqual $actualImprint $expectedImprint)) {
                 throw 'Authenticode timestamp is not bound to the executable signature.'
             }
-            [void]$sequence.ReadInteger()
-            $timestampUtc = $sequence.ReadGeneralizedTime().UtcDateTime
-            if ($reader.HasData) { throw 'Authenticode RFC3161 timestamp token has trailing outer data.' }
+            [void](Read-DerValue $sequence ([ref]$sequenceOffset) 0x02 'RFC3161 serial number')
+            $timestampBytes = Read-DerValue $sequence ([ref]$sequenceOffset) 0x18 'RFC3161 time'
+            $timestampText = [Text.Encoding]::ASCII.GetString($timestampBytes)
+            if ($timestampText -cnotmatch '^\d{14}(?:\.\d{1,7})?Z$') { throw 'Authenticode RFC3161 timestamp time is invalid.' }
+            $timestampUtc = [DateTime]::Parse($timestampText, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal)
             $accepted.Add([pscustomobject]@{ Utc=$timestampUtc; Certificate=$timestampCms.SignerInfos[0].Certificate; Kind='rfc3161' })
         }
     }
@@ -168,35 +603,13 @@ function Get-AuthenticodeTimestampUtc([Security.Cryptography.Pkcs.SignerInfo]$Si
 }
 
 function Get-VerifiedAuthenticode([string]$Path) {
+    $envelope = Get-PeEnvelope $Path
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $reader = [IO.BinaryReader]::new($stream, [Text.Encoding]::ASCII, $true)
     try {
-        if ($stream.Length -lt 256 -or $reader.ReadUInt16() -ne 0x5A4D) { throw 'Executable is not a PE image.' }
-        $stream.Position = 0x3c
-        $peOffset = [long]$reader.ReadUInt32()
-        if ($peOffset -lt 0x40 -or $peOffset + 256 -gt $stream.Length) { throw 'Executable PE header is invalid.' }
-        $stream.Position = $peOffset
-        if ($reader.ReadUInt32() -ne 0x00004550) { throw 'Executable PE signature is invalid.' }
-        $optionalOffset = $peOffset + 24
-        $stream.Position = $optionalOffset
-        $magic = $reader.ReadUInt16()
-        $dataDirectoryOffset = if ($magic -eq 0x20b) { $optionalOffset + 112 } elseif ($magic -eq 0x10b) { $optionalOffset + 96 } else { throw 'Executable optional header is invalid.' }
-        $checksumOffset = $optionalOffset + 64
-        $securityDirectoryOffset = $dataDirectoryOffset + 32
-        $stream.Position = $securityDirectoryOffset
-        $certificateOffset = [long]$reader.ReadUInt32()
-        $certificateSize = [long]$reader.ReadUInt32()
-        if ($certificateOffset -le $securityDirectoryOffset + 8 -or $certificateSize -lt 8 -or
-            $certificateOffset + $certificateSize -gt $stream.Length) { throw 'Executable has no valid Authenticode certificate table.' }
-        $stream.Position = $certificateOffset
-        $certificateLength = [long]$reader.ReadUInt32()
-        $revision = $reader.ReadUInt16()
-        $certificateType = $reader.ReadUInt16()
-        if ($certificateLength -lt 9 -or $certificateLength -gt $certificateSize -or $revision -notin @(0x0100,0x0200) -or $certificateType -ne 2) {
-            throw 'Executable Authenticode certificate entry is invalid.'
-        }
-        $pkcs7Bytes = $reader.ReadBytes([int]($certificateLength - 8))
-        if ($pkcs7Bytes.Length -ne $certificateLength - 8) { throw 'Executable Authenticode certificate entry is truncated.' }
+        $stream.Position = $envelope.CertificateOffset + 8
+        $pkcs7Bytes = $reader.ReadBytes([int]($envelope.CertificateLength - 8))
+        if ($pkcs7Bytes.Length -ne $envelope.CertificateLength - 8) { throw 'Executable Authenticode certificate entry is truncated.' }
 
         $cms = [Security.Cryptography.Pkcs.SignedCms]::new()
         $cms.Decode($pkcs7Bytes)
@@ -209,46 +622,82 @@ function Get-VerifiedAuthenticode([string]$Path) {
             throw 'Executable Authenticode SignerInfo digest algorithm must be SHA-256.'
         }
 
-        $asn = [System.Formats.Asn1.AsnReader]::new($cms.ContentInfo.Content, [System.Formats.Asn1.AsnEncodingRules]::BER)
-        $root = $asn.ReadSequence()
-        $imageData = $root.ReadSequence()
-        if ($imageData.ReadObjectIdentifier() -cne '1.3.6.1.4.1.311.2.1.15') {
-            throw 'Executable Authenticode content is not bound to PE-image data.'
-        }
-        while ($imageData.HasData) { [void]$imageData.ReadEncodedValue() }
-        $digestInfo = $root.ReadSequence()
-        $algorithm = $digestInfo.ReadSequence()
-        $algorithmOid = $algorithm.ReadObjectIdentifier()
-        if ($algorithm.HasData) { $algorithm.ReadNull() }
-        $expectedDigest = $digestInfo.ReadOctetString()
-        if ($algorithmOid -cne '2.16.840.1.101.3.4.2.1' -or $digestInfo.HasData -or $root.HasData -or $asn.HasData) {
-            throw 'Executable Authenticode image digest metadata is unsupported.'
-        }
-        $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+        $expectedDigest = Get-AuthenticodeDigest $cms.ContentInfo.Content
+        $hash = [Security.Cryptography.SHA256]::Create()
         try {
-            Add-AuthenticodeHashRange $hash $stream 0 $checksumOffset
-            Add-AuthenticodeHashRange $hash $stream ($checksumOffset + 4) ($securityDirectoryOffset - ($checksumOffset + 4))
-            Add-AuthenticodeHashRange $hash $stream ($securityDirectoryOffset + 8) ($certificateOffset - ($securityDirectoryOffset + 8))
-            if ($certificateOffset + $certificateSize -lt $stream.Length) {
-                Add-AuthenticodeHashRange $hash $stream ($certificateOffset + $certificateSize) ($stream.Length - ($certificateOffset + $certificateSize))
+            Add-AuthenticodeHashRange $hash $stream 0 $envelope.ChecksumOffset
+            Add-AuthenticodeHashRange $hash $stream ($envelope.ChecksumOffset + 4) ($envelope.SecurityDirectoryOffset - ($envelope.ChecksumOffset + 4))
+            Add-AuthenticodeHashRange $hash $stream ($envelope.SecurityDirectoryOffset + 8) ($envelope.CertificateOffset - ($envelope.SecurityDirectoryOffset + 8))
+            if ($envelope.CertificateOffset + $envelope.CertificateSize -lt $stream.Length) {
+                Add-AuthenticodeHashRange $hash $stream ($envelope.CertificateOffset + $envelope.CertificateSize) ($stream.Length - ($envelope.CertificateOffset + $envelope.CertificateSize))
             }
-            $actualDigest = $hash.GetHashAndReset()
+            [void]$hash.TransformFinalBlock([byte[]]::new(0), 0, 0)
+            $actualDigest = $hash.Hash
         }
         finally { $hash.Dispose() }
-        if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($actualDigest, $expectedDigest)) {
+        if (-not (Test-FixedBytesEqual $actualDigest $expectedDigest)) {
             throw 'Executable Authenticode image digest does not match the signed digest.'
         }
-        return [pscustomobject]@{ Cms=$cms; Signer=$cms.SignerInfos[0] }
+        return [pscustomobject]@{
+            Cms=$cms
+            Signer=$cms.SignerInfos[0]
+            Machine=$envelope.Machine
+            ImageDigest=(ConvertTo-LowerHex $actualDigest)
+        }
     }
     finally { $reader.Dispose(); $stream.Dispose() }
 }
 
-function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$TimestampRequired, [string]$EvidencePath) {
+function Assert-AuthenticatedExecutableIdentity(
+    [string]$Path,
+    [string]$ArtifactRole,
+    [string]$ExpectedMainInternalName,
+    [string]$ExpectedLegacyInternalName,
+    [string]$ExpectedProductName,
+    [string]$ExpectedDescription) {
+    if ($ArtifactRole -notin @('main-application','historical-main-application','legacy-compatibility-launcher')) { return }
+    $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+    $expectedInternalName = if ($ArtifactRole -ceq 'main-application') { $ExpectedMainInternalName } else { $ExpectedLegacyInternalName }
+    if ($versionInfo.OriginalFilename -cne $expectedInternalName -or $versionInfo.InternalName -cne $expectedInternalName) {
+        $roleDescription = if ($ArtifactRole -ceq 'main-application') { 'main application' } elseif ($ArtifactRole -ceq 'legacy-compatibility-launcher') { 'compatibility launcher' } else { 'historical main application' }
+        throw "Executable $roleDescription identity does not match the authenticated product contract."
+    }
+    if ($ArtifactRole -ne 'historical-main-application' -and
+        ($versionInfo.ProductName -cne $ExpectedProductName -or $versionInfo.FileDescription -cne $ExpectedDescription)) {
+        throw 'Executable product branding does not match the authenticated product contract.'
+    }
+}
+
+function Assert-DistinctCurrentApplicationImages([object[]]$RoleImages) {
+    $mainImages = @($RoleImages | Where-Object { [string]$_.ArtifactRole -ceq 'main-application' })
+    if ($mainImages.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$mainImages[0].ImageDigest)) {
+        throw 'Current package must contain exactly one authenticated main application image.'
+    }
+    $mainDigest = [string]$mainImages[0].ImageDigest
+    foreach ($roleImage in $RoleImages) {
+        if ([string]$roleImage.ArtifactRole -cne 'main-application' -and
+            [string]$roleImage.ImageDigest -ceq $mainDigest) {
+            throw 'Current main application shares its authenticated image with another executable role.'
+        }
+    }
+}
+
+function Assert-Authenticode(
+    [string]$Path,
+    [string]$ExpectedSpki,
+    [bool]$TimestampRequired,
+    [string]$EvidencePath,
+    [int]$ExpectedMachine = 0,
+    [ValidateSet('main-application','historical-main-application','legacy-compatibility-launcher','velopack-bootstrapper')]
+    [string]$ArtifactRole = 'velopack-bootstrapper') {
     try { $verified = Get-VerifiedAuthenticode $Path }
     catch { throw "Executable is not validly Authenticode signed: $([IO.Path]::GetFileName($Path)) ($($_.Exception.Message))" }
     $actualSpki = Get-CertificateSpki $verified.Signer.Certificate
     if ($actualSpki -cne $ExpectedSpki) {
         throw "Executable signer SPKI does not match the enrolled publisher: $([IO.Path]::GetFileName($Path))"
+    }
+    if ($ExpectedMachine -ne 0 -and $verified.Machine -ne $ExpectedMachine) {
+        throw "Executable PE architecture must be x64 (0x8664): $EvidencePath"
     }
     $codeSigningOid = '1.3.6.1.5.5.7.3.3'
     $hasCodeSigningEku = @($verified.Signer.Certificate.Extensions | Where-Object {
@@ -258,6 +707,8 @@ function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$Timest
     if (-not $hasCodeSigningEku) {
         throw "Executable signer certificate is missing the Code Signing EKU: $EvidencePath"
     }
+    Assert-AuthenticatedExecutableIdentity $Path $ArtifactRole "$productMainAssemblyName.dll" `
+        "$productLegacyAssemblyName.dll" $productDisplayName $productDescription
     $authenticodeStatus = Get-AuthenticodeSignature -LiteralPath $Path
     $timestampEvidence = Get-AuthenticodeTimestampUtc $verified.Signer
     $timestampUtc = if ($null -eq $timestampEvidence) { $null } else { [DateTime]$timestampEvidence.Utc }
@@ -295,18 +746,125 @@ function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$Timest
     $signatureEvidence.Add([ordered]@{
         file = $EvidencePath
         policy = 'publisher-authenticode-spki'
+        artifactRole = $ArtifactRole
         signerSpkiSha256 = $actualSpki
+        peMachine = ('0x{0:x4}' -f $verified.Machine)
         imageDigestVerified = $true
         platformStatus = [string]$authenticodeStatus.Status
         timestampPresent = ($null -ne $timestampUtc)
         timestampUtc = if ($null -eq $timestampUtc) { $null } else { $timestampUtc.ToString('O') }
     })
+    $result = [pscustomobject]@{ ArtifactRole=$ArtifactRole; ImageDigest=[string]$verified.ImageDigest }
     if ($null -ne $authenticodeStatus.TimeStamperCertificate) { $authenticodeStatus.TimeStamperCertificate.Dispose() }
     if ($null -ne $authenticodeStatus.SignerCertificate) { $authenticodeStatus.SignerCertificate.Dispose() }
     if ($null -ne $timestampEvidence -and $null -ne $timestampEvidence.Certificate) { $timestampEvidence.Certificate.Dispose() }
     if ($null -ne $verified.Signer.Certificate) { $verified.Signer.Certificate.Dispose() }
     $authenticodeStatus = $null
     $verified = $null
+    return $result
+}
+
+function Get-PeEnvelope([string]$Path) {
+    $fileLength = ([IO.FileInfo]::new($Path)).Length
+    if ($fileLength -gt 536870912) { throw 'Executable exceeds the allowed size.' }
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $reader = [IO.BinaryReader]::new($stream, [Text.Encoding]::ASCII, $true)
+    try {
+        if ($fileLength -lt 256 -or $reader.ReadUInt16() -ne 0x5A4D) { throw 'Executable is not a PE image.' }
+        $stream.Position = 0x3c
+        $peOffset = [long]$reader.ReadUInt32()
+        if ($peOffset -lt 0x40 -or $peOffset -gt $fileLength - 256) { throw 'Executable PE header is invalid.' }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) { throw 'Executable PE signature is invalid.' }
+        $machine = $reader.ReadUInt16()
+        $optionalOffset = $peOffset + 24
+        $stream.Position = $optionalOffset
+        $magic = $reader.ReadUInt16()
+        $dataDirectoryOffset = if ($magic -eq 0x20b) { $optionalOffset + 112 } elseif ($magic -eq 0x10b) { $optionalOffset + 96 } else { throw 'Executable optional header is invalid.' }
+        $checksumOffset = $optionalOffset + 64
+        $securityDirectoryOffset = $dataDirectoryOffset + 32
+        if ($securityDirectoryOffset -gt $fileLength - 8) { throw 'Executable certificate table is outside the PE image.' }
+        $stream.Position = $securityDirectoryOffset
+        $certificateOffset = [long]$reader.ReadUInt32()
+        $certificateSize = [long]$reader.ReadUInt32()
+        if ($certificateSize -gt 16777216) { throw 'Executable certificate table exceeds the allowed size.' }
+        if ($certificateOffset -le $securityDirectoryOffset + 8 -or $certificateSize -lt 8 -or
+            $certificateOffset -gt $fileLength - $certificateSize) { throw 'Executable has no valid Authenticode certificate table.' }
+        $stream.Position = $certificateOffset
+        $certificateLength = [long]$reader.ReadUInt32()
+        $revision = $reader.ReadUInt16()
+        $certificateType = $reader.ReadUInt16()
+        if ($certificateLength -gt 16777216) { throw 'Executable Authenticode certificate blob exceeds the allowed size.' }
+        if ($certificateLength -lt 9 -or $certificateLength -gt $certificateSize -or
+            $certificateLength -gt [int]::MaxValue -or $revision -notin @(0x0100,0x0200) -or $certificateType -ne 2) {
+            throw 'Executable Authenticode certificate entry is invalid.'
+        }
+        return [pscustomobject]@{
+            Machine=$machine; ChecksumOffset=$checksumOffset; SecurityDirectoryOffset=$securityDirectoryOffset
+            CertificateOffset=$certificateOffset; CertificateSize=$certificateSize; CertificateLength=$certificateLength
+        }
+    }
+    finally { $reader.Dispose(); $stream.Dispose() }
+}
+
+function Test-ByteSequence([byte[]]$Bytes, [byte[]]$Needle) {
+    if ($Needle.Length -eq 0 -or $Bytes.Length -lt $Needle.Length) { return $false }
+    for ($offset = 0; $offset -le $Bytes.Length - $Needle.Length; $offset++) {
+        $matches = $true
+        for ($index = 0; $index -lt $Needle.Length; $index++) {
+            if ($Bytes[$offset + $index] -ne $Needle[$index]) { $matches = $false; break }
+        }
+        if ($matches) { return $true }
+    }
+    return $false
+}
+
+function Assert-FileContainsText([string]$Path, [string]$Value, [string]$ErrorMessage, [long]$MaximumLength = 67108864) {
+    $fileLength = ([IO.FileInfo]::new($Path)).Length
+    if ($fileLength -gt $MaximumLength) { throw 'Launcher exceeds the allowed size.' }
+    $needles = @([Text.Encoding]::UTF8.GetBytes($Value), [Text.Encoding]::Unicode.GetBytes($Value))
+    $overlapLength = (@($needles | ForEach-Object { $_.Length }) | Measure-Object -Maximum).Maximum - 1
+    $carry = [byte[]]::new(0)
+    $buffer = [byte[]]::new(65536)
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $window = [byte[]]::new($carry.Length + $read)
+            if ($carry.Length -gt 0) { [Array]::Copy($carry, 0, $window, 0, $carry.Length) }
+            [Array]::Copy($buffer, 0, $window, $carry.Length, $read)
+            foreach ($needle in $needles) { if (Test-ByteSequence $window $needle) { return } }
+            $keep = [Math]::Min($overlapLength, $window.Length)
+            $carry = [byte[]]::new($keep)
+            if ($keep -gt 0) { [Array]::Copy($window, $window.Length - $keep, $carry, 0, $keep) }
+        }
+    }
+    finally { $stream.Dispose() }
+    throw $ErrorMessage
+}
+
+function Assert-DeltaPatchContract(
+    [object[]]$Patches,
+    [Collections.IDictionary]$CurrentFullTargets,
+    [string]$DeltaVersion,
+    [string]$CurrentVersion,
+    [string]$RequiredLegacyBasePath) {
+    if ($DeltaVersion -cne $CurrentVersion) { throw 'Historical Delta packages are not allowed in a production upload bundle.' }
+    $seenBases = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $hasLegacyPatch = $false
+    foreach ($patch in $Patches) {
+        $basePath = [string]$patch.BasePath
+        if (-not $seenBases.Add($basePath)) { throw "Delta target has both .diff and .zsdiff payloads: $basePath" }
+        if ([long]$patch.Length -lt 1) { throw "Delta package patch payload is empty: $basePath$($patch.Extension)" }
+        if ([long]$patch.Length -gt 536870912) { throw "Delta package patch payload exceeds the allowed size: $basePath$($patch.Extension)" }
+        if (-not $CurrentFullTargets.ContainsKey($basePath)) { throw "Delta package patch has no matching target in the current Full package: $basePath" }
+        $target = $CurrentFullTargets[$basePath]
+        $expectedShasum = "$(([string]$target.Sha1).ToUpperInvariant()) $([IO.Path]::GetFileName($basePath)).shasum $([long]$target.Length)"
+        if ([string]$patch.Shasum -cne $expectedShasum) {
+            throw "Delta package shasum does not identify the current Full target: $basePath"
+        }
+        if ($basePath -ceq $RequiredLegacyBasePath) { $hasLegacyPatch = $true }
+    }
+    if (-not $hasLegacyPatch) { throw 'Delta package does not replace the legacy executable with the compatibility launcher.' }
 }
 
 function Assert-ThirdPartyAuthenticode([string]$Path, [string]$ExpectedSpki, [string]$EvidencePath, [string]$ExpectedHash) {
@@ -465,6 +1023,13 @@ try {
     }
 
     function Get-WindowsCanonicalInnerPath([string]$Name) {
+        $reservedDeviceNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($reservedName in @(
+                'CON','PRN','AUX','NUL','CLOCK$',
+                'COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9','COM¹','COM²','COM³',
+                'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9','LPT¹','LPT²','LPT³')) {
+            [void]$reservedDeviceNames.Add($reservedName)
+        }
         if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 1024 -or
             $Name.StartsWith('/') -or $Name.StartsWith('\') -or $Name.Contains('\') -or
             $Name.Contains([char]0) -or $Name -match '^[A-Za-z]:') { return $null }
@@ -477,7 +1042,7 @@ try {
             foreach ($character in $part.ToCharArray()) { if ([int]$character -lt 0x20 -or [int]$character -eq 0x7f) { return $null } }
             $normalized = $part.Normalize([Text.NormalizationForm]::FormC)
             $stem = $normalized.Split('.')[0].ToUpperInvariant()
-            if ($stem -in @('CON','PRN','AUX','NUL','CLOCK$','COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9','LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9')) { return $null }
+            if ($reservedDeviceNames.Contains($stem)) { return $null }
             $canonicalParts.Add($normalized)
         }
         $canonical = $canonicalParts -join '/'
@@ -491,7 +1056,10 @@ try {
         [string[]]$RequiredPublisherExecutables,
         [string[]]$AllowedThirdPartyExecutables = @(),
         [string]$ExpectedPackageVersion,
-        [ValidateSet('Full','Delta','Portable')][string]$ExpectedPackageType) {
+        [ValidateSet('Full','Delta','Portable')][string]$ExpectedPackageType,
+        [string]$ExpectedLegacyLauncherSha1,
+        [long]$ExpectedLegacyLauncherLength = -1,
+        [Collections.IDictionary]$CurrentFullTargets) {
         $inner = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
         try {
             if ($inner.Entries.Count -eq 0 -or $inner.Entries.Count -gt 4096) { throw "$Description has an invalid entry count." }
@@ -500,7 +1068,7 @@ try {
             $innerCompressed = [long]0
             foreach ($innerEntry in $inner.Entries) {
                 $canonicalInnerPath = Get-WindowsCanonicalInnerPath $innerEntry.FullName
-                if ([string]::IsNullOrEmpty($innerEntry.Name) -or $null -eq $canonicalInnerPath) { throw "$Description contains an unsafe Windows path." }
+                if ([string]::IsNullOrEmpty($innerEntry.Name) -or $null -eq $canonicalInnerPath) { throw "$Description contains an unsafe Windows path: $($innerEntry.FullName)" }
                 if ($innerNames.ContainsKey($canonicalInnerPath)) { throw "$Description contains duplicate, case-colliding, or Unicode-normalization-aliased paths." }
                 $innerNames.Add($canonicalInnerPath, $innerEntry.FullName)
                 $unixType = (($innerEntry.ExternalAttributes -shr 16) -band 0xF000)
@@ -520,13 +1088,16 @@ try {
             if ($innerCompressed -gt 0 -and ([double]$innerExpanded / [double]$innerCompressed) -gt 100.0) {
                 throw "$Description has an excessive aggregate compression ratio."
             }
+            $isCurrentPackage = $ExpectedPackageVersion -ceq $currentVersion
             if ($ExpectedPackageType -ceq 'Portable') {
                 foreach ($requiredPortablePath in @(
                     '.portable',
                     'current/sq.version',
-                    'current/BaiduBatchTransfer.App.dll',
-                    'current/BaiduBatchTransfer.App.deps.json',
-                    'current/BaiduBatchTransfer.App.runtimeconfig.json')) {
+                    "current/$productMainExecutableName",
+                    "current/$productMainDllName",
+                    "current/$productMainStem.deps.json",
+                    "current/$productMainStem.runtimeconfig.json",
+                    "current/$productLegacyExecutableName")) {
                     if (-not $innerNames.ContainsKey($requiredPortablePath) -or $innerNames[$requiredPortablePath] -cne $requiredPortablePath) {
                         throw "Portable archive is missing required Velopack content: $requiredPortablePath"
                     }
@@ -555,7 +1126,10 @@ try {
                     [string]$portableMetadata.SelectSingleNode('n:id', $portableNamespace).InnerText -cne $packageId -or
                     [string]$portableMetadata.SelectSingleNode('n:version', $portableNamespace).InnerText -cne $ExpectedPackageVersion -or
                     [string]$portableMetadata.SelectSingleNode('n:channel', $portableNamespace).InnerText -cne $channel -or
-                    [string]$portableMetadata.SelectSingleNode('n:mainExe', $portableNamespace).InnerText -cne 'BaiduBatchTransfer.App.exe' -or
+                    [string]$portableMetadata.SelectSingleNode('n:title', $portableNamespace).InnerText -cne $productDisplayName -or
+                    [string]$portableMetadata.SelectSingleNode('n:description', $portableNamespace).InnerText -cne $productDescription -or
+                    [string]$portableMetadata.SelectSingleNode('n:authors', $portableNamespace).InnerText -cne $packageId -or
+                    [string]$portableMetadata.SelectSingleNode('n:mainExe', $portableNamespace).InnerText -cne $productMainExecutableName -or
                     [string]$portableMetadata.SelectSingleNode('n:os', $portableNamespace).InnerText -cne 'win' -or
                     [string]$portableMetadata.SelectSingleNode('n:rid', $portableNamespace).InnerText -cne 'win-x64' -or
                     [string]$portableMetadata.SelectSingleNode('n:machineArchitecture', $portableNamespace).InnerText -cne 'x64') {
@@ -583,35 +1157,80 @@ try {
                 $namespace = [Xml.XmlNamespaceManager]::new($nuspec.NameTable)
                 $namespace.AddNamespace('n', $nuspec.DocumentElement.NamespaceURI)
                 $metadata = $nuspec.SelectSingleNode('/n:package/n:metadata', $namespace)
+                $expectedPackageMainExe = if ($isCurrentPackage) { $productMainExecutableName } else { $productLegacyExecutableName }
                 if ($null -eq $metadata -or
                     [string]$metadata.SelectSingleNode('n:id', $namespace).InnerText -cne $packageId -or
                     [string]$metadata.SelectSingleNode('n:version', $namespace).InnerText -cne $ExpectedPackageVersion -or
                     [string]$metadata.SelectSingleNode('n:channel', $namespace).InnerText -cne $channel -or
-                    [string]$metadata.SelectSingleNode('n:mainExe', $namespace).InnerText -cne 'BaiduBatchTransfer.App.exe' -or
+                    [string]$metadata.SelectSingleNode('n:mainExe', $namespace).InnerText -cne $expectedPackageMainExe -or
                     [string]$metadata.SelectSingleNode('n:os', $namespace).InnerText -cne 'win' -or
                     [string]$metadata.SelectSingleNode('n:rid', $namespace).InnerText -cne 'win-x64') {
-                    throw "$Description Velopack package nuspec identity, version, or type metadata is invalid."
+                    throw "$Description Velopack package nuspec identity, branding, version, or type metadata is invalid."
+                }
+                if ($isCurrentPackage) {
+                    if ([string]$metadata.SelectSingleNode('n:title', $namespace).InnerText -cne $productDisplayName -or
+                        [string]$metadata.SelectSingleNode('n:description', $namespace).InnerText -cne $productDescription -or
+                        [string]$metadata.SelectSingleNode('n:authors', $namespace).InnerText -cne $packageId -or
+                        [string]$metadata.SelectSingleNode('n:machineArchitecture', $namespace).InnerText -cne 'x64') {
+                        throw "$Description Velopack package nuspec branding or architecture metadata is invalid."
+                    }
+                    $iconEntry = $inner.GetEntry('setup.ico')
+                    if ($null -eq $iconEntry -or $iconEntry.Length -lt 22 -or $iconEntry.Length -gt 16777216) {
+                        throw "$Description is missing the canonical package icon: setup.ico"
+                    }
+                    $iconBytes = Read-LimitedStream $iconEntry.Open() 16777216 "$Description setup.ico"
+                    if ($iconBytes.Length -lt 4 -or $iconBytes[0] -ne 0 -or $iconBytes[1] -ne 0 -or
+                        $iconBytes[2] -ne 1 -or $iconBytes[3] -ne 0) {
+                        throw "$Description canonical package icon is invalid: setup.ico"
+                    }
+                    if ((Get-BytesSha256 $iconBytes) -cne (Get-FileSha256 $productIconPath)) {
+                        throw "$Description canonical package icon hash differs: setup.ico"
+                    }
                 }
                 if ($ExpectedPackageType -ceq 'Full') {
-                    foreach ($requiredFullPath in @(
-                        'lib/app/BaiduBatchTransfer.App.dll',
-                        'lib/app/BaiduBatchTransfer.App.deps.json',
-                        'lib/app/BaiduBatchTransfer.App.runtimeconfig.json')) {
+                    $requiredFullPaths = if ($isCurrentPackage) { @(
+                            "lib/app/$productMainExecutableName",
+                            "lib/app/$productMainDllName",
+                            "lib/app/$productMainStem.deps.json",
+                            "lib/app/$productMainStem.runtimeconfig.json",
+                            "lib/app/$productLegacyExecutableName")
+                    } else { @(
+                            "lib/app/$productLegacyExecutableName",
+                            'lib/app/BaiduBatchTransfer.App.dll',
+                            'lib/app/BaiduBatchTransfer.App.deps.json',
+                            'lib/app/BaiduBatchTransfer.App.runtimeconfig.json') }
+                    foreach ($requiredFullPath in $requiredFullPaths) {
                         if (-not $innerNames.ContainsKey($requiredFullPath) -or $innerNames[$requiredFullPath] -cne $requiredFullPath) {
                             throw "$Description is missing required Full package content: $requiredFullPath"
                         }
                     }
                 }
                 else {
-                    $mainPatchBase = 'lib/app/BaiduBatchTransfer.App.exe'
-                    $hasMainPatch = $innerNames.ContainsKey("$mainPatchBase.diff") -or $innerNames.ContainsKey("$mainPatchBase.zsdiff")
+                    if ($ExpectedPackageVersion -cne $currentVersion) {
+                        throw 'Historical Delta packages are not allowed in a production upload bundle.'
+                    }
+                    $legacyPatchBase = "lib/app/$productLegacyExecutableName"
+                    $hasLegacyPatch = $innerNames.ContainsKey("$legacyPatchBase.diff") -or $innerNames.ContainsKey("$legacyPatchBase.zsdiff")
                     $patches = @($inner.Entries | Where-Object {
                         $_.FullName.StartsWith('lib/app/', [StringComparison]::Ordinal) -and
                         ($_.FullName.EndsWith('.diff', [StringComparison]::Ordinal) -or $_.FullName.EndsWith('.zsdiff', [StringComparison]::Ordinal))
                     })
-                    if (-not $hasMainPatch -or -not $innerNames.ContainsKey("$mainPatchBase.shasum") -or $patches.Count -eq 0) {
-                        throw 'Delta package has no meaningful patch payload for the main executable.'
+                    if (-not $hasLegacyPatch -or -not $innerNames.ContainsKey("$legacyPatchBase.shasum")) {
+                        throw 'Delta package has no meaningful patch payload. Delta package does not replace the legacy executable with the compatibility launcher.'
                     }
+                    foreach ($requiredRenamedPath in @(
+                            "lib/app/$productMainExecutableName",
+                            "lib/app/$productMainDllName",
+                            "lib/app/$productMainStem.deps.json",
+                            "lib/app/$productMainStem.runtimeconfig.json")) {
+                        if (-not $innerNames.ContainsKey($requiredRenamedPath) -or $innerNames[$requiredRenamedPath] -cne $requiredRenamedPath) {
+                            throw "Delta package does not add the renamed main application: $requiredRenamedPath"
+                        }
+                    }
+                    if ($patches.Count -eq 0) {
+                        throw 'Delta package has no meaningful patch payload.'
+                    }
+                    $patchContracts = [Collections.Generic.List[object]]::new()
                     foreach ($patch in $patches) {
                         $basePath = if ($patch.FullName.EndsWith('.zsdiff', [StringComparison]::Ordinal)) {
                             $patch.FullName.Substring(0, $patch.FullName.Length - 7)
@@ -620,10 +1239,33 @@ try {
                         if (-not $innerNames.ContainsKey("$basePath.shasum")) {
                             throw "Delta package patch is missing its shasum: $($patch.FullName)"
                         }
+                        $patchShasumEntry = $inner.GetEntry("$basePath.shasum")
+                        if ($patchShasumEntry.Length -gt 512) { throw "Delta package shasum exceeds the allowed size: $($patchShasumEntry.FullName)" }
+                        $patchShasumBytes = Read-LimitedStream $patchShasumEntry.Open() 512 "Delta package shasum"
+                        $patchShasumStream = [IO.MemoryStream]::new($patchShasumBytes, $false)
+                        $patchShasumReader = [IO.StreamReader]::new($patchShasumStream, $utf8Strict, $true, 128, $false)
+                        try { $patchShasum = $patchShasumReader.ReadToEnd() }
+                        finally { $patchShasumReader.Dispose() }
+                        $expectedShasumLeaf = [Regex]::Escape(([IO.Path]::GetFileName($basePath)) + '.shasum')
+                        if ($patchShasum -cnotmatch ('^[A-F0-9]{40} ' + $expectedShasumLeaf + ' [1-9][0-9]{0,18}$')) {
+                            throw "Delta package shasum has invalid UTF-8 or format: $($patchShasumEntry.FullName)"
+                        }
+                        $patchContracts.Add([pscustomobject]@{
+                            BasePath=$basePath
+                            Extension=if ($patch.FullName.EndsWith('.zsdiff', [StringComparison]::Ordinal)) { '.zsdiff' } else { '.diff' }
+                            Length=$patch.Length
+                            Shasum=$patchShasum
+                        })
                     }
+                    if ($null -eq $CurrentFullTargets -or [string]::IsNullOrWhiteSpace($ExpectedLegacyLauncherSha1) -or $ExpectedLegacyLauncherLength -lt 1) {
+                        throw 'Delta package cannot be bound to the current Full compatibility launcher.'
+                    }
+                    Assert-DeltaPatchContract $patchContracts.ToArray() $CurrentFullTargets $ExpectedPackageVersion `
+                        $currentVersion $legacyPatchBase
                 }
             }
             $executableIndex = 0
+            $publisherRoleImages = [Collections.Generic.List[object]]::new()
             foreach ($requiredName in $RequiredPublisherExecutables) {
                 if (-not $innerNames.ContainsKey($requiredName) -or $innerNames[$requiredName] -cne $requiredName) {
                     throw "$Description is missing required publisher executable: $requiredName"
@@ -653,10 +1295,32 @@ try {
                 try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
                 $publisherTimestampRequired = $RequireTimestamp.IsPresent -and
                     $ExpectedPackageVersion -ceq $currentVersion -and $requiredName -in @(
-                    'current/BaiduBatchTransfer.App.exe',
-                    'lib/app/BaiduBatchTransfer.App.exe')
-                Assert-Authenticode $destination $ExpectedPublisherSpkiSha256 $publisherTimestampRequired "$Description::$requiredName"
+                    "current/$productMainExecutableName",
+                    "current/$productLegacyExecutableName",
+                    "lib/app/$productMainExecutableName",
+                    "lib/app/$productLegacyExecutableName")
+                $expectedApplicationMachine = if ($requiredName -in @(
+                        "current/$productMainExecutableName",
+                        "current/$productLegacyExecutableName",
+                        "lib/app/$productMainExecutableName",
+                        "lib/app/$productLegacyExecutableName")) { 0x8664 } else { 0 }
+                $artifactRole = if ($isCurrentPackage -and $requiredName -in @(
+                        "current/$productMainExecutableName", "lib/app/$productMainExecutableName")) {
+                    'main-application'
+                } elseif ($isCurrentPackage -and $requiredName -in @(
+                        "current/$productLegacyExecutableName", "lib/app/$productLegacyExecutableName")) {
+                    'legacy-compatibility-launcher'
+                } elseif (-not $isCurrentPackage -and $requiredName -ceq "lib/app/$productLegacyExecutableName") {
+                    'historical-main-application'
+                } else { 'velopack-bootstrapper' }
+                $publisherRoleImage = Assert-Authenticode $destination $ExpectedPublisherSpkiSha256 $publisherTimestampRequired `
+                    "$Description::$requiredName" $expectedApplicationMachine $artifactRole
+                $publisherRoleImages.Add($publisherRoleImage)
+                if ($ExpectedPackageType -ceq 'Portable' -and $requiredName -ceq $productMainExecutableName) {
+                    Assert-FileContainsText $destination $productMainStem 'Root launcher does not reference the configured main executable.'
+                }
             }
+            if ($isCurrentPackage) { Assert-DistinctCurrentApplicationImages $publisherRoleImages.ToArray() }
             $psfSpki = '7a1e6298a8fc5ec53e6389ad8532cb869e36233caf30c5ee0a1108d09a2b9801'
             foreach ($thirdPartyName in $AllowedThirdPartyExecutables) {
                 if (-not $innerNames.ContainsKey($thirdPartyName)) { continue }
@@ -813,33 +1477,98 @@ try {
     $setupName = "$packageId-Setup.exe"
     $setupPath = Join-Path $temporaryRoot $setupName
     Extract-Entry $setupName $setupPath
-    Assert-Authenticode $setupPath $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent $setupName
+    [void](Assert-Authenticode $setupPath $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent $setupName)
 
     $portableName = "$packageId-Portable.zip"
     $portablePath = Join-Path $temporaryRoot $portableName
     Extract-Entry $portableName $portablePath
     Assert-InnerArchive $portablePath 'Portable archive' @(
-        "$packageId.exe",
+        $productMainExecutableName,
         'Update.exe',
-        'current/BaiduBatchTransfer.App.exe') @(
+        "current/$productMainExecutableName",
+        "current/$productLegacyExecutableName") @(
         'current/managed-browser-helper/python.exe',
         'current/managed-browser-helper/pythonw.exe') $currentVersion 'Portable'
 
+    $currentLegacyLauncherSha1 = $null
+    [long]$currentLegacyLauncherLength = -1
+    $currentFullTargets = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $validatedPackagePaths = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
     $packageIndex = 0
-    foreach ($asset in $assets) {
+    $assetsToValidate = @($assets | Sort-Object @{
+            Expression = {
+                if ([string]$_.Type -ceq 'Full' -and [string]$_.Version -ceq $currentVersion) { 0 }
+                elseif ([string]$_.Type -ceq 'Full') { 1 }
+                else { 2 }
+            }
+        }, @{ Expression = { [string]$_.Version } })
+    foreach ($asset in $assetsToValidate) {
         $packageName = [string]$asset.FileName
         $packagePath = Join-Path $temporaryRoot ("package-$packageIndex.nupkg")
         $packageIndex++
         Extract-Entry $packageName $packagePath
-        $requiredPackageExecutables = if ([string]$asset.Type -ceq 'Full') {
-            @('lib/app/BaiduBatchTransfer.App_ExecutionStub.exe', 'lib/app/BaiduBatchTransfer.App.exe', 'lib/app/Squirrel.exe')
+        $validatedPackagePaths.Add($packageName, $packagePath)
+        $requiredPackageExecutables = if ([string]$asset.Type -ceq 'Full' -and [string]$asset.Version -ceq $currentVersion) {
+            @("lib/app/$($productMainStem)_ExecutionStub.exe", "lib/app/$productMainExecutableName", "lib/app/$productLegacyExecutableName", 'lib/app/Squirrel.exe')
+        }
+        elseif ([string]$asset.Type -ceq 'Full') {
+            @('lib/app/BaiduBatchTransfer.App_ExecutionStub.exe', "lib/app/$productLegacyExecutableName", 'lib/app/Squirrel.exe')
+        }
+        elseif ([string]$asset.Type -ceq 'Delta') {
+            @("lib/app/$($productMainStem)_ExecutionStub.exe", "lib/app/$productMainExecutableName")
         }
         else { @() }
         $allowedPackageExecutables = if ([string]$asset.Type -ceq 'Full') {
             @('lib/app/managed-browser-helper/python.exe', 'lib/app/managed-browser-helper/pythonw.exe')
         }
         else { @() }
-        Assert-InnerArchive $packagePath "Package $packageName" $requiredPackageExecutables $allowedPackageExecutables ([string]$asset.Version) ([string]$asset.Type)
+        Assert-InnerArchive $packagePath "Package $packageName" $requiredPackageExecutables $allowedPackageExecutables `
+            ([string]$asset.Version) ([string]$asset.Type) $currentLegacyLauncherSha1 $currentLegacyLauncherLength $currentFullTargets
+        if ([string]$asset.Type -ceq 'Full' -and [string]$asset.Version -ceq $currentVersion) {
+            $currentFull = [IO.Compression.ZipFile]::OpenRead($packagePath)
+            try {
+                $legacyEntry = $currentFull.GetEntry("lib/app/$productLegacyExecutableName")
+                if ($null -eq $legacyEntry -or $legacyEntry.Length -le 0) {
+                    throw 'Current Full package compatibility launcher identity is unavailable.'
+                }
+                $currentLegacyLauncherLength = $legacyEntry.Length
+                $currentLegacyLauncherSha1 = Get-LowerHash ([Security.Cryptography.SHA1]::Create()) $legacyEntry.Open()
+                foreach ($targetEntry in $currentFull.Entries) {
+                    if ([string]::IsNullOrEmpty($targetEntry.Name)) { continue }
+                    if ($currentFullTargets.ContainsKey($targetEntry.FullName)) { throw 'Current Full package has duplicate Delta target paths.' }
+                    $currentFullTargets.Add($targetEntry.FullName, [pscustomobject]@{
+                        Sha1=Get-LowerHash ([Security.Cryptography.SHA1]::Create()) $targetEntry.Open()
+                        Length=$targetEntry.Length
+                    })
+                }
+            }
+            finally { $currentFull.Dispose() }
+        }
+    }
+
+    $currentDeltaAssets = @($assets | Where-Object {
+            [string]$_.Type -ceq 'Delta' -and [string]$_.Version -ceq $currentVersion
+        })
+    if ($currentDeltaAssets.Count -gt 0) {
+        if ($currentDeltaAssets.Count -ne 1) { throw 'Current production Delta asset is ambiguous.' }
+        $lowerFullAssets = @($assets | Where-Object {
+                [string]$_.Type -ceq 'Full' -and (Compare-Version ([string]$_.Version) $currentVersion) -lt 0
+            } | Sort-Object { [version]$_.Version } -Descending)
+        if ($lowerFullAssets.Count -eq 0) { throw 'Current production Delta has no lower Full base package.' }
+        $baseVersion = [string]$lowerFullAssets[0].Version
+        $baseAssets = @($lowerFullAssets | Where-Object { [string]$_.Version -ceq $baseVersion })
+        if ($baseAssets.Count -ne 1) { throw 'Current production Delta Full base package is ambiguous.' }
+        $currentFullAssets = @($assets | Where-Object {
+                [string]$_.Type -ceq 'Full' -and [string]$_.Version -ceq $currentVersion
+            })
+        if ($currentFullAssets.Count -ne 1) { throw 'Current production Full package is ambiguous.' }
+        $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+        $toolManifestPath = Join-Path $sourceRoot '.config\dotnet-tools.json'
+        Assert-DeltaReconstructsFull `
+            $validatedPackagePaths[[string]$baseAssets[0].FileName] `
+            $validatedPackagePaths[[string]$currentDeltaAssets[0].FileName] `
+            $validatedPackagePaths[[string]$currentFullAssets[0].FileName] `
+            $toolManifestPath
     }
 
     $report = [ordered]@{
