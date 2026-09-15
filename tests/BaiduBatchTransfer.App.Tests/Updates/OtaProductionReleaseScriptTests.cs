@@ -239,6 +239,8 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("Root launcher does not reference the configured main executable", validator, StringComparison.Ordinal);
         Assert.Contains("Delta package does not replace the legacy executable with the compatibility launcher", validator, StringComparison.Ordinal);
         Assert.Contains("Delta package does not add the renamed main application", validator, StringComparison.Ordinal);
+        Assert.Contains("Delta package placeholder patch and shasum must both be empty", validator, StringComparison.Ordinal);
+        Assert.Contains("Delta package empty placeholder refers to changed Full-package content", validator, StringComparison.Ordinal);
         Assert.Contains("COM¹", validator, StringComparison.Ordinal);
         Assert.Contains("LPT³", validator, StringComparison.Ordinal);
     }
@@ -570,6 +572,40 @@ public sealed class OtaProductionReleaseScriptTests
             Assert.NotEqual(0, result.ExitCode);
             Assert.Contains(item.Error, result.Output, StringComparison.OrdinalIgnoreCase);
         }
+    }
+
+    [Fact]
+    public async Task EmptyDeltaPlaceholderRequiresIdenticalOrdinaryBaseAndTarget()
+    {
+        const string setup = "$critical=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);" +
+                             "$base=@{'lib/app/ordinary.dll'=[pscustomobject]@{Sha1=('A'*40);Length=7}};" +
+                             "$current=@{'lib/app/ordinary.dll'=[pscustomobject]@{Sha1=('A'*40);Length=7}};";
+        var result = await RunValidatorFunctionsAsync(
+            setup + "if(-not (Test-DeltaEmptyPlaceholder 'lib/app/ordinary.dll' 0 0 $critical $base $current)){throw 'placeholder rejected'}");
+
+        Assert.True(result.ExitCode == 0, result.Output);
+    }
+
+    [Theory]
+    [InlineData("0", "1", "", "placeholder patch and shasum must both be empty")]
+    [InlineData("0", "0", "critical", "identity-critical patch payload is empty")]
+    [InlineData("0", "0", "changed", "refers to changed Full-package content")]
+    [InlineData("0", "0", "missing", "has no exact Full-package base and target")]
+    public async Task EmptyDeltaPlaceholderRejectsAsymmetryIdentityChangesAndMissingEvidence(
+        string patchLength, string shasumLength, string mode, string expectedError)
+    {
+        var critical = mode == "critical" ? "$critical.Add('lib/app/ordinary.dll')|Out-Null;" : "";
+        var currentHash = mode == "changed" ? "('B'*40)" : "('A'*40)";
+        var current = mode == "missing"
+            ? "$current=@{};"
+            : $"$current=@{{'lib/app/ordinary.dll'=[pscustomobject]@{{Sha1={currentHash};Length=7}}}};";
+        var command = "$critical=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);" + critical +
+                      "$base=@{'lib/app/ordinary.dll'=[pscustomobject]@{Sha1=('A'*40);Length=7}};" + current +
+                      $"Test-DeltaEmptyPlaceholder 'lib/app/ordinary.dll' {patchLength} {shasumLength} $critical $base $current|Out-Null";
+        var result = await RunValidatorFunctionsAsync(command);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedError, result.Output, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

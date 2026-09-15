@@ -852,6 +852,33 @@ function Assert-FileContainsText([string]$Path, [string]$Value, [string]$ErrorMe
     throw $ErrorMessage
 }
 
+function Test-DeltaEmptyPlaceholder(
+    [string]$BasePath,
+    [long]$PatchLength,
+    [long]$ShasumLength,
+    [Collections.Generic.HashSet[string]]$IdentityCriticalPaths,
+    [Collections.IDictionary]$BaseFullTargets,
+    [Collections.IDictionary]$CurrentFullTargets) {
+    if ($PatchLength -ne 0 -and $ShasumLength -ne 0) { return $false }
+    if ($PatchLength -eq 0 -and $IdentityCriticalPaths.Contains($BasePath)) {
+        throw "Delta package identity-critical patch payload is empty: $BasePath"
+    }
+    if ($PatchLength -ne 0 -or $ShasumLength -ne 0) {
+        throw "Delta package placeholder patch and shasum must both be empty: $BasePath"
+    }
+    if ($null -eq $BaseFullTargets -or $null -eq $CurrentFullTargets -or
+        -not $BaseFullTargets.ContainsKey($BasePath) -or -not $CurrentFullTargets.ContainsKey($BasePath)) {
+        throw "Delta package empty placeholder has no exact Full-package base and target: $BasePath"
+    }
+    $baseTarget = $BaseFullTargets[$BasePath]
+    $currentTarget = $CurrentFullTargets[$BasePath]
+    if ([long]$baseTarget.Length -ne [long]$currentTarget.Length -or
+        [string]$baseTarget.Sha1 -cne [string]$currentTarget.Sha1) {
+        throw "Delta package empty placeholder refers to changed Full-package content: $BasePath"
+    }
+    return $true
+}
+
 function Assert-DeltaPatchContract(
     [object[]]$Patches,
     [Collections.IDictionary]$CurrentFullTargets,
@@ -1069,7 +1096,8 @@ try {
         [ValidateSet('Full','Delta','Portable')][string]$ExpectedPackageType,
         [string]$ExpectedLegacyLauncherSha1,
         [long]$ExpectedLegacyLauncherLength = -1,
-        [Collections.IDictionary]$CurrentFullTargets) {
+        [Collections.IDictionary]$CurrentFullTargets,
+        [Collections.IDictionary]$BaseFullTargets) {
         $inner = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
         try {
             if ($inner.Entries.Count -eq 0 -or $inner.Entries.Count -gt 4096) { throw "$Description has an invalid entry count." }
@@ -1246,6 +1274,16 @@ try {
                         throw 'Historical Delta packages are not allowed in a production upload bundle.'
                     }
                     $legacyPatchBase = "lib/app/$productLegacyExecutableName"
+                    $identityCriticalDeltaPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                    foreach ($criticalDeltaPath in @(
+                            $legacyPatchBase,
+                            "lib/app/$productMainExecutableName",
+                            "lib/app/$productMainDllName",
+                            "lib/app/$productMainStem.deps.json",
+                            "lib/app/$productMainStem.runtimeconfig.json",
+                            "lib/app/$($productMainStem)_ExecutionStub.exe")) {
+                        [void]$identityCriticalDeltaPaths.Add($criticalDeltaPath)
+                    }
                     $hasLegacyPatch = $innerNames.ContainsKey("$legacyPatchBase.diff") -or $innerNames.ContainsKey("$legacyPatchBase.zsdiff")
                     $patches = @($inner.Entries | Where-Object {
                         $_.FullName.StartsWith('lib/app/', [StringComparison]::Ordinal) -and
@@ -1279,6 +1317,10 @@ try {
                         }
                         $patchShasumEntry = $inner.GetEntry("$basePath.shasum")
                         if ($patchShasumEntry.Length -gt 512) { throw "Delta package shasum exceeds the allowed size: $($patchShasumEntry.FullName)" }
+                        if (Test-DeltaEmptyPlaceholder $basePath $patch.Length $patchShasumEntry.Length `
+                                $identityCriticalDeltaPaths $BaseFullTargets $CurrentFullTargets) {
+                            continue
+                        }
                         $patchShasumBytes = Read-LimitedStream $patchShasumEntry.Open() 512 "Delta package shasum"
                         $patchShasumStream = [IO.MemoryStream]::new($patchShasumBytes, $false)
                         $patchShasumReader = [IO.StreamReader]::new($patchShasumStream, $utf8Strict, $true, 128, $false)
@@ -1539,6 +1581,15 @@ try {
     $currentLegacyLauncherSha1 = $null
     [long]$currentLegacyLauncherLength = -1
     $currentFullTargets = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $baseFullTargets = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $deltaBaseVersion = $null
+    if (-not $HistoricalProductIdentity.IsPresent -and
+        @($assets | Where-Object { [string]$_.Type -ceq 'Delta' -and [string]$_.Version -ceq $currentVersion }).Count -gt 0) {
+        $deltaBaseVersion = @($assets | Where-Object {
+                [string]$_.Type -ceq 'Full' -and (Compare-Version ([string]$_.Version) $currentVersion) -lt 0
+            } | Sort-Object { [version][string]$_.Version } -Descending | Select-Object -First 1 |
+            ForEach-Object { [string]$_.Version })[0]
+    }
     $validatedPackagePaths = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
     $packageIndex = 0
     $assetsToValidate = @($assets | Sort-Object @{
@@ -1579,7 +1630,8 @@ try {
         }
         else { @() }
         Assert-InnerArchive $packagePath "Package $packageName" $requiredPackageExecutables $allowedPackageExecutables `
-            ([string]$asset.Version) ([string]$asset.Type) $currentLegacyLauncherSha1 $currentLegacyLauncherLength $currentFullTargets
+            ([string]$asset.Version) ([string]$asset.Type) $currentLegacyLauncherSha1 $currentLegacyLauncherLength `
+            $currentFullTargets $baseFullTargets
         if ([string]$asset.Type -ceq 'Full' -and [string]$asset.Version -ceq $currentVersion) {
             $currentFull = [IO.Compression.ZipFile]::OpenRead($packagePath)
             try {
@@ -1599,6 +1651,20 @@ try {
                 }
             }
             finally { $currentFull.Dispose() }
+        }
+        elseif ([string]$asset.Type -ceq 'Full' -and [string]$asset.Version -ceq [string]$deltaBaseVersion) {
+            $baseFull = [IO.Compression.ZipFile]::OpenRead($packagePath)
+            try {
+                foreach ($baseEntry in $baseFull.Entries) {
+                    if ([string]::IsNullOrEmpty($baseEntry.Name)) { continue }
+                    if ($baseFullTargets.ContainsKey($baseEntry.FullName)) { throw 'Delta base Full package has duplicate target paths.' }
+                    $baseFullTargets.Add($baseEntry.FullName, [pscustomobject]@{
+                        Sha1=Get-LowerHash ([Security.Cryptography.SHA1]::Create()) $baseEntry.Open()
+                        Length=$baseEntry.Length
+                    })
+                }
+            }
+            finally { $baseFull.Dispose() }
         }
     }
 
