@@ -45,59 +45,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
-public sealed class MigrationBoundedProcessResult {
-    public int ExitCode;
-    public string StandardOutput;
-    public string StandardError;
-}
-public static class MigrationBoundedProcessRunner {
-    private static bool KillTree(int id) {
-        try {
-            using (var killer = Process.Start(new ProcessStartInfo("taskkill.exe", "/PID " + id + " /T /F") {
-                UseShellExecute = false, CreateNoWindow = true
-            })) {
-                return killer != null && killer.WaitForExit(10000) && killer.ExitCode == 0;
-            }
-        } catch { return false; }
-    }
-    public static MigrationBoundedProcessResult Run(string file, string arguments, string workingDirectory, int timeoutMs, int maximumBytes) {
-        var info = new ProcessStartInfo(file, arguments) {
-            WorkingDirectory = workingDirectory, UseShellExecute = false, CreateNoWindow = true,
-            RedirectStandardOutput = true, RedirectStandardError = true
-        };
-        using (var process = new Process { StartInfo = info }) {
-            var output = new StringBuilder(); var error = new StringBuilder();
-            var sync = new object(); var bytes = 0; var overflow = false;
-            DataReceivedEventHandler appendOutput = (sender, e) => {
-                if (e.Data == null) return;
-                lock (sync) {
-                    bytes += Encoding.UTF8.GetByteCount(e.Data) + 1;
-                    if (bytes > maximumBytes) overflow = true; else output.Append(e.Data).Append('\n');
-                }
-                if (overflow) KillTree(process.Id);
-            };
-            DataReceivedEventHandler appendError = (sender, e) => {
-                if (e.Data == null) return;
-                lock (sync) {
-                    bytes += Encoding.UTF8.GetByteCount(e.Data) + 1;
-                    if (bytes > maximumBytes) overflow = true; else error.Append(e.Data).Append('\n');
-                }
-                if (overflow) KillTree(process.Id);
-            };
-            process.OutputDataReceived += appendOutput; process.ErrorDataReceived += appendError;
-            if (!process.Start()) throw new InvalidOperationException("Unable to start bounded process.");
-            process.BeginOutputReadLine(); process.BeginErrorReadLine();
-            if (!process.WaitForExit(timeoutMs)) {
-                KillTree(process.Id);
-                if (!process.WaitForExit(10000)) throw new InvalidOperationException("Timed-out process tree could not be terminated.");
-                throw new TimeoutException("Bounded process timed out.");
-            }
-            process.WaitForExit();
-            if (overflow) throw new InvalidOperationException("Bounded process output exceeded the byte limit.");
-            return new MigrationBoundedProcessResult { ExitCode = process.ExitCode, StandardOutput = output.ToString(), StandardError = error.ToString() };
-        }
-    }
-}
 public static class MigrationNativeCommandLine {
     [DllImport("shell32.dll", SetLastError=true)] private static extern IntPtr CommandLineToArgvW(string commandLine, out int argc);
     [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr value);
@@ -944,6 +891,20 @@ function Get-FileInventory {
     return @($records)
 }
 
+function Write-TerminalMigrationEvidence {
+    param($Evidence,[string]$EvidenceRoot,[string]$RunId,[Collections.Generic.List[string]]$Failures)
+    $evidencePath=Join-Path $EvidenceRoot 'evidence.json';$inventoryPath=Join-Path $EvidenceRoot 'files.sha256.json'
+    $setTerminalState={
+        $Evidence.FinishedUtc=[DateTimeOffset]::UtcNow.ToString('O')
+        if($Failures.Count-ne 0){$Evidence.Succeeded=$false;$Evidence.Error=(@($Failures|Select-Object -Unique)-join ' | ')}
+    }
+    & $setTerminalState
+    try{Write-CanonicalJson -Value $Evidence -Destination $evidencePath}catch{throw ('Evidence terminal record is not writable; migration result is failed and must not be reported as success: '+($_.Exception.Message))}
+    try{$hashes=@(Get-FileInventory -Roots @($EvidenceRoot));Write-CanonicalJson -Value ([ordered]@{SchemaVersion=1;RunId=$RunId;Files=$hashes}) -Destination $inventoryPath}
+    catch{$Failures.Add('Evidence inventory finalization failed: '+$_.Exception.Message);& $setTerminalState;try{Write-CanonicalJson -Value $Evidence -Destination $evidencePath}catch{throw ('Evidence terminal failure record could not be rewritten: '+($_.Exception.Message))}}
+    if($Failures.Count-ne 0){& $setTerminalState;try{Write-CanonicalJson -Value $Evidence -Destination $evidencePath}catch{throw ('Evidence aggregated terminal failure record could not be written: '+($_.Exception.Message))}}
+}
+
 $runId = New-RunId
 $startedUtc = [DateTimeOffset]::UtcNow
 $evidenceRoot = $null
@@ -1138,17 +1099,17 @@ try {
     Assert-NoNonLoopbackNetwork | Out-Null
 } catch {
     $evidence.Error = $_.Exception.Message
+    $evidence.Succeeded=$false
     $primaryFailure=$_
 } finally {
     try{if($upgradeRun-and$upgradeRun.JobHandle-ne[IntPtr]::Zero){if(-not[MigrationContainedRunner]::CloseSession($upgradeRun)){throw 'Contained restart job did not terminate cleanly.'}}}catch{$finalizationFailures.Add($_.Exception.Message)}
     foreach($lock in @($oldMainLock,$legacyLock,$currentMainLock,$updaterPackageLock,$selectedAssetLock,$updaterLock,$oldPortableLock,$oldSetupLock,$driverLock)){if($lock){try{$lock.Stream.Dispose()}catch{$finalizationFailures.Add($_.Exception.Message)}}}
     if ($evidenceRoot) {
-        $evidence.FinishedUtc = [DateTimeOffset]::UtcNow.ToString('O')
-        try{Write-CanonicalJson -Value $evidence -Destination (Join-Path $evidenceRoot 'evidence.json')}catch{$finalizationFailures.Add($_.Exception.Message)}
-        try{$hashes = @(Get-FileInventory -Roots @($evidenceRoot));Write-CanonicalJson -Value ([ordered]@{ SchemaVersion=1; RunId=$runId; Files=$hashes }) -Destination (Join-Path $evidenceRoot 'files.sha256.json')}catch{$finalizationFailures.Add($_.Exception.Message)}
+        if($primaryFailure){$finalizationFailures.Insert(0,'Migration body failed: '+$primaryFailure.Exception.Message)}
+        try{Write-TerminalMigrationEvidence -Evidence $evidence -EvidenceRoot $evidenceRoot -RunId $runId -Failures $finalizationFailures}catch{$finalizationFailures.Add($_.Exception.Message)}
     }
 }
 
-if($primaryFailure-or$finalizationFailures.Count-ne 0){$messages=New-Object Collections.Generic.List[string];if($primaryFailure){$messages.Add($primaryFailure.Exception.Message)};$messages.AddRange([string[]]$finalizationFailures.ToArray());throw ('Migration gate failed: '+($messages -join ' | '))}
+if($primaryFailure-or$finalizationFailures.Count-ne 0){throw ('Migration gate failed: '+(@($finalizationFailures|Select-Object -Unique)-join ' | '))}
 if (-not $evidence.Succeeded) { throw 'The migration gate did not complete successfully.' }
 Write-Host "REAL_MIGRATION_GATE_PASS=$evidenceRoot"

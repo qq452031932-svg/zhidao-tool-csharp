@@ -574,6 +574,40 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         finally { Directory.Delete(root, recursive: true); }
     }
 
+    [Theory]
+    [InlineData("post-offline")]
+    [InlineData("cleanup")]
+    [InlineData("inventory")]
+    public async Task TerminalEvidenceRewritesPriorSuccessForBodyCleanupAndInventoryFailures(string mode)
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-terminal-{Guid.NewGuid():N}"); Directory.CreateDirectory(root);
+        var harness = System.IO.Path.Combine(root, "harness.ps1"); var evidenceRoot = System.IO.Path.Combine(root, "evidence"); Directory.CreateDirectory(evidenceRoot);
+        try
+        {
+            await File.WriteAllTextAsync(harness, """
+                param([string]$ScriptPath,[string]$EvidenceRoot,[string]$Mode)
+                $ErrorActionPreference='Stop';Import-Module Microsoft.PowerShell.Utility;$tokens=$null;$errors=$null
+                $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
+                foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
+                if($Mode-ceq'inventory'){function Get-FileInventory{throw 'forced inventory failure'}}
+                $evidence=[ordered]@{SchemaVersion=2;RunId='RUN';FinishedUtc=$null;Succeeded=$true;Error=$null}
+                $failures=New-Object Collections.Generic.List[string]
+                if($Mode-ceq'post-offline'){$failures.Add('Post-body offline assertion failed.')}
+                if($Mode-ceq'cleanup'){$failures.Add('CloseSession cleanup failed.')}
+                Write-TerminalMigrationEvidence -Evidence $evidence -EvidenceRoot $EvidenceRoot -RunId 'RUN' -Failures $failures
+                $saved=Get-Content -LiteralPath (Join-Path $EvidenceRoot 'evidence.json') -Raw -Encoding UTF8|ConvertFrom-Json
+                if($saved.Succeeded-ne$false-or[string]::IsNullOrWhiteSpace([string]$saved.Error)){throw 'Terminal evidence falsely retained success.'}
+                exit 23
+                """, new UTF8Encoding(false));
+            var start = PowerShell(); foreach (var value in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-EvidenceRoot", evidenceRoot, "-Mode", mode }) start.ArgumentList.Add(value);
+            using var process = Process.Start(start)!; var output = await process.StandardOutput.ReadToEndAsync() + await process.StandardError.ReadToEndAsync(); await process.WaitForExitAsync();
+            Assert.True(process.ExitCode == 23, output);
+            using var document = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(System.IO.Path.Combine(evidenceRoot, "evidence.json")));
+            Assert.False(document.RootElement.GetProperty("Succeeded").GetBoolean()); Assert.False(string.IsNullOrWhiteSpace(document.RootElement.GetProperty("Error").GetString()));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
     [Fact]
     public void FixtureContractRequiresRealMarkedDataAndProductionTrustChainLicense()
     {
