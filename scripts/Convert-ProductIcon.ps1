@@ -43,7 +43,15 @@ Add-Type -AssemblyName WindowsBase
 function Get-FileSha256 {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
-    return (Get-FileHash -Algorithm SHA256 -LiteralPath $LiteralPath).Hash.ToUpperInvariant()
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '')
+    }
+    finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
 }
 
 function Assert-ExpectedHash {
@@ -311,9 +319,11 @@ if ($SourceJpegPath) {
     }
     $sourceBitmap = ConvertTo-OnLoadBitmap -Bytes $sourceBytes
     Assert-Square640 -Bitmap $sourceBitmap -Label 'Source JPEG'
+    $sourceDimensions = "$($sourceBitmap.PixelWidth)x$($sourceBitmap.PixelHeight)"
 }
 else {
     $actualSourceHash = $ExpectedSourceSha256
+    $sourceDimensions = '640x640'
 }
 
 if (-not $VerifyOnly) {
@@ -355,4 +365,6 @@ if ($SourceJpegPath -and (Get-PixelSha256 -Bitmap $sourceBitmap) -ne (Get-PixelS
 Write-Output "Source JPEG SHA256: $actualSourceHash"
 Write-Output "Canonical PNG SHA256: $canonicalHash"
 Write-Output "ICO SHA256: $iconHash"
+Write-Output "SourceDimensions=$sourceDimensions"
+Write-Output "CanonicalDimensions=$($canonicalBitmap.PixelWidth)x$($canonicalBitmap.PixelHeight)"
 Read-AndValidateIcon -LiteralPath $iconFullPath -CanonicalBitmap $canonicalBitmap

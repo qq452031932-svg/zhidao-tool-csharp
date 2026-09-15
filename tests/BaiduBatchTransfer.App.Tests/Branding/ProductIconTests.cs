@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Windows.Media;
@@ -93,6 +94,51 @@ public sealed class ProductIconTests
         Assert.Contains("94BD33FCEB2228C45F6CCF44862D49E90F6DBECD2859445D2DBA67241AFA0A9B", script, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("[switch]$VerifyOnly", script, StringComparison.Ordinal);
         Assert.Contains("TransformedBitmap", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task VerifyOnlyPrintsSourceAndCanonicalDimensionsWithoutModifyingAssets()
+    {
+        var root = RepositoryRoot();
+        var pngPath = CanonicalPngPath();
+        var icoPath = IconPath();
+        var pngBytes = await File.ReadAllBytesAsync(pngPath);
+        var icoBytes = await File.ReadAllBytesAsync(icoPath);
+        var pngWriteTime = File.GetLastWriteTimeUtc(pngPath);
+        var icoWriteTime = File.GetLastWriteTimeUtc(icoPath);
+        var info = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = root,
+        };
+        foreach (var argument in new[]
+        {
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+            Path.Combine(root, "scripts", "Convert-ProductIcon.ps1"),
+            "-VerifyOnly",
+        })
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(info)!;
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await process.WaitForExitAsync(timeout.Token);
+        var output = string.Join(Environment.NewLine, await stdout, await stderr);
+
+        Assert.True(process.ExitCode == 0, output);
+        Assert.Contains("SourceDimensions=640x640", output, StringComparison.Ordinal);
+        Assert.Contains("CanonicalDimensions=640x640", output, StringComparison.Ordinal);
+        Assert.Equal(pngBytes, await File.ReadAllBytesAsync(pngPath));
+        Assert.Equal(icoBytes, await File.ReadAllBytesAsync(icoPath));
+        Assert.Equal(pngWriteTime, File.GetLastWriteTimeUtc(pngPath));
+        Assert.Equal(icoWriteTime, File.GetLastWriteTimeUtc(icoPath));
     }
 
     private static IReadOnlyList<IconEntry> ReadIconEntries(byte[] bytes)
