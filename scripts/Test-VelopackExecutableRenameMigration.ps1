@@ -129,9 +129,14 @@ public sealed class MigrationContainedResult {
     public int RestartPid; public string RestartPath; public string RestartStartedUtc; public string RestartFileIdentity; public IntPtr JobHandle;
 }
 public static class MigrationContainedRunner {
+    // Threat boundary: the gate requires an isolated standard-user profile with no
+    // other untrusted process under the same token. QueryFullProcessImageName plus
+    // immediate file-id capture/PowerShell read lock is fail-closed within that boundary;
+    // it does not claim to defeat a malicious same-user process racing mapped images.
     const uint CREATE_SUSPENDED=4, CREATE_NO_WINDOW=0x08000000, STARTF_USESTDHANDLES=0x100;
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE=0x2000, JOB_OBJECT_LIMIT_JOB_MEMORY=0x200, JOB_OBJECT_LIMIT_ACTIVE_PROCESS=8;
     const uint HANDLE_FLAG_INHERIT=1, WAIT_OBJECT_0=0;
+    const int JobObjectBasicProcessIdList=3;
     [StructLayout(LayoutKind.Sequential)] struct STARTUPINFO { public uint cb; public string r1,desktop,title; public uint x,y,xs,ys,xc,yc,fill,flags; public short show,reserved; public IntPtr r2,input,output,error; }
     [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr process,thread; public uint processId,threadId; }
     [StructLayout(LayoutKind.Sequential)] struct BASIC_LIMIT { public long processTime,jobTime; public uint flags; public UIntPtr min,max; public uint active; public UIntPtr affinity; public uint priority,scheduling; }
@@ -145,6 +150,7 @@ public static class MigrationContainedRunner {
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p);
     [DllImport("kernel32.dll",SetLastError=true)] static extern uint ResumeThread(IntPtr t);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateJobObject(IntPtr j,uint e);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint exitCode);
     [DllImport("kernel32.dll",SetLastError=true)] static extern uint WaitForSingleObject(IntPtr h,uint ms);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr h,out uint e);
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool QueryFullProcessImageName(IntPtr h,uint flags,StringBuilder path,ref uint size);
@@ -155,11 +161,11 @@ public static class MigrationContainedRunner {
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int i);
     static string Q(string s){var b=new StringBuilder("\"");int n=0;foreach(char c in s){if(c=='\\'){n++;continue;}if(c=='\"'){b.Append('\\',n*2+1).Append('"');}else{if(n>0)b.Append('\\',n);b.Append(c);}n=0;}if(n>0)b.Append('\\',n*2);return b.Append('"').ToString();}
     static uint Active(IntPtr j){int z=Marshal.SizeOf(typeof(ACCOUNTING));IntPtr p=Marshal.AllocHGlobal(z);try{uint r;if(!QueryInformationJobObject(j,1,p,(uint)z,out r))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());return ((ACCOUNTING)Marshal.PtrToStructure(p,typeof(ACCOUNTING))).active;}finally{Marshal.FreeHGlobal(p);}}
-    static uint[] ActivePids(IntPtr job){int capacity=16;int bytes=8+capacity*IntPtr.Size;IntPtr memory=Marshal.AllocHGlobal(bytes);try{uint returned;if(!QueryInformationJobObject(job,3,memory,(uint)bytes,out returned))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());uint count=(uint)Marshal.ReadInt32(memory,4);var ids=new uint[count];for(int i=0;i<count;i++)ids[i]=unchecked((uint)Marshal.ReadIntPtr(memory,8+i*IntPtr.Size).ToInt64());return ids;}finally{Marshal.FreeHGlobal(memory);}}
+    static uint[] ActivePids(IntPtr job){int capacity=16;int bytes=8+capacity*IntPtr.Size;IntPtr memory=Marshal.AllocHGlobal(bytes);try{uint returned;if(!QueryInformationJobObject(job,JobObjectBasicProcessIdList,memory,(uint)bytes,out returned))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());uint count=(uint)Marshal.ReadInt32(memory,4);var ids=new uint[count];for(int i=0;i<count;i++)ids[i]=unchecked((uint)Marshal.ReadIntPtr(memory,8+i*IntPtr.Size).ToInt64());return ids;}finally{Marshal.FreeHGlobal(memory);}}
     static string ProcessPathAndStart(uint pid,out string started,out string identity){IntPtr process=OpenProcess(0x1000,false,pid);if(process==IntPtr.Zero)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());try{var path=new StringBuilder(32768);uint size=(uint)path.Capacity;if(!QueryFullProcessImageName(process,0,path,ref size))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());System.Runtime.InteropServices.ComTypes.FILETIME c,e,k,u;if(!GetProcessTimes(process,out c,out e,out k,out u))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());long ticks=((long)c.dwHighDateTime<<32)|(uint)c.dwLowDateTime;started=DateTimeOffset.FromFileTime(ticks).ToString("O");string full=Path.GetFullPath(path.ToString());using(var file=new FileStream(full,FileMode.Open,FileAccess.Read,FileShare.Read)){identity=MigrationFileIdentity.Get(file);}return full;}finally{CloseHandle(process);}}
     static bool Offline(){foreach(var n in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()){if(n.NetworkInterfaceType!=System.Net.NetworkInformation.NetworkInterfaceType.Loopback && n.OperationalStatus==System.Net.NetworkInformation.OperationalStatus.Up)return false;}return true;}
     public static MigrationContainedResult Run(string exe,string[] args,string cwd,string stdoutPath,string stderrPath,int timeoutMs,long maxLog,string completionMode,string expectedRestartPath){
-      if(completionMode!="NoRestart"&&completionMode!="SuccessExpectRestart")throw new ArgumentException("Unknown completion mode.");if(completionMode=="SuccessExpectRestart"&&String.IsNullOrWhiteSpace(expectedRestartPath))throw new ArgumentException("Expected restart path is required.");
+      if(completionMode!="NoRestart"&&completionMode!="SuccessExpectRestart"&&completionMode!="ExpectRootAlive")throw new ArgumentException("Unknown completion mode.");if(completionMode!="NoRestart"&&String.IsNullOrWhiteSpace(expectedRestartPath))throw new ArgumentException("Expected live-process path is required.");
       var r=new MigrationContainedResult{ExitCode=-1,SafeToCleanup=false};IntPtr job=IntPtr.Zero;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();FileStream so=null,se=null;bool assigned=false;
       try{job=CreateJobObject(IntPtr.Zero,null);if(job==IntPtr.Zero)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());var lim=new EXT_LIMIT();lim.basic.flags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE|JOB_OBJECT_LIMIT_JOB_MEMORY|JOB_OBJECT_LIMIT_ACTIVE_PROCESS;lim.basic.active=8;lim.jobMemory=new UIntPtr(1073741824);int z=Marshal.SizeOf(typeof(EXT_LIMIT));IntPtr lp=Marshal.AllocHGlobal(z);try{Marshal.StructureToPtr(lim,lp,false);if(!SetInformationJobObject(job,9,lp,(uint)z))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());}finally{Marshal.FreeHGlobal(lp);}
         so=new FileStream(stdoutPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read);se=new FileStream(stderrPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read);SetHandleInformation(so.SafeFileHandle.DangerousGetHandle(),HANDLE_FLAG_INHERIT,HANDLE_FLAG_INHERIT);SetHandleInformation(se.SafeFileHandle.DangerousGetHandle(),HANDLE_FLAG_INHERIT,HANDLE_FLAG_INHERIT);
@@ -167,11 +173,12 @@ public static class MigrationContainedRunner {
         r.StartedUtc=DateTimeOffset.UtcNow.ToString("O");if(!CreateProcess(exe,cmd,IntPtr.Zero,IntPtr.Zero,true,CREATE_SUSPENDED|CREATE_NO_WINDOW,IntPtr.Zero,cwd,ref si,out pi))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());r.ProcessId=(int)pi.processId;
         var image=new StringBuilder(32768);uint imageSize=(uint)image.Capacity;if(!QueryFullProcessImageName(pi.process,0,image,ref imageSize))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());if(!String.Equals(Path.GetFullPath(image.ToString()),Path.GetFullPath(exe),StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Suspended process executable path differs from the verified ApplicationName.");
         if(!AssignProcessToJobObject(job,pi.process))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());assigned=true;if(ResumeThread(pi.thread)==UInt32.MaxValue)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());CloseHandle(pi.thread);pi.thread=IntPtr.Zero;var timer=Stopwatch.StartNew();long rootDoneAt=-1;
-        while(true){bool done=rootDoneAt>=0||WaitForSingleObject(pi.process,100)==WAIT_OBJECT_0;if(!Offline()){r.Failure="Offline invariant changed during contained process.";TerminateJobObject(job,0xEE10);break;}if(so.Length>maxLog||se.Length>maxLog||so.Length>maxLog-se.Length){r.Failure="Contained process output exceeded limit.";TerminateJobObject(job,0xEE11);break;}if(timer.ElapsedMilliseconds>timeoutMs){r.Failure="Contained process timed out.";TerminateJobObject(job,0xEE12);break;}if(done){if(rootDoneAt<0){rootDoneAt=timer.ElapsedMilliseconds;uint rootCode;if(GetExitCodeProcess(pi.process,out rootCode))r.ExitCode=unchecked((int)rootCode);CloseHandle(pi.process);pi.process=IntPtr.Zero;}var ids=ActivePids(job);if(completionMode=="NoRestart"){if(ids.Length!=0){r.Failure="NoRestart process left a live job child.";TerminateJobObject(job,0xEE14);}break;}if(ids.Length!=1||ids[0]==pi.processId){if(timer.ElapsedMilliseconds-rootDoneAt<750){System.Threading.Thread.Sleep(25);continue;}r.Failure="SuccessExpectRestart requires exactly one non-root live job process; observed ["+String.Join(",",ids)+"].";TerminateJobObject(job,0xEE15);break;}string childStarted,childIdentity;string childPath=ProcessPathAndStart(ids[0],out childStarted,out childIdentity);if(!String.Equals(childPath,Path.GetFullPath(expectedRestartPath),StringComparison.OrdinalIgnoreCase)){r.Failure="SuccessExpectRestart child executable path mismatch.";TerminateJobObject(job,0xEE16);break;}r.RestartPid=(int)ids[0];r.RestartPath=childPath;r.RestartStartedUtc=childStarted;r.RestartFileIdentity=childIdentity;r.JobHandle=job;job=IntPtr.Zero;break;}}
+        if(completionMode=="ExpectRootAlive"){if(WaitForSingleObject(pi.process,0)==WAIT_OBJECT_0)throw new InvalidOperationException("Expected root process exited before liveness proof.");string rootStarted,rootIdentity;string rootPath=ProcessPathAndStart(pi.processId,out rootStarted,out rootIdentity);if(!String.Equals(rootPath,Path.GetFullPath(expectedRestartPath),StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("ExpectRootAlive executable path mismatch.");r.RestartPid=(int)pi.processId;r.RestartPath=rootPath;r.RestartStartedUtc=rootStarted;r.RestartFileIdentity=rootIdentity;r.JobHandle=job;job=IntPtr.Zero;uint ignored;if(GetExitCodeProcess(pi.process,out ignored))r.ExitCode=unchecked((int)ignored);CloseHandle(pi.process);pi.process=IntPtr.Zero;}
+        while(completionMode!="ExpectRootAlive"){bool done=rootDoneAt>=0||WaitForSingleObject(pi.process,100)==WAIT_OBJECT_0;if(!Offline()){r.Failure="Offline invariant changed during contained process.";TerminateJobObject(job,0xEE10);break;}if(so.Length>maxLog||se.Length>maxLog||so.Length>maxLog-se.Length){r.Failure="Contained process output exceeded limit.";TerminateJobObject(job,0xEE11);break;}if(timer.ElapsedMilliseconds>timeoutMs){r.Failure="Contained process timed out.";TerminateJobObject(job,0xEE12);break;}if(done){if(rootDoneAt<0){rootDoneAt=timer.ElapsedMilliseconds;uint rootCode;if(GetExitCodeProcess(pi.process,out rootCode))r.ExitCode=unchecked((int)rootCode);CloseHandle(pi.process);pi.process=IntPtr.Zero;}var ids=ActivePids(job);if(completionMode=="NoRestart"){if(ids.Length!=0){r.Failure="NoRestart process left a live job child.";TerminateJobObject(job,0xEE14);}break;}if(ids.Length!=1||ids[0]==pi.processId){if(timer.ElapsedMilliseconds-rootDoneAt<750){System.Threading.Thread.Sleep(25);continue;}r.Failure="SuccessExpectRestart requires exactly one non-root live job process; observed ["+String.Join(",",ids)+"].";TerminateJobObject(job,0xEE15);break;}string childStarted,childIdentity;string childPath=ProcessPathAndStart(ids[0],out childStarted,out childIdentity);if(!String.Equals(childPath,Path.GetFullPath(expectedRestartPath),StringComparison.OrdinalIgnoreCase)){r.Failure="SuccessExpectRestart child executable path mismatch.";TerminateJobObject(job,0xEE16);break;}r.RestartPid=(int)ids[0];r.RestartPath=childPath;r.RestartStartedUtc=childStarted;r.RestartFileIdentity=childIdentity;r.JobHandle=job;job=IntPtr.Zero;break;}}
         if(r.JobHandle==IntPtr.Zero){var emptyTimer=Stopwatch.StartNew();while(Active(job)!=0&&emptyTimer.ElapsedMilliseconds<5000)System.Threading.Thread.Sleep(25);r.SafeToCleanup=Active(job)==0;}else r.SafeToCleanup=false;r.CompletedUtc=DateTimeOffset.UtcNow.ToString("O");
-      }catch(Exception e){if(assigned&&job!=IntPtr.Zero)TerminateJobObject(job,0xEE13);r.Failure=e.Message;r.CompletedUtc=DateTimeOffset.UtcNow.ToString("O");}
+      }catch(Exception e){string cleanup=null;if(assigned&&job!=IntPtr.Zero){if(!TerminateJobObject(job,0xEE13))cleanup="TerminateJobObject failed: "+new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message;}else if(pi.process!=IntPtr.Zero){if(!TerminateProcess(pi.process,0xEE17)||WaitForSingleObject(pi.process,5000)!=WAIT_OBJECT_0)cleanup="Unassigned root process could not be terminated and joined.";}r.Failure=e.Message+(cleanup==null?"":"; "+cleanup);r.CompletedUtc=DateTimeOffset.UtcNow.ToString("O");}
       finally{if(pi.thread!=IntPtr.Zero)CloseHandle(pi.thread);if(pi.process!=IntPtr.Zero)CloseHandle(pi.process);if(job!=IntPtr.Zero)CloseHandle(job);if(so!=null)so.Dispose();if(se!=null)se.Dispose();}
-      try{r.StandardOutput=File.Exists(stdoutPath)?File.ReadAllText(stdoutPath,Encoding.Default):"";r.StandardError=File.Exists(stderrPath)?File.ReadAllText(stderrPath,Encoding.Default):"";}catch(Exception e){r.Failure="Unable to read bounded logs: "+e.Message;}return r;
+      if(r.JobHandle==IntPtr.Zero)try{var strict=new UTF8Encoding(false,true);r.StandardOutput=File.Exists(stdoutPath)?strict.GetString(File.ReadAllBytes(stdoutPath)):"";r.StandardError=File.Exists(stderrPath)?strict.GetString(File.ReadAllBytes(stderrPath)):"";}catch(Exception e){r.Failure=(r.Failure==null?"":r.Failure+"; ")+"Unable to read strict UTF-8 bounded logs: "+e.Message;}return r;
     }
     public static bool CloseSession(MigrationContainedResult result){if(result==null||result.JobHandle==IntPtr.Zero)return true;IntPtr job=result.JobHandle;result.JobHandle=IntPtr.Zero;try{TerminateJobObject(job,0xEE20);var timer=Stopwatch.StartNew();while(timer.ElapsedMilliseconds<5000){if(Active(job)==0){result.SafeToCleanup=true;return true;}System.Threading.Thread.Sleep(25);}return false;}finally{CloseHandle(job);}}
 }
@@ -293,7 +300,7 @@ function Assert-CanonicalSignedFixture {
     $utf8 = New-Object Text.UTF8Encoding($false, $true)
     try { $json = $utf8.GetString($bytes) } catch { throw 'Migration fixture is not canonical UTF-8.' }
     try { $fixture = $json | ConvertFrom-Json } catch { throw 'Migration fixture JSON is malformed.' }
-    $expectedProperties = @('application_failure_hook_relative_path','application_failure_package_file','license_signing_key_id','license_signing_spki_base64','new_delta_file','new_full_file','old_full_file','old_portable_file','old_setup_file','schema_version','state_driver_file','state_driver_sha256')
+    $expectedProperties = @('application_failure_hook_relative_path','application_failure_package_file','download_interrupted_exit_code','download_interrupted_marker','download_interrupted_stderr_sha256','download_interrupted_stdout_sha256','license_signing_key_id','license_signing_spki_base64','new_delta_file','new_full_file','new_main_sha256','old_full_file','old_portable_file','old_setup_file','schema_version','state_driver_file','state_driver_sha256')
     $actualProperties = @($fixture.PSObject.Properties.Name | Sort-Object)
     if (($actualProperties -join "`n") -cne ($expectedProperties -join "`n") -or $fixture.schema_version -ne 1) {
         throw 'Migration fixture schema is not exactly version 1.'
@@ -301,7 +308,8 @@ function Assert-CanonicalSignedFixture {
     foreach ($name in @('application_failure_package_file','new_delta_file','new_full_file','old_full_file','old_portable_file','old_setup_file','state_driver_file')) {
         Assert-AssetFileName -FileName ([string]$fixture.$name) -Label $name | Out-Null
     }
-    if ([string]$fixture.state_driver_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'state_driver_sha256 is invalid.' }
+    if ([string]$fixture.state_driver_sha256 -cnotmatch '^[0-9a-f]{64}$'-or[string]$fixture.new_main_sha256-cnotmatch'^[0-9a-f]{64}$') { throw 'Fixture executable SHA-256 pin is invalid.' }
+    if([int64]$fixture.download_interrupted_exit_code-eq 0-or[string]$fixture.download_interrupted_marker-cnotmatch'^[A-Za-z0-9_.:-]{1,128}$'-or[string]$fixture.download_interrupted_stdout_sha256-cnotmatch'^[0-9a-f]{64}$'-or[string]$fixture.download_interrupted_stderr_sha256-cnotmatch'^[0-9a-f]{64}$'){throw 'Signed DownloadInterrupted failure fingerprint is invalid or empty.'}
     $hookRelative=[string]$fixture.application_failure_hook_relative_path
     if([string]::IsNullOrWhiteSpace($hookRelative)-or[IO.Path]::IsPathRooted($hookRelative)){throw 'Application failure hook path must be relative.'}
     Assert-StrictChildPath -Candidate (Join-Path 'C:\fixture-root' $hookRelative) -Root 'C:\fixture-root' -Label 'Application failure hook relative path'|Out-Null
@@ -519,12 +527,12 @@ function Write-CanonicalJson {
 }
 
 function Copy-BoundedLockedAsset {
-    param([string]$Source,[string]$Destination,[long]$MaximumBytes=1073741824)
+    param([string]$Source,[string]$Destination,[long]$MaximumBytes=1073741824,[long]$RemainingBudget=4294967296)
     $input=[IO.File]::Open($Source,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     try {
-        if($input.Length-lt 1-or$input.Length-gt$MaximumBytes){throw 'Allowlisted asset size is outside the bound.'}
+        if($input.Length-lt 1-or$input.Length-gt$MaximumBytes-or$input.Length-gt$RemainingBudget){throw 'Allowlisted asset size exceeds the per-file or remaining total budget.'}
         $output=[IO.File]::Open($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
-        try{$buffer=New-Object byte[] 1048576;$copied=0L;while(($read=$input.Read($buffer,0,$buffer.Length))-gt 0){$copied+=$read;if($copied-gt$MaximumBytes){throw 'Allowlisted asset copy exceeded the bound.'};$output.Write($buffer,0,$read)}}finally{$output.Dispose()}
+        try{$buffer=New-Object byte[] 1048576;$copied=0L;while(($read=$input.Read($buffer,0,$buffer.Length))-gt 0){$copied+=$read;if($copied-gt$MaximumBytes-or$copied-gt$RemainingBudget){throw 'Allowlisted asset copy exceeded the remaining total budget.'};$output.Write($buffer,0,$read)}}finally{$output.Dispose()}
         if((Get-Item -LiteralPath $Destination).Length-ne$input.Length){throw 'Allowlisted asset copy length mismatch.'}
         $input.Position=0;$sourceHash=Get-StreamingSha256 -File $Source;$destinationHash=Get-StreamingSha256 -File $Destination
         if($sourceHash-cne$destinationHash){throw 'Allowlisted asset copy hash mismatch.'}
@@ -727,74 +735,14 @@ function Assert-FileIsExactPrefix {
     } finally {$sourceStream.Dispose();$prefixStream.Dispose()}
 }
 
-function Assert-UpdaterCommandLine {
-    param($ObservedUpdater,[string]$ObservedUpdaterJson,[string]$ExpectedUpdater,[string]$ExpectedUpdaterIdentity,[string]$ExpectedPackage,[string]$InstallRoot,[string]$LocalReleaseSource,[string]$RunId)
-    if(-not$ObservedUpdater-and$ObservedUpdaterJson){$ObservedUpdater=$ObservedUpdaterJson|ConvertFrom-Json}
-    if(-not$ObservedUpdater-or@($ObservedUpdater.ParentPidChain).Count-lt 1){throw 'Observed updater parent PID chain is missing.'}
-    $arguments=@($ObservedUpdater.Arguments)
-    $urlTokens=@($arguments|Where-Object{[string]$_-match'(?i)https?://|^[a-z][a-z0-9+.-]*://'})
-    if($arguments.Count-ne 8-or$urlTokens.Count-ne 0){throw 'Observed updater command line contains an unexpected token or URL.'}
-    $expected=@($ExpectedUpdater,'apply','--package',$ExpectedPackage,'--rootDir',$InstallRoot,'--packageDir',$LocalReleaseSource)
-    foreach($index in @(0,3,5,7)){if(-not[string]::Equals([IO.Path]::GetFullPath([string]$arguments[$index]),[IO.Path]::GetFullPath([string]$expected[$index]),[StringComparison]::OrdinalIgnoreCase)){throw "Observed updater path token $index is not the fixed local apply contract."}}
-    foreach($index in @(1,2,4,6)){if([string]$arguments[$index]-cne[string]$expected[$index]){throw "Observed updater verb token $index is not the fixed local apply contract."}}
-    if($ExpectedUpdaterIdentity){$identityLock=Open-ArtifactReadLock -File ([string]$ObservedUpdater.Path) -Label 'Observed updater executable';try{if($identityLock.Identity-cne$ExpectedUpdaterIdentity){throw 'Observed updater executable file identity does not match the locked Update.exe.'}}finally{$identityLock.Stream.Dispose()}}
-    $marker=Join-Path $LocalReleaseSource ".migration-source-$RunId.json"
-    if(-not(Test-Path -LiteralPath $marker -PathType Leaf)){throw 'Run-owned local release source marker is missing.'}
-    Assert-NoReparseAncestors -ExistingPath $marker -Label 'Local release source marker';Get-FileHardLinkCount $marker|Out-Null
-}
-
-function Assert-UpgradeEvidence {
-    param(
-        [string]$EvidenceJson, [string]$RunId, [string]$ExpectedChallengeSha256, [string]$Scenario,
-        [string]$AssetKind, [string]$Path, [string]$FailureInjection, [string]$ExpectedAssetPath, [string]$ExpectedAssetSha256,
-        [long]$ExpectedAssetBytes, [string]$ExpectedUpdaterPath, [string]$ExpectedUpdaterPackage, [string]$ObservedUpdaterJson,
-        [DateTimeOffset]$WindowStartedUtc, [DateTimeOffset]$WindowCompletedUtc, [string]$RunOwnedRoot
-    )
-    try { $upgrade = $EvidenceJson | ConvertFrom-Json } catch { throw 'Upgrade evidence JSON is malformed.' }
-    if ([string]$upgrade.run_id -cne $RunId -or [string]$upgrade.challenge_sha256 -cne $ExpectedChallengeSha256) { throw 'Upgrade evidence run id or challenge does not match this invocation.' }
-    if ([string]$upgrade.scenario -cne $Scenario -or [string]$upgrade.asset_kind -cne $AssetKind -or [string]$upgrade.path -cne $Path -or [string]$upgrade.failure_injection -cne $FailureInjection) { throw 'Upgrade evidence scenario fields do not match this invocation.' }
-    if (-not[string]::Equals([IO.Path]::GetFullPath([string]$upgrade.source_asset_path),[IO.Path]::GetFullPath($ExpectedAssetPath),[StringComparison]::OrdinalIgnoreCase)-or[string]$upgrade.source_asset_sha256 -cne $ExpectedAssetSha256 -or [long]$upgrade.source_asset_length -ne $ExpectedAssetBytes) { throw 'Upgrade evidence is not bound to the selected local source asset.' }
-    try { $observed=$ObservedUpdaterJson|ConvertFrom-Json } catch { throw 'ObservedUpdater evidence is malformed.' }
-    if (-not $observed -or [int]$observed.Pid -le 0) { throw 'An independently observed updater process is required.' }
-    if (-not[string]::Equals([IO.Path]::GetFullPath([string]$observed.Path),[IO.Path]::GetFullPath($ExpectedUpdaterPath),[StringComparison]::OrdinalIgnoreCase) -or
-        [int]$upgrade.updater_pid -ne [int]$observed.Pid -or-not[string]::Equals([IO.Path]::GetFullPath([string]$upgrade.updater_path),[IO.Path]::GetFullPath([string]$observed.Path),[StringComparison]::OrdinalIgnoreCase) -or
-        [string]$upgrade.updater_started_utc -cne [string]$observed.StartedUtc) { throw 'Driver updater evidence does not match the independently observed install-root Update.exe process.' }
-    $started=[DateTimeOffset]::MinValue; $completed=[DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParseExact([string]$upgrade.started_utc,'O',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$started) -or
-        -not [DateTimeOffset]::TryParseExact([string]$upgrade.completed_utc,'O',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$completed) -or
-        $started -lt $WindowStartedUtc -or $completed -gt $WindowCompletedUtc -or $completed -lt $started) { throw 'Upgrade timestamps are outside this invocation window.' }
-    if ($upgrade.update_manager_invoked -ne $true -or [string]::IsNullOrWhiteSpace([string]$upgrade.update_manager_stage)) { throw 'The trusted driver did not invoke a named Velopack UpdateManager stage.' }
-    if ($FailureInjection -ceq 'None') {
-        if ($upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -ne 0 -or $upgrade.update_manager_succeeded -ne $true -or [string]$upgrade.update_manager_stage -cne 'apply-completed' -or [string]$upgrade.outcome -cne 'updated') {
-            throw 'Successful migration did not execute the Velopack updater successfully.'
-        }
-    } elseif ($FailureInjection -ceq 'DownloadInterrupted') {
-        $partial=Assert-StrictChildPath -Candidate ([string]$upgrade.partial_artifact_path) -Root $RunOwnedRoot -Label 'Partial download artifact'
-        if(-not[string]::Equals([IO.Path]::GetFullPath($partial),[IO.Path]::GetFullPath($ExpectedUpdaterPackage),[StringComparison]::OrdinalIgnoreCase)){throw 'Driver partial artifact is not the script-created updater package.'}
-        if (-not (Test-Path -LiteralPath $partial -PathType Leaf)) { throw 'Partial download artifact was not created.' }
-        Assert-NoReparseAncestors -ExistingPath $partial -Label 'Partial download artifact'
-        $partialInfo=Get-Item -LiteralPath $partial
-        if ($partialInfo.Length -le 0 -or $partialInfo.Length -ge $ExpectedAssetBytes -or [long]$upgrade.bytes_consumed -ne $partialInfo.Length -or [string]$upgrade.partial_artifact_sha256 -cne (Get-StreamingSha256 $partial) -or
-            $upgrade.fault_observed -ne $true -or $upgrade.asset_opened -ne $true -or $upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -eq 0 -or $upgrade.update_manager_succeeded -ne $false -or [string]$upgrade.update_manager_stage -cne 'download-failed' -or
-            [string]$upgrade.old_version_after_failure -cne '1.1.0' -or [string]$upgrade.outcome -cne 'failed-and-rolled-back') {
-            throw 'DownloadInterrupted did not prove a real updater/UpdateManager failure over an independently hashed partial artifact and 1.1.0 rollback.'
-        }
-        Assert-FileIsExactPrefix -Source ([string]$upgrade.source_asset_path) -Prefix $partial
-    } else {
-        $hook=Assert-StrictChildPath -Candidate ([string]$upgrade.candidate_hook_trace_path) -Root $RunOwnedRoot -Label 'Candidate failure hook trace'
-        if(-not(Test-Path -LiteralPath $hook -PathType Leaf)){throw 'Candidate failure hook trace is missing.'};Assert-NoReparseAncestors -ExistingPath $hook -Label 'Candidate failure hook trace';Get-FileHardLinkCount $hook|Out-Null
-        [byte[]]$hookBytes=[IO.File]::ReadAllBytes($hook);$hookUtf8=New-Object Text.UTF8Encoding($false,$true)
-        try{$hookJson=$hookUtf8.GetString($hookBytes);$hookRecord=$hookJson|ConvertFrom-Json}catch{throw 'Candidate hook trace is not canonical UTF-8 JSON.'}
-        $hookNames=@($hookRecord.PSObject.Properties.Name|Sort-Object);$expectedHookNames=@('challenge_sha256','created_utc','run_id','scenario','source_sha256')
-        $hookCreated=[DateTimeOffset]::MinValue
-        if(($hookNames-join"`n")-cne($expectedHookNames-join"`n")-or(ConvertTo-CanonicalJson $hookRecord)+"`n"-cne$hookJson-or-not[DateTimeOffset]::TryParseExact([string]$hookRecord.created_utc,'O',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$hookCreated)-or$hookCreated-lt$WindowStartedUtc-or$hookCreated-gt$WindowCompletedUtc-or[string]$hookRecord.run_id-cne$RunId-or[string]$hookRecord.challenge_sha256-cne$ExpectedChallengeSha256-or[string]$hookRecord.source_sha256-cne$ExpectedAssetSha256-or[string]$hookRecord.scenario-cne$Scenario){throw 'Candidate hook trace contract is stale or not bound to this run.'}
-        if ([string]$upgrade.candidate_hook_challenge_sha256 -cne $ExpectedChallengeSha256 -or [string]$upgrade.candidate_hook_trace_sha256 -cne (Get-StreamingSha256 $hook) -or
-            $upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -eq 0 -or $upgrade.update_manager_succeeded -ne $false -or [string]$upgrade.update_manager_stage -cne 'apply-failed' -or $upgrade.fault_observed -ne $true -or
-            [string]$upgrade.old_version_after_failure -cne '1.1.0' -or [string]$upgrade.outcome -cne 'failed-and-rolled-back') {
-            throw 'ApplicationFailed did not prove an observed updater nonzero exit, challenge-bound candidate hook, UpdateManager failure, and 1.1.0 rollback.'
-        }
-    }
-    return $upgrade
+function Assert-DownloadInterruptedFingerprint {
+    param([int]$ExitCode,[string]$StdoutPath,[string]$StderrPath,[string]$ExpectedStdoutSha256,[string]$ExpectedStderrSha256,[int]$ExpectedExitCode,[string]$ExpectedMarker,[string]$SourceLeaf,[string]$PartialLeaf)
+    if($ExitCode-ne$ExpectedExitCode-or$ExitCode-eq 0){throw 'DownloadInterrupted exit code does not match the signed Velopack fingerprint.'}
+    $strict=New-Object Text.UTF8Encoding($false,$true)
+    try{$stdoutBytes=[IO.File]::ReadAllBytes($StdoutPath);$stderrBytes=[IO.File]::ReadAllBytes($StderrPath);$stdout=$strict.GetString($stdoutBytes);$stderr=$strict.GetString($stderrBytes)}catch{throw 'DownloadInterrupted output is not strict UTF-8.'}
+    if((Get-StreamingSha256 $StdoutPath)-cne$ExpectedStdoutSha256-or(Get-StreamingSha256 $StderrPath)-cne$ExpectedStderrSha256){throw 'DownloadInterrupted output hash does not match the signed Velopack fingerprint.'}
+    $combined=$stdout+"`n"+$stderr
+    foreach($required in @($ExpectedMarker,$SourceLeaf,$PartialLeaf)){if([string]::IsNullOrWhiteSpace($required)-or-not$combined.Contains($required)){throw 'DownloadInterrupted output is not bound to the exact partial/source leaf and signed marker.'}}
 }
 
 function Assert-PublisherExecutable {
@@ -834,109 +782,6 @@ function Assert-ExactThreePartVersion {
     param([string]$Executable,[string]$Expected)
     $version=[string][Diagnostics.FileVersionInfo]::GetVersionInfo($Executable).ProductVersion
     Assert-CanonicalSemverText -Actual $version -Expected $Expected
-}
-
-function Stop-OwnedProcessTree {
-    param([int]$RootProcessId)
-    $all = @(Get-CimInstance Win32_Process)
-    $ids = New-Object System.Collections.Generic.List[int]
-    $ids.Add($RootProcessId)
-    do {
-        $added = $false
-        foreach ($process in $all) {
-            if ($ids.Contains([int]$process.ParentProcessId) -and -not $ids.Contains([int]$process.ProcessId)) {
-                $ids.Add([int]$process.ProcessId); $added = $true
-            }
-        }
-    } while ($added)
-    foreach ($id in @($ids | Sort-Object -Descending)) {
-        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
-    }
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
-    do {
-        $remaining = @($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-        if ($remaining.Count -eq 0) { return }
-        Start-Sleep -Milliseconds 100
-    } while ([DateTimeOffset]::UtcNow -lt $deadline)
-    throw "Owned process tree could not be terminated: $($remaining -join ',')"
-}
-
-function ConvertTo-NativeCommandLine {
-    param([string[]]$Arguments)
-    return (($Arguments | ForEach-Object {
-        $argument = [string]$_
-        if ($argument.IndexOf([char]0) -ge 0) { throw 'A process argument contains a NUL character.' }
-        '"' + [regex]::Replace($argument, '(\\*)"', '$1$1\"') + ([regex]::Match($argument, '\\+$').Value) + '"'
-    }) -join ' ')
-}
-
-function Invoke-MonitoredProcess {
-    param([string]$File, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds, [string]$ExpectedUpdater, [switch]$RequireUpdaterObservation)
-    $token = [Guid]::NewGuid().ToString('N')
-    $stdoutPath = Join-Path $WorkingDirectory ".migration-$token.stdout"
-    $stderrPath = Join-Path $WorkingDirectory ".migration-$token.stderr"
-    $started = [DateTimeOffset]::UtcNow
-    Assert-NoNonLoopbackNetwork | Out-Null
-    $watcher=$null;$subscription=$null;$eventSource="migration-process-start-$token"
-    if($RequireUpdaterObservation){$watcher=New-Object Management.ManagementEventWatcher 'SELECT * FROM Win32_ProcessStartTrace';$subscription=Register-ObjectEvent -InputObject $watcher -EventName EventArrived -SourceIdentifier $eventSource;$watcher.Start()}
-    $process = Start-Process -FilePath $File -ArgumentList (ConvertTo-NativeCommandLine $Arguments) -WorkingDirectory $WorkingDirectory -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -NoNewWindow -PassThru
-    $observedUpdater = $null
-    $startEvents=New-Object Collections.Generic.List[object]
-    $maximumPollMilliseconds=0.0
-    try {
-        $deadline = $started.AddSeconds($TimeoutSeconds)
-        while (-not $process.HasExited) {
-            $pollStarted=[DateTimeOffset]::UtcNow
-            try { Assert-NoNonLoopbackNetwork | Out-Null } catch { Stop-OwnedProcessTree -RootProcessId $process.Id; throw }
-            $snapshot=@(Get-CimInstance Win32_Process -ErrorAction Stop)
-            if($RequireUpdaterObservation){foreach($creationEvent in @(Get-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue)){$payload=$creationEvent.SourceEventArgs.NewEvent;$startEvents.Add([ordered]@{Pid=[int]$payload.ProcessID;ParentPid=[int]$payload.ParentProcessID;ProcessName=[string]$payload.ProcessName});Remove-Event -EventIdentifier $creationEvent.EventIdentifier -ErrorAction SilentlyContinue}}
-            $descendantIds=New-Object Collections.Generic.List[int]
-            $descendantIds.Add($process.Id)
-            do {
-                $added=$false
-                foreach($item in $snapshot) { if ($descendantIds.Contains([int]$item.ParentProcessId) -and -not $descendantIds.Contains([int]$item.ProcessId)) { $descendantIds.Add([int]$item.ProcessId); $added=$true } }
-            } while($added)
-            foreach ($candidate in $snapshot) {
-                if ($RequireUpdaterObservation -and $descendantIds.Contains([int]$candidate.ProcessId) -and [int]$candidate.ProcessId -ne $process.Id -and $candidate.ExecutablePath -and
-                    [string]::Equals([IO.Path]::GetFullPath([string]$candidate.ExecutablePath), [IO.Path]::GetFullPath($ExpectedUpdater), [StringComparison]::OrdinalIgnoreCase)) {
-                    $creation=$candidate.CreationDate
-                    $creationUtc=if($creation-is[DateTime]){([DateTime]$creation).ToUniversalTime()}else{[Management.ManagementDateTimeConverter]::ToDateTime([string]$creation).ToUniversalTime()}
-                    $parentChain=New-Object Collections.Generic.List[object];$cursor=$candidate
-                    while($cursor-and[int]$cursor.ProcessId-ne$process.Id){$parentChain.Add([ordered]@{Pid=[int]$cursor.ProcessId;ParentPid=[int]$cursor.ParentProcessId});$parentId=[int]$cursor.ParentProcessId;$cursor=@($snapshot|Where-Object{[int]$_.ProcessId-eq$parentId})|Select-Object -First 1}
-                    if(-not$cursor-or[int]$cursor.ProcessId-ne$process.Id){throw 'Observed updater parent PID chain did not terminate at the trusted driver.'}
-                    [string[]]$parsedArguments=[MigrationNativeCommandLine]::Split([string]$candidate.CommandLine)
-                    $observedUpdater = [ordered]@{ Pid=[int]$candidate.ProcessId; ParentPidChain=$parentChain.ToArray(); Path=[IO.Path]::GetFullPath([string]$candidate.ExecutablePath); CommandLine=[string]$candidate.CommandLine; Arguments=$parsedArguments; StartedUtc=$creationUtc.ToString('O') }
-                }
-            }
-            foreach ($outputPath in @($stdoutPath,$stderrPath)) {
-                if ((Test-Path -LiteralPath $outputPath) -and (Get-Item -LiteralPath $outputPath).Length -gt $script:MaximumDriverOutputBytes) { Stop-OwnedProcessTree -RootProcessId $process.Id; throw 'Bounded process output exceeded the byte limit.' }
-            }
-            if ([DateTimeOffset]::UtcNow -ge $deadline) { Stop-OwnedProcessTree -RootProcessId $process.Id; throw "Bounded process timed out after $TimeoutSeconds seconds." }
-            $pollMilliseconds=([DateTimeOffset]::UtcNow-$pollStarted).TotalMilliseconds;if($pollMilliseconds-gt$maximumPollMilliseconds){$maximumPollMilliseconds=$pollMilliseconds}
-            Start-Sleep -Milliseconds 20
-            $process.Refresh()
-        }
-        $process.WaitForExit()
-        Start-Sleep -Milliseconds 50
-        if($RequireUpdaterObservation){foreach($creationEvent in @(Get-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue)){$payload=$creationEvent.SourceEventArgs.NewEvent;$startEvents.Add([ordered]@{Pid=[int]$payload.ProcessID;ParentPid=[int]$payload.ParentProcessID;ProcessName=[string]$payload.ProcessName});Remove-Event -EventIdentifier $creationEvent.EventIdentifier -ErrorAction SilentlyContinue}}
-        if($RequireUpdaterObservation-and-not$observedUpdater){$instant=@($startEvents|Where-Object{[string]$_.ProcessName-ceq[IO.Path]::GetFileName($ExpectedUpdater)-and[int]$_.ParentPid-eq$process.Id})|Select-Object -Last 1;if($instant){$observedUpdater=[ordered]@{Pid=[int]$instant.Pid;ParentPidChain=@([ordered]@{Pid=[int]$instant.Pid;ParentPid=[int]$instant.ParentPid});Path=[IO.Path]::GetFullPath($ExpectedUpdater);CommandLine=$null;Arguments=$null;StartedUtc=$null;ObservedBy='Win32_ProcessStartTrace'}}}
-        if ($RequireUpdaterObservation -and -not $observedUpdater) { throw 'The expected install-root Update.exe descendant was not independently observed.' }
-        [byte[]]$stdoutBytes = [IO.File]::ReadAllBytes($stdoutPath)
-        [byte[]]$stderrBytes = [IO.File]::ReadAllBytes($stderrPath)
-        if ($stdoutBytes.Length + $stderrBytes.Length -gt $script:MaximumDriverOutputBytes) { throw 'Bounded process output exceeded the byte limit.' }
-        $utf8 = New-Object Text.UTF8Encoding($false, $true)
-        try { $stdout=$utf8.GetString($stdoutBytes); $stderr=$utf8.GetString($stderrBytes) } catch { throw 'Bounded process output is not strict UTF-8.' }
-        $process.Refresh();$exitCode=[int]$process.ExitCode;$processId=[int]$process.Id
-        return [pscustomobject]@{ ExitCode=$exitCode; StandardOutput=$stdout; StandardError=$stderr; ProcessId=$processId; StartedUtc=$started.ToString('O'); CompletedUtc=[DateTimeOffset]::UtcNow.ToString('O'); ObservedUpdater=$observedUpdater; ProcessStartEvents=$startEvents.ToArray(); MaximumOfflinePollMilliseconds=$maximumPollMilliseconds }
-    } finally {
-        if($watcher){try{$watcher.Stop()}catch{};Unregister-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue;if($subscription){Remove-Job -Id $subscription.Id -Force -ErrorAction SilentlyContinue};$watcher.Dispose()}
-        $process.Dispose()
-        foreach ($ownedOutput in @($stdoutPath,$stderrPath)) {
-            $cleanupDeadline=[DateTimeOffset]::UtcNow.AddSeconds(5)
-            while(Test-Path -LiteralPath $ownedOutput){try{Remove-Item -LiteralPath $ownedOutput -Force -ErrorAction Stop}catch [IO.IOException]{if([DateTimeOffset]::UtcNow-ge$cleanupDeadline){throw};Start-Sleep -Milliseconds 50}}
-        }
-        Assert-NoNonLoopbackNetwork | Out-Null
-    }
 }
 
 function Invoke-BoundedDriver {
@@ -1001,37 +846,28 @@ function Expand-LocalPortableAsset {
     foreach ($item in @(Get-ChildItem -LiteralPath $Destination -Force -Recurse)) { Assert-NoReparsePoint -ExistingPath $item.FullName -Label 'Portable archive output' }
 }
 
+function Assert-PackageContainsPinnedMain {
+    param([string]$Package,[string]$ExpectedFileName,[string]$ExpectedSha256)
+    $zip=[IO.Compression.ZipFile]::OpenRead($Package)
+    try{$matches=@($zip.Entries|Where-Object{[string]::Equals([IO.Path]::GetFileName(([string]$_.FullName).Replace('/','\')),$ExpectedFileName,[StringComparison]::Ordinal)})
+        if($matches.Count-ne 1-or$matches[0].Length-le 0-or$matches[0].Length-gt 536870912){throw 'Signed candidate package must contain exactly one bounded expected main executable.'}
+        $stream=$matches[0].Open();$sha=[Security.Cryptography.SHA256]::Create();try{$actual=(($sha.ComputeHash($stream)|ForEach-Object{$_.ToString('x2')})-join '')}finally{$sha.Dispose();$stream.Dispose()}
+        if($actual-cne$ExpectedSha256){throw 'Signed candidate package main executable hash does not match the signed fixture pin.'}
+    }finally{$zip.Dispose()}
+}
+
 function Get-ShortcutTarget {
     param([string]$Shortcut)
     $shell = New-Object -ComObject WScript.Shell
     return [IO.Path]::GetFullPath([string]$shell.CreateShortcut($Shortcut).TargetPath)
 }
 
-function Find-ExactProcessPath {
-    param([string]$ExpectedPath, [DateTimeOffset]$NotBefore, [int]$TimeoutSeconds = 45)
-    $canonical = [IO.Path]::GetFullPath($ExpectedPath)
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
-    do {
-        foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
-            try {
-                if ($process.StartTime.ToUniversalTime() -ge $NotBefore.UtcDateTime -and
-                    [string]::Equals([IO.Path]::GetFullPath($process.Path), $canonical, [StringComparison]::OrdinalIgnoreCase)) {
-                    return $process
-                }
-            } catch { }
-        }
-        Start-Sleep -Milliseconds 250
-    } while ([DateTimeOffset]::UtcNow -lt $deadline)
-    throw "Expected process was not observed: $canonical"
-}
-
 function Assert-OldVersionStillLaunches {
-    param([string]$OldExecutable, [string]$RunId)
-    $started = [DateTimeOffset]::UtcNow
-    $process = Start-Process -FilePath $OldExecutable -ArgumentList @('--migration-gate-rollback', $RunId) -WorkingDirectory (Split-Path -Parent $OldExecutable) -PassThru
-    $observed = Find-ExactProcessPath -ExpectedPath $OldExecutable -NotBefore $started
-    Stop-OwnedProcessTree -RootProcessId $observed.Id
-    return $true
+    param([string]$OldExecutable,[string]$RunId,[string]$EvidenceRoot,$ArtifactLock)
+    Assert-ArtifactReadLockUnchanged $ArtifactLock
+    $token=[Guid]::NewGuid().ToString('N');$run=$null
+    try{$run=[MigrationContainedRunner]::Run($OldExecutable,@('--migration-gate-rollback',$RunId),(Split-Path -Parent $OldExecutable),(Join-Path $EvidenceRoot "rollback-$token.stdout"),(Join-Path $EvidenceRoot "rollback-$token.stderr"),45000,1048576,'ExpectRootAlive',$OldExecutable);if($run.Failure-or$run.JobHandle-eq[IntPtr]::Zero-or[string]$run.RestartFileIdentity-cne$ArtifactLock.Identity){throw "Old version liveness proof failed: $($run.Failure)"};return [ordered]@{Pid=$run.RestartPid;Path=$run.RestartPath;StartedUtc=$run.RestartStartedUtc;FileIdentity=$run.RestartFileIdentity;JobOwned=$true}}
+    finally{if($run-and$run.JobHandle-ne[IntPtr]::Zero){if(-not[MigrationContainedRunner]::CloseSession($run)){throw 'Old-version liveness job did not terminate cleanly.'}}}
 }
 
 function Get-UninstallEntry {
@@ -1111,14 +947,15 @@ function Get-FileInventory {
 $runId = New-RunId
 $startedUtc = [DateTimeOffset]::UtcNow
 $evidenceRoot = $null
-$driverLock=$null;$updaterLock=$null;$selectedAssetLock=$null;$updaterPackageLock=$null;$oldSetupLock=$null;$oldPortableLock=$null;$currentMainLock=$null;$upgradeRun=$null
+$driverLock=$null;$updaterLock=$null;$selectedAssetLock=$null;$updaterPackageLock=$null;$oldSetupLock=$null;$oldPortableLock=$null;$currentMainLock=$null;$legacyLock=$null;$oldMainLock=$null;$upgradeRun=$null
 $evidence = [ordered]@{
     SchemaVersion = 2; RunId = $runId; StartedUtc = $startedUtc.ToString('O'); FinishedUtc = $null
     AssetSource = 'caller-supplied-local-directories'; AssetKind = $AssetKind; Path = $Path
     Scenario = "$AssetKind-$Path"; FailureInjection = $FailureInjection; Succeeded = $false
     FailureRollbackVerified = $false; VelopackUpdaterVersion = $null; Upgrade = $null
-    Surfaces = $null; BeforeState = $null; AfterState = $null; BeforeLicenseAudit=$null; AfterLicenseAudit=$null; MaximumOfflinePollMilliseconds=$null; Error = $null
+    Surfaces = $null; BeforeState = $null; AfterState = $null; BeforeLicenseAudit=$null; AfterLicenseAudit=$null; RollbackLaunch=$null; MaximumOfflinePollMilliseconds=$null; Error = $null
 }
+$primaryFailure=$null;$finalizationFailures=New-Object Collections.Generic.List[string]
 
 try {
     $profile = Assert-IsolatedWindowsProfile
@@ -1148,8 +985,8 @@ try {
     $oldNames=@($script:FixtureName,$script:FixtureSignatureName,[string]$fixture.state_driver_file,[string]$fixture.old_setup_file,[string]$fixture.old_portable_file,[string]$fixture.old_full_file)|Select-Object -Unique
     $newNames=@([string]$fixture.new_delta_file,[string]$fixture.new_full_file,[string]$fixture.application_failure_package_file)|Select-Object -Unique
     $totalBytes=0L
-    foreach($name in $oldNames){$source=Resolve-AssetFile -Root $oldSource -FileName $name -Label 'Allowlisted old asset';$copy=Copy-BoundedLockedAsset -Source $source -Destination (Join-Path $stagedOld $name);$totalBytes+=$copy.Length}
-    foreach($name in $newNames){$source=Resolve-AssetFile -Root $newSource -FileName $name -Label 'Allowlisted new asset';$copy=Copy-BoundedLockedAsset -Source $source -Destination (Join-Path $stagedNew $name);$totalBytes+=$copy.Length}
+    foreach($name in $oldNames){$source=Resolve-AssetFile -Root $oldSource -FileName $name -Label 'Allowlisted old asset';$copy=Copy-BoundedLockedAsset -Source $source -Destination (Join-Path $stagedOld $name) -RemainingBudget (4294967296-$totalBytes);$totalBytes+=$copy.Length}
+    foreach($name in $newNames){$source=Resolve-AssetFile -Root $newSource -FileName $name -Label 'Allowlisted new asset';$copy=Copy-BoundedLockedAsset -Source $source -Destination (Join-Path $stagedNew $name) -RemainingBudget (4294967296-$totalBytes);$totalBytes+=$copy.Length}
     if($totalBytes-gt 4294967296){throw 'Allowlisted asset total exceeds 4 GiB.'}
 
     $fixturePath = Resolve-AssetFile -Root $stagedOld -FileName $script:FixtureName -Label 'Migration fixture'
@@ -1217,6 +1054,8 @@ try {
     $selectedAssetHash = $selectedAssetLock.Sha256
     $selectedAssetBytes = $selectedAssetLock.Length
     if($selectedAssetBytes-lt 2){throw 'Selected local update asset is too small.'}
+    $candidateVerificationPackage=if($FailureInjection-ceq'ApplicationFailed'){$selectedAsset}else{Resolve-AssetFile -Root $stagedNew -FileName ([string]$fixture.new_full_file) -Label 'Pinned candidate full package'}
+    Assert-PackageContainsPinnedMain -Package $candidateVerificationPackage -ExpectedFileName $script:NewMainExecutableName -ExpectedSha256 ([string]$fixture.new_main_sha256)
     $localReleaseSource=Join-Path $evidenceRoot "local-release-source-$runId"
     New-Item -ItemType Directory -Path $localReleaseSource|Out-Null;$script:OwnedPaths.Add($localReleaseSource)
     Write-CanonicalJson -Value ([ordered]@{run_id=$runId;source_asset_sha256=$selectedAssetHash}) -Destination (Join-Path $localReleaseSource ".migration-source-$runId.json") -CreateNew
@@ -1238,10 +1077,10 @@ try {
     if($upgradeRun.Failure-or($completionMode-ceq'NoRestart'-and-not$upgradeRun.SafeToCleanup)-or($completionMode-ceq'SuccessExpectRestart'-and$upgradeRun.JobHandle-eq[IntPtr]::Zero)){throw "Contained Velopack updater failed safety enforcement: $($upgradeRun.Failure)"}
     Assert-NoNonLoopbackNetwork|Out-Null
     Assert-ArtifactReadLockUnchanged $updaterLock;Assert-ArtifactReadLockUnchanged $selectedAssetLock;Assert-ArtifactReadLockUnchanged $updaterPackageLock
-    $upgrade=[ordered]@{run_id=$runId;challenge_sha256=$upgradeChallenge.Sha256;scenario=$evidence.Scenario;asset_kind=$AssetKind;path=$Path;failure_injection=$FailureInjection;started_utc=$upgradeRun.StartedUtc;completed_utc=$upgradeRun.CompletedUtc;source_asset_path=$selectedAsset;source_asset_sha256=$selectedAssetHash;source_asset_length=$selectedAssetBytes;updater_path=$updater;updater_identity=$updaterLock.Identity;updater_pid=$upgradeRun.ProcessId;updater_exit_code=$upgradeRun.ExitCode;updater_arguments=$updaterArguments;package_path=$updaterPackage;package_sha256=$updaterPackageLock.Sha256}
+    $upgrade=[ordered]@{run_id=$runId;challenge_sha256=$upgradeChallenge.Sha256;scenario=$evidence.Scenario;asset_kind=$AssetKind;path=$Path;failure_injection=$FailureInjection;started_utc=$upgradeRun.StartedUtc;completed_utc=$upgradeRun.CompletedUtc;source_asset_path=$selectedAsset;source_asset_sha256=$selectedAssetHash;source_asset_length=$selectedAssetBytes;updater_path=$updater;updater_identity=$updaterLock.Identity;updater_pid=$upgradeRun.ProcessId;updater_exit_code=$upgradeRun.ExitCode;updater_arguments=$updaterArguments;package_path=$updaterPackage;package_sha256=$updaterPackageLock.Sha256;candidate_main_expected_sha256=[string]$fixture.new_main_sha256;candidate_main_observed_sha256=$null}
     if($FailureInjection-ceq'None'){if($upgradeRun.ExitCode-ne 0){throw 'Velopack updater returned nonzero for the success scenario.'}}
     else{if($upgradeRun.ExitCode-eq 0){throw 'Failure injection did not make the real Velopack updater fail.'}}
-    if($FailureInjection-ceq'DownloadInterrupted'){Assert-FileIsExactPrefix -Source $selectedAsset -Prefix $updaterPackage;$upgrade.partial_artifact_path=$updaterPackage}
+    if($FailureInjection-ceq'DownloadInterrupted'){Assert-FileIsExactPrefix -Source $selectedAsset -Prefix $updaterPackage;Assert-DownloadInterruptedFingerprint -ExitCode $upgradeRun.ExitCode -StdoutPath $updaterStdout -StderrPath $updaterStderr -ExpectedStdoutSha256 ([string]$fixture.download_interrupted_stdout_sha256) -ExpectedStderrSha256 ([string]$fixture.download_interrupted_stderr_sha256) -ExpectedExitCode ([int]$fixture.download_interrupted_exit_code) -ExpectedMarker ([string]$fixture.download_interrupted_marker) -SourceLeaf ([IO.Path]::GetFileName($selectedAsset)) -PartialLeaf ([IO.Path]::GetFileName($updaterPackage));$upgrade.partial_artifact_path=$updaterPackage;$upgrade.failure_fingerprint_verified=$true}
     if($FailureInjection-ceq'ApplicationFailed'){
         $hook=Assert-StrictChildPath -Candidate (Join-Path $installRoot ([string]$fixture.application_failure_hook_relative_path)) -Root $installRoot -Label 'Application failure hook trace'
         if(-not(Test-Path -LiteralPath $hook -PathType Leaf)){throw 'Signed candidate application failure hook was not produced.'}
@@ -1255,7 +1094,8 @@ try {
 
     if ($FailureInjection -cne 'None') {
         Assert-ExactThreePartVersion -Executable $oldMain -Expected '1.1.0'
-        Assert-OldVersionStillLaunches -OldExecutable $oldMain -RunId $runId | Out-Null
+        Assert-PublisherExecutable -Executable $oldMain;$oldMainLock=Open-ArtifactReadLock -File $oldMain -Label 'Rollback old main executable'
+        $evidence.RollbackLaunch=Assert-OldVersionStillLaunches -OldExecutable $oldMain -RunId $runId -EvidenceRoot $evidenceRoot -ArtifactLock $oldMainLock
         $afterChallenge=New-RunChallenge
         $afterRun = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('probe','--challenge',$afterChallenge.Base64) + $commonDriverArguments)
         $after = Assert-StateEvidence -StateJson $afterRun.StandardOutput -ProfileRoot $profile -RunId $runId -ExpectedChallengeSha256 $afterChallenge.Sha256 -WindowStartedUtc $afterRun.StartedUtc -WindowCompletedUtc $afterRun.CompletedUtc
@@ -1272,21 +1112,19 @@ try {
         Assert-ExactThreePartVersion -Executable $currentMain -Expected '1.1.1'
         foreach ($application in @($currentMain,$rootLauncher,$legacy)) { Assert-PublisherExecutable -Executable $application }
         $currentMainLock=Open-ArtifactReadLock -File $currentMain -Label 'Job-owned restarted current executable'
-        if(-not[string]::Equals([IO.Path]::GetFullPath([string]$upgradeRun.RestartPath),[IO.Path]::GetFullPath($currentMain),[StringComparison]::OrdinalIgnoreCase)-or[int]$upgradeRun.RestartPid-le 0-or[string]$upgradeRun.RestartFileIdentity-cne$currentMainLock.Identity){throw 'Contained updater did not retain the exact current Chinese restart process/file identity.'}
+        if(-not[string]::Equals([IO.Path]::GetFullPath([string]$upgradeRun.RestartPath),[IO.Path]::GetFullPath($currentMain),[StringComparison]::OrdinalIgnoreCase)-or[int]$upgradeRun.RestartPid-le 0-or[string]$upgradeRun.RestartFileIdentity-cne$currentMainLock.Identity-or$currentMainLock.Sha256-cne[string]$fixture.new_main_sha256){throw 'Contained updater did not retain the exact signed-fixture-pinned current Chinese restart process/file identity/hash.'}
         $restartTime=[DateTimeOffset]$upgradeRun.RestartStartedUtc;if($restartTime-lt$restartStarted-or$restartTime-gt[DateTimeOffset]$upgradeRun.CompletedUtc){throw 'Contained restart process creation time is outside the upgrade window.'}
         $restartEvidence = [ordered]@{ Id=[int]$upgradeRun.RestartPid; Path=[string]$upgradeRun.RestartPath; StartTimeUtc=$restartTime.ToString('O'); FileIdentity=$currentMainLock.Identity; JobOwned=$true }
+        $upgrade.candidate_main_observed_sha256=$currentMainLock.Sha256
         if ($AssetKind -ceq 'Setup') {
             $surfaces = Assert-SetupSurfaces -InstallRoot $installRoot -CurrentMain $currentMain -RootLauncher $rootLauncher -LegacyLauncher $legacy -Profile $profile
         } else {
             $surfaces = [ordered]@{ InstallRoot=$installRoot; CurrentDirectory=$currentDirectory; InstallRootLauncher=$rootLauncher; CurrentMainExecutable=$currentMain; LegacyCompatibilityLauncher=$legacy; DesktopShortcut=$null; StartMenuShortcut=$null; UninstallEntry=$null }
         }
         $surfaces.UpgradeRestartProcess = $restartEvidence
-        $compatStarted = [DateTimeOffset]::UtcNow
-        $compatProcess = Start-Process -FilePath $legacy -ArgumentList @('--migration-gate-compat',$runId) -WorkingDirectory $currentDirectory -PassThru
-        try { $compatTarget = Find-ExactProcessPath -ExpectedPath $currentMain -NotBefore $compatStarted }
-        finally { if ($compatProcess -and -not $compatProcess.HasExited) { Stop-OwnedProcessTree -RootProcessId $compatProcess.Id } }
-        Stop-OwnedProcessTree -RootProcessId $compatTarget.Id
-        $surfaces.LegacyCompatibilityForwardTarget = $compatTarget.Path
+        $legacyLock=Open-ArtifactReadLock -File $legacy -Label 'Legacy compatibility launcher';$compatRun=$null;$compatToken=[Guid]::NewGuid().ToString('N')
+        try{$compatRun=[MigrationContainedRunner]::Run($legacy,@('--migration-gate-compat',$runId),$currentDirectory,(Join-Path $evidenceRoot "compat-$compatToken.stdout"),(Join-Path $evidenceRoot "compat-$compatToken.stderr"),45000,1048576,'SuccessExpectRestart',$currentMain);if($compatRun.Failure-or$compatRun.JobHandle-eq[IntPtr]::Zero-or[string]$compatRun.RestartFileIdentity-cne$currentMainLock.Identity){throw "Legacy compatibility forwarding proof failed: $($compatRun.Failure)"};$surfaces.LegacyCompatibilityForwardTarget=$compatRun.RestartPath;$surfaces.LegacyCompatibilityForwardPid=$compatRun.RestartPid}
+        finally{if($compatRun-and$compatRun.JobHandle-ne[IntPtr]::Zero){if(-not[MigrationContainedRunner]::CloseSession($compatRun)){throw 'Compatibility forwarding job did not terminate cleanly.'}}}
         $afterChallenge=New-RunChallenge
         $afterRun = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('probe','--challenge',$afterChallenge.Base64) + $commonDriverArguments)
         $after = Assert-StateEvidence -StateJson $afterRun.StandardOutput -ProfileRoot $profile -RunId $runId -ExpectedChallengeSha256 $afterChallenge.Sha256 -WindowStartedUtc $afterRun.StartedUtc -WindowCompletedUtc $afterRun.CompletedUtc
@@ -1300,17 +1138,17 @@ try {
     Assert-NoNonLoopbackNetwork | Out-Null
 } catch {
     $evidence.Error = $_.Exception.Message
-    throw
+    $primaryFailure=$_
 } finally {
-    if($upgradeRun-and$upgradeRun.JobHandle-ne[IntPtr]::Zero){if(-not[MigrationContainedRunner]::CloseSession($upgradeRun)){throw 'Contained restart job did not terminate cleanly.'}}
-    foreach($lock in @($currentMainLock,$updaterPackageLock,$selectedAssetLock,$updaterLock,$oldPortableLock,$oldSetupLock,$driverLock)){if($lock){$lock.Stream.Dispose()}}
+    try{if($upgradeRun-and$upgradeRun.JobHandle-ne[IntPtr]::Zero){if(-not[MigrationContainedRunner]::CloseSession($upgradeRun)){throw 'Contained restart job did not terminate cleanly.'}}}catch{$finalizationFailures.Add($_.Exception.Message)}
+    foreach($lock in @($oldMainLock,$legacyLock,$currentMainLock,$updaterPackageLock,$selectedAssetLock,$updaterLock,$oldPortableLock,$oldSetupLock,$driverLock)){if($lock){try{$lock.Stream.Dispose()}catch{$finalizationFailures.Add($_.Exception.Message)}}}
     if ($evidenceRoot) {
         $evidence.FinishedUtc = [DateTimeOffset]::UtcNow.ToString('O')
-        Write-CanonicalJson -Value $evidence -Destination (Join-Path $evidenceRoot 'evidence.json')
-        $hashes = @(Get-FileInventory -Roots @($evidenceRoot))
-        Write-CanonicalJson -Value ([ordered]@{ SchemaVersion=1; RunId=$runId; Files=$hashes }) -Destination (Join-Path $evidenceRoot 'files.sha256.json')
+        try{Write-CanonicalJson -Value $evidence -Destination (Join-Path $evidenceRoot 'evidence.json')}catch{$finalizationFailures.Add($_.Exception.Message)}
+        try{$hashes = @(Get-FileInventory -Roots @($evidenceRoot));Write-CanonicalJson -Value ([ordered]@{ SchemaVersion=1; RunId=$runId; Files=$hashes }) -Destination (Join-Path $evidenceRoot 'files.sha256.json')}catch{$finalizationFailures.Add($_.Exception.Message)}
     }
 }
 
+if($primaryFailure-or$finalizationFailures.Count-ne 0){$messages=New-Object Collections.Generic.List[string];if($primaryFailure){$messages.Add($primaryFailure.Exception.Message)};$messages.AddRange([string[]]$finalizationFailures.ToArray());throw ('Migration gate failed: '+($messages -join ' | '))}
 if (-not $evidence.Succeeded) { throw 'The migration gate did not complete successfully.' }
 Write-Host "REAL_MIGRATION_GATE_PASS=$evidenceRoot"
