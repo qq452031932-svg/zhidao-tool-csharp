@@ -1,7 +1,7 @@
 <Window x:Class="BaiduBatchTransfer.App.Features.Transfers.TransferTargetDirectoryWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="选择百度网盘目录"
+        Title="选择百度网盘目录" Icon="{StaticResource ProductWindowIcon}"
         Width="560" Height="520" MinWidth="440" MinHeight="360"
         WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
     <Grid Margin="16">

@@ -1,12 +1,17 @@
 <Application x:Class="BaiduBatchTransfer.App.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:po="http://schemas.microsoft.com/winfx/2006/xaml/presentation/options">
     <!-- Compiled as Page so Program.Main owns startup sequencing. -->
     <Application.Resources>
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
                 <ResourceDictionary Source="Styles/SuperPanTheme.xaml" />
             </ResourceDictionary.MergedDictionaries>
+            <BitmapImage x:Key="ProductWindowIcon"
+                         UriSource="/知道综合工具;component/Assets/Branding/知道综合工具.png"
+                         CacheOption="OnLoad"
+                         po:Freeze="True" />
             <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
         </ResourceDictionary>
     </Application.Resources>

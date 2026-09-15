@@ -596,7 +596,7 @@ public sealed class MainWindowViewModelTests
     {
         var xaml = File.ReadAllText(MainWindowXamlPath());
 
-        Assert.Contains("Title=\"{Binding ApplicationTitle}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Title=\"知道综合工具\"", xaml, StringComparison.Ordinal);
         Assert.Contains("Text=\"百度网盘批量管理工作台\"", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("Title=\"百度批量转存\"", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("百度网盘批量工作台", xaml, StringComparison.Ordinal);
