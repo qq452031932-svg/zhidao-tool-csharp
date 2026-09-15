@@ -5,6 +5,7 @@ param(
     [string]$ExpectedVersion,
     [string]$ExpectedPublisherSpkiSha256 = 'f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff',
     [string]$OutputReportPath,
+    [switch]$HistoricalProductIdentity,
     [switch]$RequireTimestamp
 )
 
@@ -28,6 +29,9 @@ $packageId = [string]$productIdentity.ProductPackageId
 if ($packageId -cne 'SuperPan.BaiduBatchTransfer' -or
     $productLegacyExecutableName -cne 'BaiduBatchTransfer.App.exe') {
     throw 'Product identity changed a stable OTA compatibility identifier.'
+}
+if ($HistoricalProductIdentity.IsPresent -and $ExpectedVersion -cne '1.1.0') {
+    throw 'HistoricalProductIdentity is restricted to the signed 1.1.0 migration base.'
 }
 if (-not (Test-Path -LiteralPath $productIconPath -PathType Leaf) -or
     (([IO.File]::GetAttributes($productIconPath) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
@@ -1095,15 +1099,24 @@ try {
                 throw "$Description has an excessive aggregate compression ratio."
             }
             $isCurrentPackage = $ExpectedPackageVersion -ceq $currentVersion
+            $historicalCurrentPackage = $HistoricalProductIdentity.IsPresent -and $isCurrentPackage
             if ($ExpectedPackageType -ceq 'Portable') {
-                foreach ($requiredPortablePath in @(
-                    '.portable',
-                    'current/sq.version',
-                    "current/$productMainExecutableName",
-                    "current/$productMainDllName",
-                    "current/$productMainStem.deps.json",
-                    "current/$productMainStem.runtimeconfig.json",
-                    "current/$productLegacyExecutableName")) {
+                $requiredPortablePaths = if ($historicalCurrentPackage) { @(
+                        '.portable',
+                        'current/sq.version',
+                        "current/$productLegacyExecutableName",
+                        'current/BaiduBatchTransfer.App.dll',
+                        'current/BaiduBatchTransfer.App.deps.json',
+                        'current/BaiduBatchTransfer.App.runtimeconfig.json')
+                } else { @(
+                        '.portable',
+                        'current/sq.version',
+                        "current/$productMainExecutableName",
+                        "current/$productMainDllName",
+                        "current/$productMainStem.deps.json",
+                        "current/$productMainStem.runtimeconfig.json",
+                        "current/$productLegacyExecutableName") }
+                foreach ($requiredPortablePath in $requiredPortablePaths) {
                     if (-not $innerNames.ContainsKey($requiredPortablePath) -or $innerNames[$requiredPortablePath] -cne $requiredPortablePath) {
                         throw "Portable archive is missing required Velopack content: $requiredPortablePath"
                     }
@@ -1128,14 +1141,17 @@ try {
                 $portableNamespace = [Xml.XmlNamespaceManager]::new($portableXml.NameTable)
                 $portableNamespace.AddNamespace('n', $portableXml.DocumentElement.NamespaceURI)
                 $portableMetadata = $portableXml.SelectSingleNode('/n:package/n:metadata', $portableNamespace)
+                $portableExpectedTitle = if ($historicalCurrentPackage) { $packageId } else { $productDisplayName }
+                $portableExpectedDescription = if ($historicalCurrentPackage) { $packageId } else { $productDescription }
+                $portableExpectedMainExecutable = if ($historicalCurrentPackage) { $productLegacyExecutableName } else { $productMainExecutableName }
                 if ($null -eq $portableMetadata -or
                     [string]$portableMetadata.SelectSingleNode('n:id', $portableNamespace).InnerText -cne $packageId -or
                     [string]$portableMetadata.SelectSingleNode('n:version', $portableNamespace).InnerText -cne $ExpectedPackageVersion -or
                     [string]$portableMetadata.SelectSingleNode('n:channel', $portableNamespace).InnerText -cne $channel -or
-                    [string]$portableMetadata.SelectSingleNode('n:title', $portableNamespace).InnerText -cne $productDisplayName -or
-                    [string]$portableMetadata.SelectSingleNode('n:description', $portableNamespace).InnerText -cne $productDescription -or
+                    [string]$portableMetadata.SelectSingleNode('n:title', $portableNamespace).InnerText -cne $portableExpectedTitle -or
+                    [string]$portableMetadata.SelectSingleNode('n:description', $portableNamespace).InnerText -cne $portableExpectedDescription -or
                     [string]$portableMetadata.SelectSingleNode('n:authors', $portableNamespace).InnerText -cne $packageId -or
-                    [string]$portableMetadata.SelectSingleNode('n:mainExe', $portableNamespace).InnerText -cne $productMainExecutableName -or
+                    [string]$portableMetadata.SelectSingleNode('n:mainExe', $portableNamespace).InnerText -cne $portableExpectedMainExecutable -or
                     [string]$portableMetadata.SelectSingleNode('n:os', $portableNamespace).InnerText -cne 'win' -or
                     [string]$portableMetadata.SelectSingleNode('n:rid', $portableNamespace).InnerText -cne 'win-x64' -or
                     [string]$portableMetadata.SelectSingleNode('n:machineArchitecture', $portableNamespace).InnerText -cne 'x64') {
@@ -1163,7 +1179,7 @@ try {
                 $namespace = [Xml.XmlNamespaceManager]::new($nuspec.NameTable)
                 $namespace.AddNamespace('n', $nuspec.DocumentElement.NamespaceURI)
                 $metadata = $nuspec.SelectSingleNode('/n:package/n:metadata', $namespace)
-                $expectedPackageMainExe = if ($isCurrentPackage) { $productMainExecutableName } else { $productLegacyExecutableName }
+                $expectedPackageMainExe = if ($isCurrentPackage -and -not $historicalCurrentPackage) { $productMainExecutableName } else { $productLegacyExecutableName }
                 if ($null -eq $metadata -or
                     [string]$metadata.SelectSingleNode('n:id', $namespace).InnerText -cne $packageId -or
                     [string]$metadata.SelectSingleNode('n:version', $namespace).InnerText -cne $ExpectedPackageVersion -or
@@ -1174,27 +1190,41 @@ try {
                     throw "$Description Velopack package nuspec identity, branding, version, or type metadata is invalid."
                 }
                 if ($isCurrentPackage) {
-                    if ([string]$metadata.SelectSingleNode('n:title', $namespace).InnerText -cne $productDisplayName -or
-                        [string]$metadata.SelectSingleNode('n:description', $namespace).InnerText -cne $productDescription -or
-                        [string]$metadata.SelectSingleNode('n:authors', $namespace).InnerText -cne $packageId -or
+                    if ([string]$metadata.SelectSingleNode('n:authors', $namespace).InnerText -cne $packageId -or
                         [string]$metadata.SelectSingleNode('n:machineArchitecture', $namespace).InnerText -cne 'x64') {
                         throw "$Description Velopack package nuspec branding or architecture metadata is invalid."
                     }
-                    $iconEntry = $inner.GetEntry('setup.ico')
-                    if ($null -eq $iconEntry -or $iconEntry.Length -lt 22 -or $iconEntry.Length -gt 16777216) {
-                        throw "$Description is missing the canonical package icon: setup.ico"
-                    }
-                    $iconBytes = Read-LimitedStream $iconEntry.Open() 16777216 "$Description setup.ico"
-                    if ($iconBytes.Length -lt 4 -or $iconBytes[0] -ne 0 -or $iconBytes[1] -ne 0 -or
-                        $iconBytes[2] -ne 1 -or $iconBytes[3] -ne 0) {
-                        throw "$Description canonical package icon is invalid: setup.ico"
-                    }
-                    if ((Get-BytesSha256 $iconBytes) -cne (Get-FileSha256 $productIconPath)) {
-                        throw "$Description canonical package icon hash differs: setup.ico"
+                    if ($historicalCurrentPackage) {
+                        if ([string]$metadata.SelectSingleNode('n:title', $namespace).InnerText -cne $packageId -or
+                            [string]$metadata.SelectSingleNode('n:description', $namespace).InnerText -cne $packageId) {
+                            throw "$Description historical Velopack package identity is invalid."
+                        }
+                    } else {
+                        if ([string]$metadata.SelectSingleNode('n:title', $namespace).InnerText -cne $productDisplayName -or
+                            [string]$metadata.SelectSingleNode('n:description', $namespace).InnerText -cne $productDescription) {
+                            throw "$Description Velopack package nuspec branding or architecture metadata is invalid."
+                        }
+                        $iconEntry = $inner.GetEntry('setup.ico')
+                        if ($null -eq $iconEntry -or $iconEntry.Length -lt 22 -or $iconEntry.Length -gt 16777216) {
+                            throw "$Description is missing the canonical package icon: setup.ico"
+                        }
+                        $iconBytes = Read-LimitedStream $iconEntry.Open() 16777216 "$Description setup.ico"
+                        if ($iconBytes.Length -lt 4 -or $iconBytes[0] -ne 0 -or $iconBytes[1] -ne 0 -or
+                            $iconBytes[2] -ne 1 -or $iconBytes[3] -ne 0) {
+                            throw "$Description canonical package icon is invalid: setup.ico"
+                        }
+                        if ((Get-BytesSha256 $iconBytes) -cne (Get-FileSha256 $productIconPath)) {
+                            throw "$Description canonical package icon hash differs: setup.ico"
+                        }
                     }
                 }
                 if ($ExpectedPackageType -ceq 'Full') {
-                    $requiredFullPaths = if ($isCurrentPackage) { @(
+                    $requiredFullPaths = if ($historicalCurrentPackage) { @(
+                            "lib/app/$productLegacyExecutableName",
+                            'lib/app/BaiduBatchTransfer.App.dll',
+                            'lib/app/BaiduBatchTransfer.App.deps.json',
+                            'lib/app/BaiduBatchTransfer.App.runtimeconfig.json')
+                    } elseif ($isCurrentPackage) { @(
                             "lib/app/$productMainExecutableName",
                             "lib/app/$productMainDllName",
                             "lib/app/$productMainStem.deps.json",
@@ -1224,13 +1254,15 @@ try {
                     if (-not $hasLegacyPatch -or -not $innerNames.ContainsKey("$legacyPatchBase.shasum")) {
                         throw 'Delta package has no meaningful patch payload. Delta package does not replace the legacy executable with the compatibility launcher.'
                     }
-                    foreach ($requiredRenamedPath in @(
-                            "lib/app/$productMainExecutableName",
-                            "lib/app/$productMainDllName",
-                            "lib/app/$productMainStem.deps.json",
-                            "lib/app/$productMainStem.runtimeconfig.json")) {
-                        if (-not $innerNames.ContainsKey($requiredRenamedPath) -or $innerNames[$requiredRenamedPath] -cne $requiredRenamedPath) {
-                            throw "Delta package does not add the renamed main application: $requiredRenamedPath"
+                    if (-not $historicalCurrentPackage) {
+                        foreach ($requiredRenamedPath in @(
+                                "lib/app/$productMainExecutableName",
+                                "lib/app/$productMainDllName",
+                                "lib/app/$productMainStem.deps.json",
+                                "lib/app/$productMainStem.runtimeconfig.json")) {
+                            if (-not $innerNames.ContainsKey($requiredRenamedPath) -or $innerNames[$requiredRenamedPath] -cne $requiredRenamedPath) {
+                                throw "Delta package does not add the renamed main application: $requiredRenamedPath"
+                            }
                         }
                     }
                     if ($patches.Count -eq 0) {
@@ -1310,7 +1342,10 @@ try {
                         "current/$productLegacyExecutableName",
                         "lib/app/$productMainExecutableName",
                         "lib/app/$productLegacyExecutableName")) { 0x8664 } else { 0 }
-                $artifactRole = if ($isCurrentPackage -and $requiredName -in @(
+                $artifactRole = if ($historicalCurrentPackage -and $requiredName -in @(
+                        "current/$productLegacyExecutableName", "lib/app/$productLegacyExecutableName")) {
+                    'historical-main-application'
+                } elseif ($isCurrentPackage -and $requiredName -in @(
                         "current/$productMainExecutableName", "lib/app/$productMainExecutableName")) {
                     'main-application'
                 } elseif ($isCurrentPackage -and $requiredName -in @(
@@ -1326,7 +1361,7 @@ try {
                     Assert-FileContainsText $destination $productMainStem 'Root launcher does not reference the configured main executable.'
                 }
             }
-            if ($isCurrentPackage) { Assert-DistinctCurrentApplicationImages $publisherRoleImages.ToArray() }
+            if ($isCurrentPackage -and -not $historicalCurrentPackage) { Assert-DistinctCurrentApplicationImages $publisherRoleImages.ToArray() }
             $psfSpki = '7a1e6298a8fc5ec53e6389ad8532cb869e36233caf30c5ee0a1108d09a2b9801'
             foreach ($thirdPartyName in $AllowedThirdPartyExecutables) {
                 if (-not $innerNames.ContainsKey($thirdPartyName)) { continue }
@@ -1488,11 +1523,16 @@ try {
     $portableName = "$packageId-Portable.zip"
     $portablePath = Join-Path $temporaryRoot $portableName
     Extract-Entry $portableName $portablePath
-    Assert-InnerArchive $portablePath 'Portable archive' @(
-        $productMainExecutableName,
-        'Update.exe',
-        "current/$productMainExecutableName",
-        "current/$productLegacyExecutableName") @(
+    $portablePublisherExecutables = if ($HistoricalProductIdentity.IsPresent) { @(
+            "$packageId.exe",
+            'Update.exe',
+            "current/$productLegacyExecutableName")
+    } else { @(
+            $productMainExecutableName,
+            'Update.exe',
+            "current/$productMainExecutableName",
+            "current/$productLegacyExecutableName") }
+    Assert-InnerArchive $portablePath 'Portable archive' $portablePublisherExecutables @(
         'current/managed-browser-helper/python.exe',
         'current/managed-browser-helper/pythonw.exe') $currentVersion 'Portable'
 
@@ -1510,15 +1550,25 @@ try {
         }, @{ Expression = { [string]$_.Version } })
     foreach ($asset in $assetsToValidate) {
         $packageName = [string]$asset.FileName
+        # The authenticated 1.1.0 upload is used only as the immutable Full-package
+        # base for the rename migration. Its already-signed historical Delta is not
+        # carried into the new release and predates the current delta-shape policy.
+        if ($HistoricalProductIdentity.IsPresent -and [string]$asset.Type -ceq 'Delta') { continue }
         $packagePath = Join-Path $temporaryRoot ("package-$packageIndex.nupkg")
         $packageIndex++
         Extract-Entry $packageName $packagePath
         $validatedPackagePaths.Add($packageName, $packagePath)
-        $requiredPackageExecutables = if ([string]$asset.Type -ceq 'Full' -and [string]$asset.Version -ceq $currentVersion) {
+        $requiredPackageExecutables = if ($HistoricalProductIdentity.IsPresent -and [string]$asset.Type -ceq 'Full' -and [string]$asset.Version -ceq $currentVersion) {
+            @('lib/app/BaiduBatchTransfer.App_ExecutionStub.exe', "lib/app/$productLegacyExecutableName", 'lib/app/Squirrel.exe')
+        }
+        elseif ([string]$asset.Type -ceq 'Full' -and [string]$asset.Version -ceq $currentVersion) {
             @("lib/app/$($productMainStem)_ExecutionStub.exe", "lib/app/$productMainExecutableName", "lib/app/$productLegacyExecutableName", 'lib/app/Squirrel.exe')
         }
         elseif ([string]$asset.Type -ceq 'Full') {
             @('lib/app/BaiduBatchTransfer.App_ExecutionStub.exe', "lib/app/$productLegacyExecutableName", 'lib/app/Squirrel.exe')
+        }
+        elseif ($HistoricalProductIdentity.IsPresent -and [string]$asset.Type -ceq 'Delta') {
+            @('lib/app/BaiduBatchTransfer.App_ExecutionStub.exe', "lib/app/$productLegacyExecutableName")
         }
         elseif ([string]$asset.Type -ceq 'Delta') {
             @("lib/app/$($productMainStem)_ExecutionStub.exe", "lib/app/$productMainExecutableName")
@@ -1552,9 +1602,12 @@ try {
         }
     }
 
-    $currentDeltaAssets = @($assets | Where-Object {
-            [string]$_.Type -ceq 'Delta' -and [string]$_.Version -ceq $currentVersion
-        })
+    $currentDeltaAssets = @()
+    if (-not $HistoricalProductIdentity.IsPresent) {
+        $currentDeltaAssets = @($assets | Where-Object {
+                [string]$_.Type -ceq 'Delta' -and [string]$_.Version -ceq $currentVersion
+            })
+    }
     if ($currentDeltaAssets.Count -gt 0) {
         if ($currentDeltaAssets.Count -ne 1) { throw 'Current production Delta asset is ambiguous.' }
         $lowerFullAssets = @($assets | Where-Object {
@@ -1583,6 +1636,7 @@ try {
         packageId = $packageId
         channel = $channel
         version = $currentVersion
+        historicalProductIdentity = $HistoricalProductIdentity.IsPresent
         manifestSha256 = Get-BytesSha256 $manifestBytes
         publisherSpkiSha256 = $certificateSpki
         authenticodeTimestampRequired = $RequireTimestamp.IsPresent

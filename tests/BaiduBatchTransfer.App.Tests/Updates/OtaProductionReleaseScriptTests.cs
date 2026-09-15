@@ -154,6 +154,9 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("Published production metadata", script, StringComparison.Ordinal);
         Assert.Contains("Previous production upload ZIP", script, StringComparison.Ordinal);
         Assert.Contains("Previous production generation directory must contain exactly one canonical upload ZIP.", script, StringComparison.Ordinal);
+        Assert.Contains("-ExpectedVersion '1.1.0' -HistoricalProductIdentity", script, StringComparison.Ordinal);
+        Assert.Contains("[switch]$HistoricalProductIdentity", validator, StringComparison.Ordinal);
+        Assert.Contains("HistoricalProductIdentity is restricted to the signed 1.1.0 migration base.", validator, StringComparison.Ordinal);
         Assert.Contains("'delta','patch'", script, StringComparison.Ordinal);
         Assert.Contains("Delta reconstruction differs from the current Full package", script, StringComparison.Ordinal);
         Assert.Contains("Join-Path $sourceSnapshot 'scripts\\Test-OtaUploadBundle.ps1'", script, StringComparison.Ordinal);
@@ -359,6 +362,24 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("Portable archive::current/BaiduBatchTransfer.App.exe", result.Output, StringComparison.Ordinal);
         Assert.Contains("Package SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg::lib/app/知道综合工具.exe", result.Output, StringComparison.Ordinal);
         Assert.Contains("Package SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg::lib/app/BaiduBatchTransfer.App.exe", result.Output, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("1.1.1", "restricted to the signed 1.1.0 migration base")]
+    [InlineData("1.1.0", "version does not match ExpectedVersion")]
+    public async Task HistoricalIdentityCannotAuthorizeCurrentOrMixedSignedBundles(string expectedVersion, string expectedError)
+    {
+        var (bundle, certificate, spki) = GoldenFixture();
+        var result = await RunPowerShellAsync(
+            ValidatorScriptPath(),
+            "-BundlePath", bundle,
+            "-PublisherCertificatePath", certificate,
+            "-ExpectedPublisherSpkiSha256", spki,
+            "-ExpectedVersion", expectedVersion,
+            "-HistoricalProductIdentity");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedError, result.Output, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

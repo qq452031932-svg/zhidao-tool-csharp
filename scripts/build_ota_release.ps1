@@ -654,7 +654,8 @@ function Invoke-ProductionRelease {
             Assert-ExistingPathIsNotReparsePoint $previousUploadSource 'Previous production upload ZIP'
             $validatedPrevious = Join-Path $buildRoot 'previous-upload.zip'
             [IO.File]::Copy($previousUploadSource, $validatedPrevious, $false)
-            & $bundleValidator -BundlePath $validatedPrevious -PublisherCertificatePath $publisherCertificate -ExpectedPublisherSpkiSha256 $expectedSpki | Out-Null
+            & $bundleValidator -BundlePath $validatedPrevious -PublisherCertificatePath $publisherCertificate `
+                -ExpectedPublisherSpkiSha256 $expectedSpki -ExpectedVersion '1.1.0' -HistoricalProductIdentity | Out-Null
             $previousArchive = [IO.Compression.ZipFile]::OpenRead($validatedPrevious)
             try {
                 foreach ($entry in $previousArchive.Entries) {
