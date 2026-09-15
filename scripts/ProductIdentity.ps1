@@ -10,7 +10,17 @@ function Assert-SafeProductIdentityLeaf {
     $isDotSegment = $Value -ceq '.' -or $Value -ceq '..'
     $hasSeparator = $Value.IndexOf('/') -ge 0 -or $Value.IndexOf('\') -ge 0
     $hasInvalidCharacter = $Value.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0
-    if ([System.IO.Path]::IsPathRooted($Value) -or $isDotSegment -or $hasSeparator -or $hasInvalidCharacter) {
+    $hasNormalizedSuffix = $Value.EndsWith('.', [System.StringComparison]::Ordinal) -or
+        $Value.EndsWith(' ', [System.StringComparison]::Ordinal)
+    $hasReservedDeviceBaseName = [System.Text.RegularExpressions.Regex]::IsMatch(
+        $Value,
+        '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)')
+    if ([System.IO.Path]::IsPathRooted($Value) -or
+        $isDotSegment -or
+        $hasSeparator -or
+        $hasInvalidCharacter -or
+        $hasNormalizedSuffix -or
+        $hasReservedDeviceBaseName) {
         throw [System.IO.InvalidDataException]::new("Product identity field '$Name' must be a safe leaf name.")
     }
 }
@@ -96,6 +106,13 @@ function Get-ProductIdentity {
         $value = $element.Value
         if ([string]::IsNullOrWhiteSpace($value) -or $value -ne $value.Trim() -or $value.IndexOfAny([char[]]@("`r", "`n", "`0")) -ge 0) {
             throw [System.IO.InvalidDataException]::new("Product identity field '$name' must be a non-empty single-line value without surrounding whitespace.")
+        }
+        $containsMsBuildExpression = $value.IndexOf('$(', [System.StringComparison]::Ordinal) -ge 0 -or
+            $value.IndexOf('@(', [System.StringComparison]::Ordinal) -ge 0 -or
+            $value.IndexOf('%(', [System.StringComparison]::Ordinal) -ge 0 -or
+            [System.Text.RegularExpressions.Regex]::IsMatch($value, '%[0-9A-Fa-f]{2}')
+        if ($containsMsBuildExpression) {
+            throw [System.IO.InvalidDataException]::new("Product identity field '$name' must not contain MSBuild evaluation syntax or escapes.")
         }
         $values[$name] = $value
     }

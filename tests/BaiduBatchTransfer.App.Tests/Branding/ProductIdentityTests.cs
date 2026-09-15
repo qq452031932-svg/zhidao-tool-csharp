@@ -224,6 +224,99 @@ public sealed class ProductIdentityTests
         Assert.NotEqual(0, result.ExitCode);
     }
 
+    [Theory]
+    [InlineData("ProductDisplayName", "知道$(Configuration)")]
+    [InlineData("ProductDescription", "描述@(Items)")]
+    [InlineData("ProductPackageId", "Package%2fIdentity")]
+    public async Task LoaderRejectsMsBuildEvaluationSyntaxInNonFileIdentity(
+        string propertyName,
+        string expressionLikeValue)
+    {
+        var result = await RunGeneratorWithOverridesAsync(new Dictionary<string, string>
+        {
+            [propertyName] = expressionLikeValue,
+        });
+
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Fact]
+    public async Task LoaderRejectsMsBuildEvaluationSyntaxInAssemblyIdentity()
+    {
+        var result = await RunGeneratorWithOverridesAsync(new Dictionary<string, string>
+        {
+            ["ProductMainAssemblyName"] = "工具%(Identity)",
+            ["ProductMainExecutableName"] = "工具%(Identity).exe",
+            ["ProductMainDllName"] = "工具%(Identity).dll",
+        });
+
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Fact]
+    public async Task LoaderAllowsOrdinaryChinesePunctuationAndPercent()
+    {
+        var result = await RunGeneratorWithOverridesAsync(new Dictionary<string, string>
+        {
+            ["ProductDescription"] = "进度 100%，请稍候（正常）。",
+        });
+
+        Assert.True(result.ExitCode == 0, result.Output);
+    }
+
+    [Theory]
+    [InlineData("CON")]
+    [InlineData("NUL.exe")]
+    [InlineData("COM1.dll")]
+    [InlineData("data.")]
+    [InlineData("trailing ")]
+    public async Task LoaderRejectsReservedOrNormalizedWindowsLeaf(string unsafeValue)
+    {
+        var result = await RunGeneratorWithOverridesAsync(new Dictionary<string, string>
+        {
+            ["ProductDataDirectoryName"] = unsafeValue,
+        });
+
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Fact]
+    public async Task EvaluatedProductionMsBuildIdentityMatchesCanonicalSource()
+    {
+        var canonical = LoadCanonicalProperties();
+        var loaderResult = await RunProductIdentityLoaderAsync();
+        var result = await RunMsBuildPropertiesAsync(otaAcceptanceBuild: false);
+
+        Assert.True(loaderResult.ExitCode == 0, loaderResult.Output);
+        Assert.True(result.ExitCode == 0, result.Output);
+        using var loaderJson = System.Text.Json.JsonDocument.Parse(loaderResult.Output);
+        using var json = System.Text.Json.JsonDocument.Parse(result.Output);
+        var loaded = loaderJson.RootElement;
+        var properties = json.RootElement.GetProperty("Properties");
+        Assert.Equal(canonical["ProductDisplayName"], loaded.GetProperty("ProductDisplayName").GetString());
+        Assert.Equal(loaded.GetProperty("ProductDisplayName").GetString(), properties.GetProperty("ProductDisplayName").GetString());
+        Assert.Equal(loaded.GetProperty("ProductMainAssemblyName").GetString(), properties.GetProperty("ProductMainAssemblyName").GetString());
+        Assert.Equal(loaded.GetProperty("ProductMainAssemblyName").GetString(), properties.GetProperty("AssemblyName").GetString());
+        Assert.Equal(loaded.GetProperty("ProductMainExecutableName").GetString(), properties.GetProperty("ProductMainExecutableName").GetString());
+        Assert.Equal(loaded.GetProperty("ProductMainDllName").GetString(), properties.GetProperty("ProductMainDllName").GetString());
+        Assert.Equal(loaded.GetProperty("ProductLegacyAssemblyName").GetString(), properties.GetProperty("ProductLegacyAssemblyName").GetString());
+        Assert.Equal(loaded.GetProperty("ProductLegacyExecutableName").GetString(), properties.GetProperty("ProductLegacyExecutableName").GetString());
+        Assert.Equal(loaded.GetProperty("ProductPackageId").GetString(), properties.GetProperty("PackageId").GetString());
+        Assert.Equal(loaded.GetProperty("ProductLicenseProductId").GetString(), properties.GetProperty("LicenseProductId").GetString());
+    }
+
+    [Fact]
+    public async Task EvaluatedAcceptanceMsBuildIdentityKeepsDedicatedPackageId()
+    {
+        var result = await RunMsBuildPropertiesAsync(otaAcceptanceBuild: true);
+
+        Assert.True(result.ExitCode == 0, result.Output);
+        using var json = System.Text.Json.JsonDocument.Parse(result.Output);
+        Assert.Equal(
+            "SuperPan.BaiduBatchTransfer.OtaAcceptance",
+            json.RootElement.GetProperty("Properties").GetProperty("PackageId").GetString());
+    }
+
     [Fact]
     public async Task GeneratorPreservesTokenLikeValuesAndUsesLanguageSpecificEscapes()
     {
@@ -343,6 +436,39 @@ public sealed class ProductIdentityTests
             """);
         return await RunProcessAsync("dotnet", ["build", projectPath, "--nologo"], compileRoot, TimeSpan.FromMinutes(1));
     }
+
+    private static Task<ProcessResult> RunMsBuildPropertiesAsync(bool otaAcceptanceBuild)
+    {
+        var projectPath = Path.Combine(
+            RepositoryRoot(), "src", "BaiduBatchTransfer.App", "BaiduBatchTransfer.App.csproj");
+        return RunProcessAsync(
+            "dotnet",
+            [
+                "msbuild",
+                projectPath,
+                "-nologo",
+                "-getProperty:ProductDisplayName,ProductMainAssemblyName,AssemblyName,ProductMainExecutableName,ProductMainDllName,ProductLegacyAssemblyName,ProductLegacyExecutableName,PackageId,LicenseProductId",
+                "-p:Configuration=Debug",
+                $"-p:OtaAcceptanceBuild={otaAcceptanceBuild.ToString().ToLowerInvariant()}",
+            ],
+            RepositoryRoot(),
+            TimeSpan.FromSeconds(30));
+    }
+
+    private static Task<ProcessResult> RunProductIdentityLoaderAsync()
+    {
+        var scriptPath = Path.Combine(RepositoryRoot(), "scripts", "ProductIdentity.ps1");
+        var propsPath = Path.Combine(RepositoryRoot(), "eng", "ProductIdentity.props");
+        var command = $". '{EscapePowerShellLiteral(scriptPath)}'; " +
+            $"Get-ProductIdentity -Path '{EscapePowerShellLiteral(propsPath)}' | ConvertTo-Json -Compress";
+        return RunProcessAsync(
+            "powershell.exe",
+            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            RepositoryRoot(),
+            TimeSpan.FromSeconds(30));
+    }
+
+    private static string EscapePowerShellLiteral(string value) => value.Replace("'", "''", StringComparison.Ordinal);
 
     private static async Task<ProcessResult> RunGeneratorAsync(string repositoryRoot, bool verifyOnly)
     {
