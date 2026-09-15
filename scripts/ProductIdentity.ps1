@@ -1,6 +1,20 @@
 Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Xml.Linq
 
+function Assert-SafeProductIdentityLeaf {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    $isDotSegment = $Value -ceq '.' -or $Value -ceq '..'
+    $hasSeparator = $Value.IndexOf('/') -ge 0 -or $Value.IndexOf('\') -ge 0
+    $hasInvalidCharacter = $Value.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0
+    if ([System.IO.Path]::IsPathRooted($Value) -or $isDotSegment -or $hasSeparator -or $hasInvalidCharacter) {
+        throw [System.IO.InvalidDataException]::new("Product identity field '$Name' must be a safe leaf name.")
+    }
+}
+
 function Get-ProductIdentity {
     [CmdletBinding()]
     param(
@@ -29,8 +43,11 @@ function Get-ProductIdentity {
         throw [System.IO.InvalidDataException]::new("Product identity source is not valid XML: $resolvedPath. $($_.Exception.Message)", $_.Exception)
     }
 
-    if ($null -eq $document.Root -or $document.Root.Name.LocalName -ne 'Project' -or $document.Root.Name.NamespaceName -ne '') {
-        throw [System.IO.InvalidDataException]::new('Product identity source must have an unqualified Project root element.')
+    if ($null -eq $document.Root -or
+        $document.Root.Name.LocalName -cne 'Project' -or
+        $document.Root.Name.NamespaceName -cne '' -or
+        $document.Root.HasAttributes) {
+        throw [System.IO.InvalidDataException]::new('Product identity source must have an unqualified, unattributed Project root element.')
     }
 
     $requiredNames = @(
@@ -45,29 +62,52 @@ function Get-ProductIdentity {
         'ProductDataDirectoryName',
         'ProductLicenseProductId'
     )
-    $propertyGroups = @($document.Root.Elements() |
-        Where-Object { $_.Name.LocalName -eq 'PropertyGroup' -and $_.Name.NamespaceName -eq '' })
-    foreach ($propertyGroup in $propertyGroups) {
-        if ($propertyGroup.HasAttributes) {
-            throw [System.IO.InvalidDataException]::new('Product identity PropertyGroup must not be conditional or attributed.')
-        }
+    $rootElements = @($document.Root.Elements())
+    if ($rootElements.Count -ne 1) {
+        throw [System.IO.InvalidDataException]::new('Product identity Project must contain exactly one PropertyGroup element.')
     }
-    $propertyElements = @($propertyGroups | ForEach-Object { $_.Elements() })
+    $propertyGroup = $rootElements[0]
+    if ($propertyGroup.Name.LocalName -cne 'PropertyGroup' -or
+        $propertyGroup.Name.NamespaceName -cne '' -or
+        $propertyGroup.HasAttributes) {
+        throw [System.IO.InvalidDataException]::new('Product identity PropertyGroup must be direct, unqualified, and unattributed.')
+    }
+    $propertyElements = @($propertyGroup.Elements())
+    if ($propertyElements.Count -ne $requiredNames.Count) {
+        throw [System.IO.InvalidDataException]::new('Product identity PropertyGroup must contain exactly the required fields.')
+    }
     $values = [ordered]@{}
 
-    foreach ($name in $requiredNames) {
-        $matches = @($propertyElements | Where-Object { $_.Name.LocalName -eq $name -and $_.Name.NamespaceName -eq '' })
-        if ($matches.Count -ne 1) {
+    foreach ($element in $propertyElements) {
+        $name = $element.Name.LocalName
+        if ($element.Name.NamespaceName -cne '' -or $requiredNames -cnotcontains $name) {
+            throw [System.IO.InvalidDataException]::new("Unknown or incorrectly cased product identity field '$name'.")
+        }
+        if ($values.Contains($name)) {
             throw [System.IO.InvalidDataException]::new("Product identity field '$name' must appear exactly once.")
         }
-        if ($matches[0].HasAttributes) {
+        if ($element.HasAttributes) {
             throw [System.IO.InvalidDataException]::new("Product identity field '$name' must not be conditional or attributed.")
         }
-        $value = $matches[0].Value
+        $nonTextNodes = @($element.Nodes() | Where-Object { $_.NodeType -ne [System.Xml.XmlNodeType]::Text })
+        if ($element.HasElements -or $nonTextNodes.Count -ne 0) {
+            throw [System.IO.InvalidDataException]::new("Product identity field '$name' must contain text only.")
+        }
+        $value = $element.Value
         if ([string]::IsNullOrWhiteSpace($value) -or $value -ne $value.Trim() -or $value.IndexOfAny([char[]]@("`r", "`n", "`0")) -ge 0) {
             throw [System.IO.InvalidDataException]::new("Product identity field '$name' must be a non-empty single-line value without surrounding whitespace.")
         }
         $values[$name] = $value
+    }
+
+    foreach ($name in @(
+        'ProductMainAssemblyName',
+        'ProductMainExecutableName',
+        'ProductMainDllName',
+        'ProductLegacyAssemblyName',
+        'ProductLegacyExecutableName',
+        'ProductDataDirectoryName')) {
+        Assert-SafeProductIdentityLeaf -Name $name -Value $values[$name]
     }
 
     if ($values.ProductMainExecutableName -ne "$($values.ProductMainAssemblyName).exe") {

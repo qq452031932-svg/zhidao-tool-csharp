@@ -140,6 +140,128 @@ public sealed class ProductIdentityTests
         }
     }
 
+    public static TheoryData<string, string> RejectedSchemaMutations => new()
+    {
+        { "</Project>", "  <Choose />\n</Project>" },
+        { "</Project>", "  <Import Project=\"other.props\" />\n</Project>" },
+        { "</Project>", "  <Target Name=\"Unexpected\" />\n</Project>" },
+        { "<Project>", "<Project Unexpected=\"true\">" },
+        { "</PropertyGroup>", "    <UnknownIdentity>value</UnknownIdentity>\n  </PropertyGroup>" },
+        { "</PropertyGroup>", "    <ProductDisplayName>duplicate</ProductDisplayName>\n  </PropertyGroup>" },
+        { "</Project>", "  <PropertyGroup />\n</Project>" },
+        { "<ProductDescription>知道综合工具</ProductDescription>", "<ProductDescription><Value>知道综合工具</Value></ProductDescription>" },
+        { "<ProductDescription>知道综合工具</ProductDescription>", "<ProductDescription>知道<!-- comment -->综合工具</ProductDescription>" },
+        { "<ProductDescription>知道综合工具</ProductDescription>", "<ProductDescription><![CDATA[知道综合工具]]></ProductDescription>" },
+        { "<ProductDescription>知道综合工具</ProductDescription>", "<ProductDescription Condition=\"'$(Configuration)' == 'Release'\">知道综合工具</ProductDescription>" },
+        { "<ProductDescription>知道综合工具</ProductDescription>", "<productDescription>知道综合工具</productDescription>" },
+        { "<ProductDescription>知道综合工具</ProductDescription>", "<x:ProductDescription xmlns:x=\"urn:test\">知道综合工具</x:ProductDescription>" },
+        { "<PropertyGroup>", "<x:PropertyGroup xmlns:x=\"urn:test\">" },
+    };
+
+    [Theory]
+    [MemberData(nameof(RejectedSchemaMutations))]
+    public async Task LoaderRejectsAnythingOutsideClosedSchema(string original, string replacement)
+    {
+        var fixtureRoot = Path.Combine(Path.GetTempPath(), $"product-identity-{Guid.NewGuid():N}");
+        try
+        {
+            CopyIdentityFixture(fixtureRoot);
+            var propsPath = Path.Combine(fixtureRoot, "eng", "ProductIdentity.props");
+            var props = await File.ReadAllTextAsync(propsPath);
+            var mutated = props.Replace(original, replacement, StringComparison.Ordinal);
+            Assert.NotEqual(props, mutated);
+            await File.WriteAllTextAsync(propsPath, mutated);
+
+            var result = await RunGeneratorAsync(fixtureRoot, verifyOnly: true);
+
+            Assert.NotEqual(0, result.ExitCode);
+        }
+        finally
+        {
+            if (Directory.Exists(fixtureRoot)) Directory.Delete(fixtureRoot, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(@"C:\unsafe")]
+    [InlineData("unsafe/name")]
+    [InlineData(@"unsafe\name")]
+    [InlineData(".")]
+    [InlineData("..")]
+    [InlineData("unsafe:name")]
+    public async Task LoaderRejectsUnsafeDataDirectoryLeaf(string unsafeValue)
+    {
+        var result = await RunGeneratorWithOverridesAsync(new Dictionary<string, string>
+        {
+            ["ProductDataDirectoryName"] = unsafeValue,
+        });
+
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Fact]
+    public async Task LoaderRejectsUnsafeMainFileComponentsEvenWhenSuffixesMatch()
+    {
+        var result = await RunGeneratorWithOverridesAsync(new Dictionary<string, string>
+        {
+            ["ProductMainAssemblyName"] = "unsafe/name",
+            ["ProductMainExecutableName"] = "unsafe/name.exe",
+            ["ProductMainDllName"] = "unsafe/name.dll",
+        });
+
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Fact]
+    public async Task LoaderRejectsUnsafeLegacyFileComponentsEvenWhenSuffixesMatch()
+    {
+        var result = await RunGeneratorWithOverridesAsync(new Dictionary<string, string>
+        {
+            ["ProductLegacyAssemblyName"] = @"unsafe\name",
+            ["ProductLegacyExecutableName"] = @"unsafe\name.exe",
+        });
+
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Fact]
+    public async Task GeneratorPreservesTokenLikeValuesAndUsesLanguageSpecificEscapes()
+    {
+        var fixtureRoot = Path.Combine(Path.GetTempPath(), $"product-identity-{Guid.NewGuid():N}");
+        try
+        {
+            CopyIdentityFixture(fixtureRoot);
+            const string tokenLikeDisplayName = "{ProductDescription}";
+            const string complexDescription = "quote \" slash \\ braces {ProductPackageId} tab\t next\u0085line\u2028para\u2029emoji😀";
+            await SetPropertiesAsync(fixtureRoot, new Dictionary<string, string>
+            {
+                ["ProductDisplayName"] = tokenLikeDisplayName,
+                ["ProductDescription"] = complexDescription,
+            });
+
+            var result = await RunGeneratorAsync(fixtureRoot, verifyOnly: false);
+
+            Assert.True(result.ExitCode == 0, result.Output);
+            var mainCSharpPath = Path.Combine(
+                fixtureRoot, "src", "BaiduBatchTransfer.App", "Branding", "ProductIdentity.Generated.cs");
+            var mainCSharp = await File.ReadAllTextAsync(mainCSharpPath);
+            var go = await File.ReadAllTextAsync(Path.Combine(
+                fixtureRoot, "services", "ota_admin", "internal", "release", "product_identity_generated.go"));
+            const string expectedEscapedDescription = "quote \\\" slash \\\\ braces {ProductPackageId} tab\\t next\\u0085line\\u2028para\\u2029emoji😀";
+            Assert.Contains("internal const string DisplayName = \"{ProductDescription}\";", mainCSharp, StringComparison.Ordinal);
+            Assert.Contains($"internal const string Description = \"{expectedEscapedDescription}\";", mainCSharp, StringComparison.Ordinal);
+            Assert.Contains("productDisplayName          = \"{ProductDescription}\"", go, StringComparison.Ordinal);
+            Assert.Contains($"productDescription          = \"{expectedEscapedDescription}\"", go, StringComparison.Ordinal);
+
+            var compileResult = await CompileGeneratedCSharpAsync(fixtureRoot, mainCSharpPath);
+            Assert.True(compileResult.ExitCode == 0, compileResult.Output);
+        }
+        finally
+        {
+            if (Directory.Exists(fixtureRoot)) Directory.Delete(fixtureRoot, recursive: true);
+        }
+    }
+
     private static Dictionary<string, string> LoadCanonicalProperties()
     {
         var document = XDocument.Load(Path.Combine(RepositoryRoot(), "eng", "ProductIdentity.props"));
@@ -167,6 +289,61 @@ public sealed class ProductIdentityTests
         }
     }
 
+    private static async Task<ProcessResult> RunGeneratorWithOverridesAsync(
+        IReadOnlyDictionary<string, string> overrides)
+    {
+        var fixtureRoot = Path.Combine(Path.GetTempPath(), $"product-identity-{Guid.NewGuid():N}");
+        try
+        {
+            CopyIdentityFixture(fixtureRoot);
+            await SetPropertiesAsync(fixtureRoot, overrides);
+            return await RunGeneratorAsync(fixtureRoot, verifyOnly: false);
+        }
+        finally
+        {
+            if (Directory.Exists(fixtureRoot)) Directory.Delete(fixtureRoot, recursive: true);
+        }
+    }
+
+    private static async Task SetPropertiesAsync(
+        string fixtureRoot,
+        IReadOnlyDictionary<string, string> overrides)
+    {
+        var propsPath = Path.Combine(fixtureRoot, "eng", "ProductIdentity.props");
+        var document = XDocument.Load(propsPath);
+        foreach (var (name, value) in overrides)
+        {
+            document.Descendants().Single(element => element.Name.LocalName == name).Value = value;
+        }
+        await File.WriteAllTextAsync(
+            propsPath,
+            document.ToString(),
+            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+    }
+
+    private static async Task<ProcessResult> CompileGeneratedCSharpAsync(
+        string fixtureRoot,
+        string generatedSourcePath)
+    {
+        var compileRoot = Path.Combine(fixtureRoot, "compile");
+        Directory.CreateDirectory(compileRoot);
+        var sourcePath = Path.Combine(compileRoot, "ProductIdentity.Generated.cs");
+        File.Copy(generatedSourcePath, sourcePath);
+        var projectPath = Path.Combine(compileRoot, "GeneratedIdentity.csproj");
+        await File.WriteAllTextAsync(projectPath, """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net8.0</TargetFramework>
+                <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+              </PropertyGroup>
+              <ItemGroup>
+                <Compile Include="ProductIdentity.Generated.cs" />
+              </ItemGroup>
+            </Project>
+            """);
+        return await RunProcessAsync("dotnet", ["build", projectPath, "--nologo"], compileRoot, TimeSpan.FromMinutes(1));
+    }
+
     private static async Task<ProcessResult> RunGeneratorAsync(string repositoryRoot, bool verifyOnly)
     {
         var info = new ProcessStartInfo
@@ -189,10 +366,34 @@ public sealed class ProductIdentityTests
         }
         if (verifyOnly) info.ArgumentList.Add("-VerifyOnly");
 
+        return await RunProcessAsync(info, TimeSpan.FromSeconds(30));
+    }
+
+    private static async Task<ProcessResult> RunProcessAsync(
+        string fileName,
+        IEnumerable<string> arguments,
+        string workingDirectory,
+        TimeSpan timeout)
+    {
+        var info = new ProcessStartInfo
+        {
+            FileName = fileName,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = workingDirectory,
+        };
+        foreach (var argument in arguments) info.ArgumentList.Add(argument);
+        return await RunProcessAsync(info, timeout);
+    }
+
+    private static async Task<ProcessResult> RunProcessAsync(ProcessStartInfo info, TimeSpan timeoutValue)
+    {
         using var process = Process.Start(info)!;
         var stdout = process.StandardOutput.ReadToEndAsync();
         var stderr = process.StandardError.ReadToEndAsync();
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var timeout = new CancellationTokenSource(timeoutValue);
         await process.WaitForExitAsync(timeout.Token);
         return new ProcessResult(process.ExitCode, string.Join(Environment.NewLine, await stdout, await stderr));
     }
