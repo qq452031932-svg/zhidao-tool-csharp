@@ -149,6 +149,7 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("Private-key material is forbidden", script, StringComparison.Ordinal);
         Assert.Contains("failure-logs", script, StringComparison.Ordinal);
         Assert.Contains("$productionStage", script, StringComparison.Ordinal);
+        Assert.Contains("Install-VerifiedLegacyLauncher $legacyLauncherPublishDirectory $publishDirectory $productionStage", script, StringComparison.Ordinal);
         Assert.Contains("[IO.Directory]::Move($productionStage, $productionOutput)", script, StringComparison.Ordinal);
         Assert.DoesNotContain("Join-Path $productionOutput '.build'", script, StringComparison.Ordinal);
         Assert.Contains("Published production metadata", script, StringComparison.Ordinal);

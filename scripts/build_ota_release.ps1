@@ -702,7 +702,7 @@ function Invoke-ProductionRelease {
             'publish',$legacyLauncherProject,'-c','Release','-r','win-x64','--self-contained','true','--no-restore',
             '-o',$legacyLauncherPublishDirectory,"-p:VersionPrefix=$Version",'-p:RuntimeIdentifier=win-x64','-p:SelfContained=true') $sourceSnapshot
         Assert-PublishedApplicationLayout $publishDirectory 'Published production application'
-        Install-VerifiedLegacyLauncher $legacyLauncherPublishDirectory $publishDirectory $buildRoot
+        Install-VerifiedLegacyLauncher $legacyLauncherPublishDirectory $publishDirectory $productionStage
         $publishedAssemblyPath = Join-Path $publishDirectory $productMainDllName
         $publishedAssembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($publishedAssemblyPath))
         $publishedMetadata = @{}
