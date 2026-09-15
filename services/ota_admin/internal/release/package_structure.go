@@ -66,7 +66,7 @@ func validateSetupStructure(file *verifiedFile) error {
 	return nil
 }
 
-func validatePackageStructure(file *verifiedFile, expectedVersion, expectedType string) error {
+func validatePackageStructure(file *verifiedFile, expectedVersion, expectedType, currentVersion string) error {
 	inner, err := openInnerArchive(file)
 	if err != nil {
 		return err
@@ -76,36 +76,60 @@ func validatePackageStructure(file *verifiedFile, expectedVersion, expectedType 
 			return fmt.Errorf("package is missing %s", required)
 		}
 	}
-	if err := validateNuspec(inner.entries[packageID+".nuspec"], expectedVersion, false); err != nil {
+	isCurrent := expectedVersion == currentVersion
+	expectedMainExecutable := productLegacyExecutableName
+	if isCurrent {
+		expectedMainExecutable = productMainExecutableName
+	}
+	if err := validateNuspec(inner.entries[packageID+".nuspec"], expectedVersion, expectedMainExecutable, false); err != nil {
 		return err
 	}
 	if expectedType == "Full" {
+		assemblyName := productLegacyAssemblyName
+		dllName := assemblyName + ".dll"
+		if isCurrent {
+			assemblyName = productMainAssemblyName
+			dllName = productMainDLLName
+		}
 		for _, required := range []string{
-			"lib/app/BaiduBatchTransfer.App.dll",
-			"lib/app/BaiduBatchTransfer.App.deps.json",
-			"lib/app/BaiduBatchTransfer.App.runtimeconfig.json",
+			"lib/app/" + dllName,
+			"lib/app/" + assemblyName + ".deps.json",
+			"lib/app/" + assemblyName + ".runtimeconfig.json",
 		} {
 			if _, ok := inner.entries[required]; !ok {
 				return fmt.Errorf("Full package is missing %s", required)
 			}
 		}
-		return validateExecutableSet(inner, []string{
-			"lib/app/BaiduBatchTransfer.App_ExecutionStub.exe",
-			"lib/app/BaiduBatchTransfer.App.exe",
+		requiredExecutables := []string{
+			"lib/app/" + assemblyName + "_ExecutionStub.exe",
+			"lib/app/" + expectedMainExecutable,
 			"lib/app/Squirrel.exe",
-		}, []string{
+		}
+		if isCurrent {
+			requiredExecutables = append(requiredExecutables, "lib/app/"+productLegacyExecutableName)
+		}
+		return validateExecutableSet(inner, requiredExecutables, []string{
 			"lib/app/managed-browser-helper/python.exe",
 			"lib/app/managed-browser-helper/pythonw.exe",
 		})
 	}
-	if err := validateExecutableSet(inner, nil, nil); err != nil {
-		return err
+	legacyBase := "lib/app/" + productLegacyExecutableName
+	if isCurrent {
+		for _, required := range []string{
+			"lib/app/" + productMainDLLName,
+			"lib/app/" + productMainAssemblyName + ".deps.json",
+			"lib/app/" + productMainAssemblyName + ".runtimeconfig.json",
+		} {
+			if _, ok := inner.entries[required]; !ok {
+				return fmt.Errorf("Delta package is missing %s", required)
+			}
+		}
 	}
-	patchBase := "lib/app/BaiduBatchTransfer.App.exe"
-	_, diff := inner.entries[patchBase+".diff"]
-	_, zsdiff := inner.entries[patchBase+".zsdiff"]
-	if (!diff && !zsdiff) || inner.entries[patchBase+".shasum"] == nil {
-		return errors.New("Delta package has no main executable patch and shasum")
+	_, legacyReplacement := inner.entries[legacyBase]
+	_, diff := inner.entries[legacyBase+".diff"]
+	_, zsdiff := inner.entries[legacyBase+".zsdiff"]
+	if !legacyReplacement && ((!diff && !zsdiff) || inner.entries[legacyBase+".shasum"] == nil) {
+		return errors.New("Delta package does not replace or patch the compatibility executable")
 	}
 	for name := range inner.entries {
 		base := ""
@@ -118,7 +142,17 @@ func validatePackageStructure(file *verifiedFile, expectedVersion, expectedType 
 			return fmt.Errorf("Delta patch has no shasum: %s", name)
 		}
 	}
-	return nil
+	requiredExecutables := []string(nil)
+	if isCurrent {
+		requiredExecutables = append(requiredExecutables,
+			"lib/app/"+productMainAssemblyName+"_ExecutionStub.exe",
+			"lib/app/"+productMainExecutableName,
+		)
+	}
+	if legacyReplacement {
+		requiredExecutables = append(requiredExecutables, legacyBase)
+	}
+	return validateExecutableSet(inner, requiredExecutables, nil)
 }
 
 func validatePortableStructure(file *verifiedFile, expectedVersion string) error {
@@ -129,21 +163,22 @@ func validatePortableStructure(file *verifiedFile, expectedVersion string) error
 	for _, required := range []string{
 		".portable",
 		"current/sq.version",
-		"current/BaiduBatchTransfer.App.dll",
-		"current/BaiduBatchTransfer.App.deps.json",
-		"current/BaiduBatchTransfer.App.runtimeconfig.json",
+		"current/" + productMainDLLName,
+		"current/" + productMainAssemblyName + ".deps.json",
+		"current/" + productMainAssemblyName + ".runtimeconfig.json",
 	} {
 		if _, ok := inner.entries[required]; !ok {
 			return fmt.Errorf("Portable archive is missing %s", required)
 		}
 	}
-	if err := validateNuspec(inner.entries["current/sq.version"], expectedVersion, true); err != nil {
+	if err := validateNuspec(inner.entries["current/sq.version"], expectedVersion, productMainExecutableName, true); err != nil {
 		return err
 	}
 	return validateExecutableSet(inner, []string{
-		packageID + ".exe",
+		productMainExecutableName,
 		"Update.exe",
-		"current/BaiduBatchTransfer.App.exe",
+		"current/" + productMainExecutableName,
+		"current/" + productLegacyExecutableName,
 	}, []string{
 		"current/managed-browser-helper/python.exe",
 		"current/managed-browser-helper/pythonw.exe",
@@ -436,7 +471,7 @@ func isASCIIAlpha(value byte) bool {
 	return value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
 }
 
-func validateNuspec(entry *zip.File, expectedVersion string, requireMachineArchitecture bool) error {
+func validateNuspec(entry *zip.File, expectedVersion, expectedMainExecutable string, requireMachineArchitecture bool) error {
 	data, err := readZipEntry(entry, maxNuspecBytes)
 	if err != nil {
 		return errors.New("package metadata is oversized or unreadable")
@@ -462,7 +497,7 @@ func validateNuspec(entry *zip.File, expectedVersion string, requireMachineArchi
 	}
 	metadata := document.Metadata[0]
 	if !exactSingle(metadata.ID, packageID) || !exactSingle(metadata.Version, expectedVersion) || !exactSingle(metadata.Channel, channel) ||
-		!exactSingle(metadata.MainExecutable, "BaiduBatchTransfer.App.exe") || !exactSingle(metadata.OS, "win") || !exactSingle(metadata.RID, "win-x64") {
+		!exactSingle(metadata.MainExecutable, expectedMainExecutable) || !exactSingle(metadata.OS, "win") || !exactSingle(metadata.RID, "win-x64") {
 		return errors.New("package metadata identity, version, channel, or RID differs")
 	}
 	if requireMachineArchitecture && !exactSingle(metadata.MachineArchitecture, "x64") ||

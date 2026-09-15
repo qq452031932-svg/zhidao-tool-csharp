@@ -83,8 +83,10 @@ func newBundleFixtureWithAssets(t *testing.T, specs []fixtureAsset) *bundleFixtu
 		if parsed.compare(parsedCurrent) > 0 {
 			currentVersion, parsedCurrent = spec.version, parsed
 		}
+	}
+	for _, spec := range specs {
 		name := fmt.Sprintf("%s-%s-%s.nupkg", packageID, spec.version, strings.ToLower(spec.kind))
-		fixture.files[name] = makeNupkg(t, spec.version, spec.kind, channel)
+		fixture.files[name] = makeNupkg(t, spec.version, spec.kind, channel, spec.version == currentVersion)
 		assets = append(assets, fixture.releaseAsset(spec.version, spec.kind, name))
 		if spec.kind == "Full" {
 			fullNames = append(fullNames, name)
@@ -144,23 +146,43 @@ func previousVersion(t *testing.T, value string) string {
 	return fmt.Sprintf("%d.%d.%d", numbers[0], numbers[1], numbers[2])
 }
 
-func makeNupkg(t *testing.T, version, kind, packageChannel string) []byte {
+func makeNupkg(t *testing.T, version, kind, packageChannel string, current bool) []byte {
 	t.Helper()
+	mainExecutable := productLegacyExecutableName
+	if current {
+		mainExecutable = productMainExecutableName
+	}
 	entries := map[string][]byte{
 		"[Content_Types].xml": []byte(`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`),
 		"_rels/.rels":         []byte(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`),
-		packageID + ".nuspec": []byte(packageMetadata(version, packageChannel)),
+		packageID + ".nuspec": []byte(packageMetadata(version, packageChannel, mainExecutable)),
 	}
 	if kind == "Full" {
-		entries["lib/app/BaiduBatchTransfer.App.dll"] = []byte("managed assembly")
-		entries["lib/app/BaiduBatchTransfer.App.deps.json"] = []byte(`{}`)
-		entries["lib/app/BaiduBatchTransfer.App.runtimeconfig.json"] = []byte(`{}`)
-		entries["lib/app/BaiduBatchTransfer.App_ExecutionStub.exe"] = makeSetupImage()
-		entries["lib/app/BaiduBatchTransfer.App.exe"] = makeSetupImage()
+		assemblyName := productLegacyAssemblyName
+		dllName := assemblyName + ".dll"
+		if current {
+			assemblyName = productMainAssemblyName
+			dllName = productMainDLLName
+		}
+		entries["lib/app/"+dllName] = []byte("managed assembly")
+		entries["lib/app/"+assemblyName+".deps.json"] = []byte(`{}`)
+		entries["lib/app/"+assemblyName+".runtimeconfig.json"] = []byte(`{}`)
+		entries["lib/app/"+assemblyName+"_ExecutionStub.exe"] = makeSetupImage()
+		entries["lib/app/"+mainExecutable] = makeSetupImage()
+		if current {
+			entries["lib/app/"+productLegacyExecutableName] = makeSetupImage()
+		}
 		entries["lib/app/Squirrel.exe"] = makeSetupImage()
 	} else {
-		entries["lib/app/BaiduBatchTransfer.App.exe.diff"] = []byte("real patch bytes")
-		entries["lib/app/BaiduBatchTransfer.App.exe.shasum"] = []byte(strings.Repeat("0", 64))
+		entries["lib/app/"+productLegacyExecutableName+".diff"] = []byte("real patch bytes")
+		entries["lib/app/"+productLegacyExecutableName+".shasum"] = []byte(strings.Repeat("0", 64))
+		if current {
+			entries["lib/app/"+productMainAssemblyName+"_ExecutionStub.exe"] = makeSetupImage()
+			entries["lib/app/"+productMainExecutableName] = makeSetupImage()
+			entries["lib/app/"+productMainDLLName] = []byte("managed assembly")
+			entries["lib/app/"+productMainAssemblyName+".deps.json"] = []byte(`{}`)
+			entries["lib/app/"+productMainAssemblyName+".runtimeconfig.json"] = []byte(`{}`)
+		}
 	}
 	return zipBytes(t, entries)
 }
@@ -168,19 +190,20 @@ func makeNupkg(t *testing.T, version, kind, packageChannel string) []byte {
 func makePortable(t *testing.T, version, packageChannel string) []byte {
 	t.Helper()
 	return zipBytes(t, map[string][]byte{
-		".portable":                                         {},
-		"current/sq.version":                                []byte(packageMetadata(version, packageChannel)),
-		"current/BaiduBatchTransfer.App.dll":                []byte("managed assembly"),
-		"current/BaiduBatchTransfer.App.deps.json":          []byte(`{}`),
-		"current/BaiduBatchTransfer.App.runtimeconfig.json": []byte(`{}`),
-		packageID + ".exe":                                  makeSetupImage(),
-		"Update.exe":                                        makeSetupImage(),
-		"current/BaiduBatchTransfer.App.exe":                makeSetupImage(),
+		".portable":                     {},
+		"current/sq.version":            []byte(packageMetadata(version, packageChannel, productMainExecutableName)),
+		"current/" + productMainDLLName: []byte("managed assembly"),
+		"current/" + productMainAssemblyName + ".deps.json":          []byte(`{}`),
+		"current/" + productMainAssemblyName + ".runtimeconfig.json": []byte(`{}`),
+		productMainExecutableName:                                    makeSetupImage(),
+		"Update.exe":                                                 makeSetupImage(),
+		"current/" + productMainExecutableName:                       makeSetupImage(),
+		"current/" + productLegacyExecutableName:                     makeSetupImage(),
 	})
 }
 
-func packageMetadata(version, packageChannel string) string {
-	return fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?><package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd"><metadata><id>%s</id><version>%s</version><channel>%s</channel><mainExe>BaiduBatchTransfer.App.exe</mainExe><os>win</os><rid>win-x64</rid><machineArchitecture>x64</machineArchitecture></metadata></package>`, packageID, version, packageChannel)
+func packageMetadata(version, packageChannel, mainExecutable string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?><package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd"><metadata><id>%s</id><version>%s</version><channel>%s</channel><mainExe>%s</mainExe><os>win</os><rid>win-x64</rid><machineArchitecture>x64</machineArchitecture></metadata></package>`, packageID, version, packageChannel, mainExecutable)
 }
 
 func zipBytes(t *testing.T, entries map[string][]byte) []byte {
@@ -483,12 +506,12 @@ func TestValidatorRejectsArbitraryOrMismatchedPackageStructures(t *testing.T) {
 			f.replaceReleaseAsset("SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg", []byte("not a package"))
 		}},
 		{"renamed Acceptance Full", func(f *bundleFixture) {
-			f.replaceReleaseAsset("SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg", makeNupkg(t, "1.2.3", "Full", "ota-acceptance"))
+			f.replaceReleaseAsset("SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg", makeNupkg(t, "1.2.3", "Full", "ota-acceptance", true))
 		}},
 		{"Delta without patch structure", func(f *bundleFixture) {
 			name := "SuperPan.BaiduBatchTransfer-1.2.3-delta.nupkg"
 			f.replaceReleaseAsset(name, zipBytes(t, map[string][]byte{
-				"[Content_Types].xml": {}, "_rels/.rels": {}, packageID + ".nuspec": []byte(packageMetadata("1.2.3", channel)),
+				"[Content_Types].xml": {}, "_rels/.rels": {}, packageID + ".nuspec": []byte(packageMetadata("1.2.3", channel, productMainExecutableName)),
 			}))
 		}},
 		{"stale Portable", func(f *bundleFixture) {
@@ -498,6 +521,88 @@ func TestValidatorRejectsArbitraryOrMismatchedPackageStructures(t *testing.T) {
 		{"arbitrary Setup blob", func(f *bundleFixture) {
 			f.files[setupName] = []byte("not a PE image")
 			f.reseal()
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newBundleFixture(t, "1.2.3", true)
+			test.edit(fixture)
+			if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+				t.Fatalf("error = %v, want %v", err, ErrMetadata)
+			}
+		})
+	}
+}
+
+func TestValidatorAcceptsHistoricalLegacyFullAndCurrentDeltaReplacement(t *testing.T) {
+	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
+		{version: "1.2.2", kind: "Full"},
+		{version: "1.2.3", kind: "Full"},
+		{version: "1.2.3", kind: "Delta"},
+	})
+	deltaName := fmt.Sprintf("%s-1.2.3-delta.nupkg", packageID)
+	entries := readZipBytes(t, fixture.files[deltaName])
+	delete(entries, "lib/app/"+productLegacyExecutableName+".diff")
+	delete(entries, "lib/app/"+productLegacyExecutableName+".shasum")
+	entries["lib/app/"+productLegacyExecutableName] = makeSetupImage()
+	fixture.replaceReleaseAsset(deltaName, zipBytes(t, entries))
+
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidatorRejectsCurrentPackagesThatDoNotExpressRenameMigration(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*bundleFixture)
+	}{
+		{"current Full uses historical layout", func(f *bundleFixture) {
+			name := fmt.Sprintf("%s-1.2.3-full.nupkg", packageID)
+			f.replaceReleaseAsset(name, makeNupkg(t, "1.2.3", "Full", channel, false))
+		}},
+		{"current Full lacks compatibility launcher", func(f *bundleFixture) {
+			name := fmt.Sprintf("%s-1.2.3-full.nupkg", packageID)
+			entries := readZipBytes(t, f.files[name])
+			delete(entries, "lib/app/"+productLegacyExecutableName)
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"Portable lacks compatibility launcher", func(f *bundleFixture) {
+			entries := readZipBytes(t, f.files[portableName])
+			delete(entries, "current/"+productLegacyExecutableName)
+			f.files[portableName] = zipBytes(t, entries)
+			f.reseal()
+		}},
+		{"Portable uses legacy root launcher name", func(f *bundleFixture) {
+			entries := readZipBytes(t, f.files[portableName])
+			delete(entries, productMainExecutableName)
+			entries[packageID+".exe"] = makeSetupImage()
+			f.files[portableName] = zipBytes(t, entries)
+			f.reseal()
+		}},
+		{"Delta patches renamed executable instead of compatibility path", func(f *bundleFixture) {
+			name := fmt.Sprintf("%s-1.2.3-delta.nupkg", packageID)
+			entries := readZipBytes(t, f.files[name])
+			delete(entries, "lib/app/"+productLegacyExecutableName+".diff")
+			delete(entries, "lib/app/"+productLegacyExecutableName+".shasum")
+			entries["lib/app/"+productMainExecutableName+".diff"] = []byte("wrong baseline")
+			entries["lib/app/"+productMainExecutableName+".shasum"] = []byte(strings.Repeat("0", 64))
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"Delta uses historical layout", func(f *bundleFixture) {
+			name := fmt.Sprintf("%s-1.2.3-delta.nupkg", packageID)
+			entries := readZipBytes(t, f.files[name])
+			delete(entries, "lib/app/"+productMainExecutableName)
+			delete(entries, "lib/app/"+productMainDLLName)
+			delete(entries, "lib/app/"+productMainAssemblyName+".deps.json")
+			delete(entries, "lib/app/"+productMainAssemblyName+".runtimeconfig.json")
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"Delta has unexpected executable", func(f *bundleFixture) {
+			name := fmt.Sprintf("%s-1.2.3-delta.nupkg", packageID)
+			entries := readZipBytes(t, f.files[name])
+			entries["lib/app/evil.exe"] = makeSetupImage()
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
 		}},
 	}
 	for _, test := range tests {
@@ -555,7 +660,7 @@ func TestValidatorRequiresPublisherExecutablesAndRejectsUnexpectedExecutables(t 
 func TestValidatorRequiresPortableX64MachineArchitecture(t *testing.T) {
 	fixture := newBundleFixture(t, "1.2.3", false)
 	entries := readZipBytes(t, fixture.files[portableName])
-	entries["current/sq.version"] = []byte(strings.Replace(packageMetadata("1.2.3", channel), "<machineArchitecture>x64</machineArchitecture>", "", 1))
+	entries["current/sq.version"] = []byte(strings.Replace(packageMetadata("1.2.3", channel, productMainExecutableName), "<machineArchitecture>x64</machineArchitecture>", "", 1))
 	fixture.files[portableName] = zipBytes(t, entries)
 	fixture.reseal()
 	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {

@@ -163,7 +163,7 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 		return Report{}, fmt.Errorf("%w: %v", ErrMetadata, err)
 	}
 	for _, asset := range feed.Assets {
-		if err := validatePackageStructure(files[*asset.FileName], *asset.Version, *asset.Type); err != nil {
+		if err := validatePackageStructure(files[*asset.FileName], *asset.Version, *asset.Type, currentVersion); err != nil {
 			return Report{}, fmt.Errorf("%w: %s: %v", ErrMetadata, *asset.FileName, err)
 		}
 	}

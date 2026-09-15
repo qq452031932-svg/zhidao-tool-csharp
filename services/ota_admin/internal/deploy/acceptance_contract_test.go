@@ -37,7 +37,7 @@ func TestAcceptanceHarnessIsBuildTaggedAndIsolatedFromProduction(t *testing.T) {
 		}
 	}
 	acceptanceScript := readTask10Script(t, filepath.Join(moduleRoot, "scripts", "build_linux_acceptance.ps1"))
-	for _, required := range []string{"-tags 'ota_admin_acceptance'", "./cmd/ota-admin-acceptance", "superpan-ota-admin-acceptance-linux-amd64", "Get-AcceptanceSourcePaths", "cmd/ota-admin-acceptance/testdata/valid-upload.zip", "cmd/ota-admin-acceptance/testdata/publisher.cer", "b01dd17f87ade73bcefacedf55fe688fc8dd7bc222bb4bb7c264790633afff95", "54250feb9125e34f5f48ffaa2210f7c6d251a6475bf09cef34b0aee9e57f3d53"} {
+	for _, required := range []string{"-tags 'ota_admin_acceptance'", "./cmd/ota-admin-acceptance", "superpan-ota-admin-acceptance-linux-amd64", "Get-AcceptanceSourcePaths", "cmd/ota-admin-acceptance/testdata/valid-upload.zip", "cmd/ota-admin-acceptance/testdata/publisher.cer", "30b96617dfb888b5ce6daf0e8d3b7bd2b1a94c09d37021919d0b313720148916", "eed6657913e5bf86caac9b8f23928648b83a50b9b06f1e2c738cbb2a13dbc2d5"} {
 		if !strings.Contains(acceptanceScript, required) {
 			t.Fatalf("acceptance build script missing %q", required)
 		}
@@ -57,8 +57,8 @@ func TestAcceptanceHarnessFixturesExactlyMatchTrackedPowerShellGolden(t *testing
 	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
 	acceptanceFixtureRoot := filepath.Join(moduleRoot, "cmd", "ota-admin-acceptance", "testdata")
 	for name, want := range map[string]string{
-		"valid-upload.zip": "b01dd17f87ade73bcefacedf55fe688fc8dd7bc222bb4bb7c264790633afff95",
-		"publisher.cer":    "54250feb9125e34f5f48ffaa2210f7c6d251a6475bf09cef34b0aee9e57f3d53",
+		"valid-upload.zip": "30b96617dfb888b5ce6daf0e8d3b7bd2b1a94c09d37021919d0b313720148916",
+		"publisher.cer":    "eed6657913e5bf86caac9b8f23928648b83a50b9b06f1e2c738cbb2a13dbc2d5",
 	} {
 		got := fixtureSHA256(t, filepath.Join(acceptanceFixtureRoot, name))
 		if got != want {
