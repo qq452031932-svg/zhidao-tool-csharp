@@ -183,6 +183,8 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("Publisher certificate SPKI pin does not match", validator, StringComparison.Ordinal);
         Assert.Contains("Upload ZIP contains a directory or nested entry", validator, StringComparison.Ordinal);
         Assert.Contains("duplicate or case-colliding file", validator, StringComparison.Ordinal);
+        Assert.Contains("[DateTime]::ParseExact($timestampText", validator, StringComparison.Ordinal);
+        Assert.Contains("yyyyMMddHHmmss", validator, StringComparison.Ordinal);
     }
 
     [Fact]

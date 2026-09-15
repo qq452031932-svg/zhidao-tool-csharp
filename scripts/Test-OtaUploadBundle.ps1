@@ -592,7 +592,13 @@ function Get-AuthenticodeTimestampUtc([Security.Cryptography.Pkcs.SignerInfo]$Si
             $timestampBytes = Read-DerValue $sequence ([ref]$sequenceOffset) 0x18 'RFC3161 time'
             $timestampText = [Text.Encoding]::ASCII.GetString($timestampBytes)
             if ($timestampText -cnotmatch '^\d{14}(?:\.\d{1,7})?Z$') { throw 'Authenticode RFC3161 timestamp time is invalid.' }
-            $timestampUtc = [DateTime]::Parse($timestampText, [Globalization.CultureInfo]::InvariantCulture,
+            $fractionDigits = if ($timestampText.Contains('.')) { $timestampText.Length - 16 } else { 0 }
+            $timestampFormat = if ($fractionDigits -eq 0) {
+                "yyyyMMddHHmmss'Z'"
+            } else {
+                "yyyyMMddHHmmss." + ''.PadLeft($fractionDigits, 'f') + "'Z'"
+            }
+            $timestampUtc = [DateTime]::ParseExact($timestampText, $timestampFormat, [Globalization.CultureInfo]::InvariantCulture,
                 [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal)
             $accepted.Add([pscustomobject]@{ Utc=$timestampUtc; Certificate=$timestampCms.SignerInfos[0].Certificate; Kind='rfc3161' })
         }
