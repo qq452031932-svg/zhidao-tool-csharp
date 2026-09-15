@@ -9,6 +9,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <ProductApplicationIconPath>Assets\Branding\知道综合工具.ico</ProductApplicationIconPath>
+    <ProductBrandingPngPath>Assets\Branding\知道综合工具.png</ProductBrandingPngPath>
+    <ApplicationIcon>$(ProductApplicationIconPath)</ApplicationIcon>
     <AssemblyName>$(ProductMainAssemblyName)</AssemblyName>
     <AssemblyTitle>$(ProductDisplayName)</AssemblyTitle>
     <Product>$(ProductDisplayName)</Product>
@@ -165,6 +168,7 @@ public sealed class ValidateLicenseProductionTrust : Task
   <ItemGroup>
     <ApplicationDefinition Remove="App.xaml" />
     <Page Include="App.xaml" />
+    <Resource Include="$(ProductBrandingPngPath)" />
   </ItemGroup>
 
   <ItemGroup>
