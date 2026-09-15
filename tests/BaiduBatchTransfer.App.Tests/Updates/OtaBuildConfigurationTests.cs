@@ -15,8 +15,10 @@ public sealed class OtaBuildConfigurationTests
     public void LicenseProductIdIsImmutableAssemblyMetadata()
     {
         var project = File.ReadAllText(ProjectPath());
+        var identity = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "eng", "ProductIdentity.props"));
 
-        Assert.Contains($"<LicenseProductId>{ProductId}</LicenseProductId>", project, StringComparison.Ordinal);
+        Assert.Contains("<LicenseProductId Condition=\"'$(LicenseProductId)' == ''\">$(ProductLicenseProductId)</LicenseProductId>", project, StringComparison.Ordinal);
+        Assert.Contains($"<ProductLicenseProductId>{ProductId}</ProductLicenseProductId>", identity, StringComparison.Ordinal);
         Assert.Contains("<_Parameter1>LicenseProductId</_Parameter1>", project, StringComparison.Ordinal);
         Assert.Contains("<_Parameter2>$(LicenseProductId)</_Parameter2>", project, StringComparison.Ordinal);
     }

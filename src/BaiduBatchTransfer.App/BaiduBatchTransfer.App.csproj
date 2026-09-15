@@ -1,13 +1,19 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk"
          TreatAsLocalProperty="_ExpectedProductVersion;_ExpectedInformationalVersion;_ExpectedFileVersion;_VersionPrefixIsValid;_ExpectedProductMajor;_ExpectedAssemblyVersion;_UpdateFeedUrlIsValid;_AcceptanceFeedIsAbsolute;LicenseRuntimeMode">
 
+  <Import Project="..\..\eng\ProductIdentity.props" />
+
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
-    <LicenseProductId>8270e8d7-1791-487d-ad76-0da7a0cbed12</LicenseProductId>
+    <AssemblyName>$(ProductMainAssemblyName)</AssemblyName>
+    <AssemblyTitle>$(ProductDisplayName)</AssemblyTitle>
+    <Product>$(ProductDisplayName)</Product>
+    <Description>$(ProductDescription)</Description>
+    <LicenseProductId Condition="'$(LicenseProductId)' == ''">$(ProductLicenseProductId)</LicenseProductId>
     <LicenseSigningKeyId Condition="'$(LicenseSigningKeyId)' == ''">production-v1</LicenseSigningKeyId>
     <LicenseAcceptanceBuild Condition="'$(LicenseAcceptanceBuild)' == ''">false</LicenseAcceptanceBuild>
     <LicenseRuntimeMode Condition="'$(Configuration)' == 'Release'">Production</LicenseRuntimeMode>
@@ -29,7 +35,7 @@
     <AssemblyVersion>$(_ExpectedAssemblyVersion)</AssemblyVersion>
     <OtaAcceptanceBuild Condition="'$(OtaAcceptanceBuild)' == ''">false</OtaAcceptanceBuild>
     <PackageId Condition="'$(PackageId)' == '' and '$(OtaAcceptanceBuild)' == 'true'">SuperPan.BaiduBatchTransfer.OtaAcceptance</PackageId>
-    <PackageId Condition="'$(PackageId)' == ''">SuperPan.BaiduBatchTransfer</PackageId>
+    <PackageId Condition="'$(PackageId)' == ''">$(ProductPackageId)</PackageId>
     <UpdateChannel Condition="'$(UpdateChannel)' == ''">win-x64-stable</UpdateChannel>
     <AdapterBuildVersion Condition="'$(AdapterBuildVersion)' == ''">managed-browser-v3</AdapterBuildVersion>
     <ManagedBrowserHelperPackageDirectory Condition="'$(ManagedBrowserHelperPackageDirectory)' == ''">$(MSBuildProjectDirectory)\..\..\.artifacts\managed-session-pipeline-20260901\helper-bundle-r2</ManagedBrowserHelperPackageDirectory>

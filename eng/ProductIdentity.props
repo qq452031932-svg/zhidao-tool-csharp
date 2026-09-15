@@ -1,0 +1,15 @@
+<Project>
+  <!-- The only hand-maintained source for product branding and stable compatibility identity. -->
+  <PropertyGroup>
+    <ProductDisplayName>知道综合工具</ProductDisplayName>
+    <ProductDescription>知道综合工具</ProductDescription>
+    <ProductMainAssemblyName>知道综合工具</ProductMainAssemblyName>
+    <ProductMainExecutableName>知道综合工具.exe</ProductMainExecutableName>
+    <ProductMainDllName>知道综合工具.dll</ProductMainDllName>
+    <ProductLegacyAssemblyName>BaiduBatchTransfer.App</ProductLegacyAssemblyName>
+    <ProductLegacyExecutableName>BaiduBatchTransfer.App.exe</ProductLegacyExecutableName>
+    <ProductPackageId>SuperPan.BaiduBatchTransfer</ProductPackageId>
+    <ProductDataDirectoryName>BaiduBatchTransfer</ProductDataDirectoryName>
+    <ProductLicenseProductId>8270e8d7-1791-487d-ad76-0da7a0cbed12</ProductLicenseProductId>
+  </PropertyGroup>
+</Project>
