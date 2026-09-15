@@ -47,6 +47,8 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
         Assert.Contains("WindowsIdentity]::GetCurrent()", script, StringComparison.Ordinal);
         Assert.Contains("AreAccessRulesProtected", script, StringComparison.Ordinal);
         Assert.Contains("FileMode]::CreateNew", script, StringComparison.Ordinal);
+        Assert.Contains("Assert-IsolationMarkerClaims", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("ExpectedIsolatedProfilePath", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -67,6 +69,8 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
         Assert.Contains("$ErrorActionPreference = 'Continue'", script, StringComparison.Ordinal);
         Assert.Contains("$commandExitCode = $LASTEXITCODE", script, StringComparison.Ordinal);
         Assert.Contains("$ErrorActionPreference = $previousErrorActionPreference", script, StringComparison.Ordinal);
+        Assert.Contains("Push-Location -LiteralPath $WorkingDirectory", script, StringComparison.Ordinal);
+        Assert.Contains("Pop-Location", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -86,13 +90,17 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
         Assert.Contains("WScript.Shell", script, StringComparison.Ordinal);
         Assert.Contains("--veloapp-updated", script, StringComparison.Ordinal);
         Assert.Contains("--spike-restarted", script, StringComparison.Ordinal);
+        Assert.Contains("VELOPACK_RENAME_SPIKE_RUN_ID", script, StringComparison.Ordinal);
+        Assert.Contains("ExpectedRunId", script, StringComparison.Ordinal);
+        Assert.Contains("NotBefore", script, StringComparison.Ordinal);
+        Assert.Contains("Remove-Item -LiteralPath $evidenceLog -Force", script, StringComparison.Ordinal);
         Assert.Contains("Assert-CanonicalPathEquals -Label 'DesktopShortcut'", script, StringComparison.Ordinal);
         Assert.Contains("Assert-CanonicalPathEquals -Label 'StartMenuShortcut'", script, StringComparison.Ordinal);
         Assert.DoesNotContain("Assert-PathEndsWith", script, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task EnvironmentAndCallerPathSpoofDoNotAuthorizeInstallUpgrade()
+    public async Task EnvironmentAndProfilePathSpoofDoNotAuthorizeInstallUpgrade()
     {
         var output = Path.Combine(Path.GetTempPath(), $"velopack-rename-spike-test-{Guid.NewGuid():N}");
         try
@@ -119,8 +127,7 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
             }
             startInfo.Environment["VELOPACK_RENAME_SPIKE_ISOLATED_PROFILE"] =
                 "I_UNDERSTAND_THIS_PROFILE_IS_DISPOSABLE";
-            startInfo.ArgumentList.Add("-ExpectedIsolatedProfilePath");
-            startInfo.ArgumentList.Add(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+            startInfo.Environment["USERPROFILE"] = output;
 
             using var process = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("Unable to start Windows PowerShell.");
@@ -130,7 +137,6 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
 
             Assert.NotEqual(0, process.ExitCode);
             Assert.Contains("profile-bound isolation marker", stdout + stderr, StringComparison.OrdinalIgnoreCase);
-            Assert.False(Directory.Exists(output));
         }
         finally
         {
@@ -168,7 +174,22 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
         var result = await RunIsolationMarkerValidationAsync(fixture.ProfilePath, fixture.CurrentSid);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("writable", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.True(
+            result.Output.Contains("writable", StringComparison.OrdinalIgnoreCase),
+            result.Output);
+    }
+
+    [Fact]
+    public async Task ValidIsolationMarkerClaimsAreAcceptedWithoutElevation()
+    {
+        var profile = Path.Combine(Path.GetTempPath(), $"velopack-valid-marker-{Guid.NewGuid():N}");
+        var sid = WindowsIdentity.GetCurrent().User?.Value
+            ?? throw new InvalidOperationException("Current Windows SID is unavailable.");
+        var nonce = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+
+        var result = await RunIsolationClaimsValidationAsync(profile, sid, nonce);
+
+        Assert.Equal(0, result.ExitCode);
     }
 
     [Theory]
@@ -181,17 +202,99 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
         var oldExecutable = Path.Combine(root, "current", "BaiduBatchTransfer.App.exe");
         var newExecutable = Path.Combine(root, "current", "知道综合工具.exe");
         var wrongExecutable = Path.Combine(root, "decoy", "知道综合工具.exe");
+        var runId = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+        var notBefore = DateTimeOffset.UtcNow;
         var records = new[]
         {
-            $"{DateTimeOffset.UtcNow:O}|{(eventToCorrupt == "obsolete" ? wrongExecutable : oldExecutable)}|--veloapp-obsolete 1.0.0",
-            $"{DateTimeOffset.UtcNow.AddSeconds(1):O}|{(eventToCorrupt == "updated" ? wrongExecutable : newExecutable)}|--veloapp-updated 1.1.0",
-            $"{DateTimeOffset.UtcNow.AddSeconds(2):O}|{(eventToCorrupt == "restart" ? wrongExecutable : newExecutable)}|--spike-restarted",
+            $"{notBefore.AddSeconds(1):O}|{(eventToCorrupt == "obsolete" ? wrongExecutable : oldExecutable)}|{runId}|--veloapp-obsolete 1.0.0",
+            $"{notBefore.AddSeconds(2):O}|{(eventToCorrupt == "updated" ? wrongExecutable : newExecutable)}|{runId}|--veloapp-updated 1.1.0",
+            $"{notBefore.AddSeconds(3):O}|{(eventToCorrupt == "restart" ? wrongExecutable : newExecutable)}|{runId}|--spike-restarted {runId}",
         };
 
-        var result = await RunLaunchEvidenceValidationAsync(records, oldExecutable, newExecutable);
+        var result = await RunLaunchEvidenceValidationAsync(records, oldExecutable, newExecutable, runId, notBefore);
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("ordered exact-path", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ValidCurrentRunLifecycleEvidenceIsAccepted()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"velopack-valid-launch-{Guid.NewGuid():N}");
+        var oldExecutable = Path.Combine(root, "current", "BaiduBatchTransfer.App.exe");
+        var newExecutable = Path.Combine(root, "current", "知道综合工具.exe");
+        var runId = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+        var notBefore = DateTimeOffset.UtcNow;
+        var records = new[]
+        {
+            $"{notBefore.AddMilliseconds(1):O}|{oldExecutable}|{runId}|--veloapp-obsolete 1.0.0",
+            $"{notBefore.AddMilliseconds(2):O}|{newExecutable}|{runId}|--veloapp-updated 1.1.0",
+            $"{notBefore.AddMilliseconds(3):O}|{newExecutable}|{runId}|--spike-restarted {runId}",
+        };
+
+        var result = await RunLaunchEvidenceValidationAsync(records, oldExecutable, newExecutable, runId, notBefore);
+
+        Assert.Equal(0, result.ExitCode);
+    }
+
+    [Theory]
+    [InlineData("wrong-run")]
+    [InlineData("stale-time")]
+    public async Task StaleOrWrongRunLifecycleEvidenceFailsClosed(string corruption)
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"velopack-stale-launch-{Guid.NewGuid():N}");
+        var oldExecutable = Path.Combine(root, "current", "BaiduBatchTransfer.App.exe");
+        var newExecutable = Path.Combine(root, "current", "知道综合工具.exe");
+        var runId = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+        var recordRunId = corruption == "wrong-run" ? Convert.ToHexString(RandomNumberGenerator.GetBytes(32)) : runId;
+        var notBefore = DateTimeOffset.UtcNow;
+        var eventTime = corruption == "stale-time" ? notBefore.AddMinutes(-1) : notBefore.AddMilliseconds(1);
+        var records = new[]
+        {
+            $"{eventTime:O}|{oldExecutable}|{recordRunId}|--veloapp-obsolete 1.0.0",
+            $"{eventTime.AddMilliseconds(1):O}|{newExecutable}|{recordRunId}|--veloapp-updated 1.1.0",
+            $"{eventTime.AddMilliseconds(2):O}|{newExecutable}|{recordRunId}|--spike-restarted {recordRunId}",
+        };
+
+        var result = await RunLaunchEvidenceValidationAsync(records, oldExecutable, newExecutable, runId, notBefore);
+
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Fact]
+    public async Task PackPhaseSucceedsOutsideRepositoryAndBuildsExactChineseExecutable()
+    {
+        var callerDirectory = Path.Combine(Path.GetTempPath(), $"velopack-pack-caller-{Guid.NewGuid():N}");
+        var workRoot = Path.Combine(Path.GetTempPath(), $"velopack-pack-output-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(callerDirectory);
+        try
+        {
+            var startInfo = CreatePowerShellStartInfo();
+            startInfo.WorkingDirectory = callerDirectory;
+            foreach (var argument in new[]
+                     {
+                         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ScriptPath(),
+                         "-Phase", "Pack", "-WorkRoot", workRoot,
+                     })
+            {
+                startInfo.ArgumentList.Add(argument);
+            }
+            using var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("Unable to start Windows PowerShell.");
+            var stdout = await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            await process.WaitForExitAsync(timeout.Token);
+
+            Assert.Equal(0, process.ExitCode);
+            Assert.Contains("PACK_STRUCTURE_PASS", stdout + stderr, StringComparison.Ordinal);
+            Assert.True(File.Exists(Path.Combine(workRoot, "new-publish", "知道综合工具.exe")));
+        }
+        finally
+        {
+            if (Directory.Exists(workRoot)) Directory.Delete(workRoot, recursive: true);
+            if (Directory.Exists(callerDirectory)) Directory.Delete(callerDirectory, recursive: true);
+        }
     }
 
     private static async Task<ScriptResult> RunIsolationMarkerValidationAsync(string profilePath, string sid)
@@ -206,13 +309,15 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
                 $parseErrors = $null
                 $ast = [Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$parseErrors)
                 if ($parseErrors.Count -ne 0) { throw 'Spike script parse failed.' }
-                $function = @($ast.FindAll({
-                    param($node)
-                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-                        $node.Name -ceq 'Test-IsolationMarker'
-                }, $true))
-                if ($function.Count -ne 1) { throw 'Test-IsolationMarker function was not found exactly once.' }
-                Invoke-Expression $function[0].Extent.Text
+                foreach ($name in @('Assert-IsolationMarkerClaims', 'Test-IsolationMarker')) {
+                    $function = @($ast.FindAll({
+                        param($node)
+                        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                            $node.Name -ceq $name
+                    }, $true))
+                    if ($function.Count -ne 1) { throw "Function '$name' was not found exactly once." }
+                    Invoke-Expression $function[0].Extent.Text
+                }
                 Test-IsolationMarker -ProfilePath $ProfilePath -IdentitySid $IdentitySid | Out-Null
                 """);
 
@@ -221,6 +326,64 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
                      {
                          "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath,
                          "-ScriptPath", ScriptPath(), "-ProfilePath", profilePath, "-IdentitySid", sid,
+                     })
+            {
+                startInfo.ArgumentList.Add(argument);
+            }
+
+            using var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("Unable to start Windows PowerShell.");
+            var stdout = await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            return new ScriptResult(process.ExitCode, stdout + stderr);
+        }
+        finally
+        {
+            File.Delete(harnessPath);
+        }
+    }
+
+    private static async Task<ScriptResult> RunIsolationClaimsValidationAsync(
+        string profilePath,
+        string sid,
+        string nonce)
+    {
+        var harnessPath = Path.Combine(Path.GetTempPath(), $"velopack-isolation-claims-harness-{Guid.NewGuid():N}.ps1");
+        try
+        {
+            File.WriteAllText(harnessPath, """
+                param([string]$ScriptPath, [string]$ProfilePath, [string]$IdentitySid, [string]$Nonce)
+                $ErrorActionPreference = 'Stop'
+                $tokens = $null
+                $parseErrors = $null
+                $ast = [Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$parseErrors)
+                if ($parseErrors.Count -ne 0) { throw 'Spike script parse failed.' }
+                $function = @($ast.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                        $node.Name -ceq 'Assert-IsolationMarkerClaims'
+                }, $true))
+                if ($function.Count -ne 1) { throw 'Assert-IsolationMarkerClaims function was not found exactly once.' }
+                Invoke-Expression $function[0].Extent.Text
+                Assert-IsolationMarkerClaims `
+                    -ProfilePath $ProfilePath `
+                    -IdentitySid $IdentitySid `
+                    -MarkerProfilePath $ProfilePath `
+                    -MarkerSid $IdentitySid `
+                    -MarkerNonce $Nonce `
+                    -OwnerSids @('S-1-5-32-544') `
+                    -AclsProtected $true `
+                    -MarkerWritable $false `
+                    -DirectoryWritable $false | Out-Null
+                """);
+
+            var startInfo = CreatePowerShellStartInfo();
+            foreach (var argument in new[]
+                     {
+                         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath,
+                         "-ScriptPath", ScriptPath(), "-ProfilePath", profilePath,
+                         "-IdentitySid", sid, "-Nonce", nonce,
                      })
             {
                 startInfo.ArgumentList.Add(argument);
@@ -255,7 +418,9 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
     private static async Task<ScriptResult> RunLaunchEvidenceValidationAsync(
         string[] records,
         string oldExecutable,
-        string newExecutable)
+        string newExecutable,
+        string runId,
+        DateTimeOffset notBefore)
     {
         var id = Guid.NewGuid().ToString("N");
         var harnessPath = Path.Combine(Path.GetTempPath(), $"velopack-launch-harness-{id}.ps1");
@@ -264,7 +429,13 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
         {
             File.WriteAllLines(recordsPath, records);
             File.WriteAllText(harnessPath, """
-                param([string]$ScriptPath, [string]$RecordsPath, [string]$OldExecutable, [string]$NewExecutable)
+                param(
+                    [string]$ScriptPath,
+                    [string]$RecordsPath,
+                    [string]$OldExecutable,
+                    [string]$NewExecutable,
+                    [string]$RunId,
+                    [string]$NotBefore)
                 $ErrorActionPreference = 'Stop'
                 $tokens = $null
                 $parseErrors = $null
@@ -279,7 +450,12 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
                     Invoke-Expression $function[0].Extent.Text
                 }
                 $records = @(Get-Content -LiteralPath $RecordsPath -Encoding UTF8)
-                Assert-LaunchEvidence -Records $records -ExpectedOldExecutable $OldExecutable -ExpectedNewExecutable $NewExecutable | Out-Null
+                Assert-LaunchEvidence `
+                    -Records $records `
+                    -ExpectedOldExecutable $OldExecutable `
+                    -ExpectedNewExecutable $NewExecutable `
+                    -ExpectedRunId $RunId `
+                    -NotBefore ([DateTimeOffset]::Parse($NotBefore, [Globalization.CultureInfo]::InvariantCulture)) | Out-Null
                 """);
 
             var startInfo = CreatePowerShellStartInfo();
@@ -288,6 +464,7 @@ public sealed class VelopackExecutableRenameSpikeScriptTests
                          "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath,
                          "-ScriptPath", ScriptPath(), "-RecordsPath", recordsPath,
                          "-OldExecutable", oldExecutable, "-NewExecutable", newExecutable,
+                         "-RunId", runId, "-NotBefore", notBefore.ToString("O"),
                      })
             {
                 startInfo.ArgumentList.Add(argument);

@@ -4,9 +4,7 @@ param(
     [ValidateSet('Pack', 'InstallUpgrade')]
     [string]$Phase,
 
-    [string]$WorkRoot,
-
-    [string]$ExpectedIsolatedProfilePath
+    [string]$WorkRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,7 +18,52 @@ $script:OldMainExe = 'BaiduBatchTransfer.App.exe'
 $script:NewDisplayName = "$([char]0x77E5)$([char]0x9053)$([char]0x7EFC)$([char]0x5408)$([char]0x5DE5)$([char]0x5177)"
 $script:NewMainExe = $script:NewDisplayName + '.exe'
 $script:EvidenceDirectoryName = 'VelopackExecutableRenameSpikeEvidence'
-$script:VelopackUpdatedArgument = '--veloapp-updated'
+
+function Assert-IsolationMarkerClaims {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProfilePath,
+        [Parameter(Mandatory = $true)][string]$IdentitySid,
+        [Parameter(Mandatory = $true)][string]$MarkerProfilePath,
+        [Parameter(Mandatory = $true)][string]$MarkerSid,
+        [Parameter(Mandatory = $true)][string]$MarkerNonce,
+        [Parameter(Mandatory = $true)][string[]]$OwnerSids,
+        [Parameter(Mandatory = $true)][bool]$AclsProtected,
+        [Parameter(Mandatory = $true)][bool]$MarkerWritable,
+        [Parameter(Mandatory = $true)][bool]$DirectoryWritable
+    )
+
+    $canonicalProfile = [IO.Path]::GetFullPath($ProfilePath).TrimEnd('\')
+    $canonicalMarkerProfile = [IO.Path]::GetFullPath($MarkerProfilePath).TrimEnd('\')
+    if (-not [string]::Equals($canonicalMarkerProfile, $canonicalProfile, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The profile-bound isolation marker profile does not match '$canonicalProfile'."
+    }
+    if (-not [string]::Equals($MarkerSid, $IdentitySid, [StringComparison]::Ordinal)) {
+        throw "The profile-bound isolation marker SID does not match the current Windows identity SID '$IdentitySid'."
+    }
+    try {
+        $nonceBytes = [Convert]::FromBase64String($MarkerNonce)
+    } catch {
+        throw 'The profile-bound isolation marker nonce is malformed.'
+    }
+    if ($nonceBytes.Length -lt 32) {
+        throw 'The profile-bound isolation marker nonce must contain at least 256 bits.'
+    }
+    if ($MarkerWritable) {
+        throw 'The profile-bound isolation marker is writable by the isolated standard user.'
+    }
+    if ($DirectoryWritable) {
+        throw 'The profile-bound isolation marker directory is writable by the isolated standard user.'
+    }
+    if (-not $AclsProtected) {
+        throw 'The profile-bound isolation marker ACL must disable inheritance.'
+    }
+    foreach ($ownerSid in $OwnerSids) {
+        if ($ownerSid -cne 'S-1-5-18' -and $ownerSid -cne 'S-1-5-32-544') {
+            throw "The profile-bound isolation marker owner must be SYSTEM or Administrators, actual SID '$ownerSid'."
+        }
+    }
+    return $canonicalProfile
+}
 
 function Test-IsolationMarker {
     param(
@@ -64,7 +107,6 @@ function Test-IsolationMarker {
     if ($nonceBytes.Length -lt 32) {
         throw 'The profile-bound isolation marker nonce must contain at least 256 bits.'
     }
-
     $markerWritable = $false
     $markerStream = $null
     try {
@@ -75,10 +117,6 @@ function Test-IsolationMarker {
     } finally {
         if ($markerStream) { $markerStream.Dispose() }
     }
-    if ($markerWritable) {
-        throw 'The profile-bound isolation marker is writable by the isolated standard user.'
-    }
-
     $directoryWritable = $false
     $probePath = Join-Path $markerDirectory ("write-probe-$([Guid]::NewGuid().ToString('N')).tmp")
     $probeStream = $null
@@ -91,21 +129,33 @@ function Test-IsolationMarker {
         if ($probeStream) { $probeStream.Dispose() }
         if (Test-Path -LiteralPath $probePath) { Remove-Item -LiteralPath $probePath -Force }
     }
+    if ($markerWritable) {
+        throw 'The profile-bound isolation marker is writable by the isolated standard user.'
+    }
     if ($directoryWritable) {
         throw 'The profile-bound isolation marker directory is writable by the isolated standard user.'
     }
-
+    $ownerSids = @()
+    $aclsProtected = $true
     foreach ($securedPath in @($markerDirectory, $markerPath)) {
         $acl = Get-Acl -LiteralPath $securedPath
         if (-not $acl.AreAccessRulesProtected) {
-            throw "The profile-bound isolation marker ACL must disable inheritance: $securedPath"
+            $aclsProtected = $false
         }
         $owner = New-Object Security.Principal.NTAccount -ArgumentList ([string]$acl.Owner)
-        $ownerSid = $owner.Translate([Security.Principal.SecurityIdentifier]).Value
-        if ($ownerSid -cne 'S-1-5-18' -and $ownerSid -cne 'S-1-5-32-544') {
-            throw "The profile-bound isolation marker owner must be SYSTEM or Administrators, actual SID '$ownerSid'."
-        }
+        $ownerSids += $owner.Translate([Security.Principal.SecurityIdentifier]).Value
     }
+
+    Assert-IsolationMarkerClaims `
+        -ProfilePath $canonicalProfile `
+        -IdentitySid $IdentitySid `
+        -MarkerProfilePath ([string]$marker.ProfilePath) `
+        -MarkerSid ([string]$marker.Sid) `
+        -MarkerNonce ([string]$marker.Nonce) `
+        -OwnerSids $ownerSids `
+        -AclsProtected $aclsProtected `
+        -MarkerWritable $markerWritable `
+        -DirectoryWritable $directoryWritable | Out-Null
 
     return [pscustomobject]@{
         ProfilePath = $canonicalProfile
@@ -121,14 +171,7 @@ function Assert-IsolatedWindowsProfile {
     if (-not $identity.User) {
         throw 'The current Windows identity has no SID.'
     }
-    $validated = Test-IsolationMarker -ProfilePath $actualProfile -IdentitySid $identity.User.Value
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedIsolatedProfilePath)) {
-        $untrustedCallerPath = [IO.Path]::GetFullPath($ExpectedIsolatedProfilePath).TrimEnd('\')
-        if (-not [string]::Equals($untrustedCallerPath, $validated.ProfilePath, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'The caller-supplied profile path does not match the profile-bound isolation marker.'
-        }
-    }
-    return $validated.ProfilePath
+    return (Test-IsolationMarker -ProfilePath $actualProfile -IdentitySid $identity.User.Value).ProfilePath
 }
 
 function Get-PinnedVelopackVersions {
@@ -164,11 +207,13 @@ function Invoke-Checked {
     Write-Host "> $FilePath $($Arguments -join ' ')"
     $previousErrorActionPreference = $ErrorActionPreference
     try {
+        Push-Location -LiteralPath $WorkingDirectory
         $ErrorActionPreference = 'Continue'
         & $FilePath @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
         $commandExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
+        Pop-Location
     }
     if ($commandExitCode -ne 0) {
         throw "Command failed with exit code ${commandExitCode}: $FilePath"
@@ -191,6 +236,7 @@ function New-SampleProject {
     <TargetFramework>net8.0</TargetFramework>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
+    <ImplicitUsings>enable</ImplicitUsings>
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
     <AssemblyName>$AssemblyName</AssemblyName>
     <Version>$Version</Version>
@@ -209,19 +255,20 @@ var evidenceRoot = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
     "VelopackExecutableRenameSpikeEvidence");
 Directory.CreateDirectory(evidenceRoot);
+var runId = Environment.GetEnvironmentVariable("VELOPACK_RENAME_SPIKE_RUN_ID") ?? "";
 File.AppendAllText(
     Path.Combine(evidenceRoot, "launches.log"),
-    $"{DateTimeOffset.UtcNow:O}|{Environment.ProcessPath}|{string.Join(" ", args)}{Environment.NewLine}");
+    $"{DateTimeOffset.UtcNow:O}|{Environment.ProcessPath}|{runId}|{string.Join(" ", args)}{Environment.NewLine}");
 
 VelopackApp.Build().Run();
 
-if (args.Length == 2 && args[0] == "--spike-apply")
+if (args.Length == 3 && args[0] == "--spike-apply" && args[2] == runId)
 {
     var manager = new UpdateManager(args[1]);
     var update = await manager.CheckForUpdatesAsync()
         ?? throw new InvalidOperationException("The rename spike feed contains no update.");
     await manager.DownloadUpdatesAsync(update);
-    manager.ApplyUpdatesAndRestart(update.TargetFullRelease, new[] { "--spike-restarted" });
+    manager.ApplyUpdatesAndRestart(update.TargetFullRelease, new[] { "--spike-restarted", runId });
 }
 '@
     Set-Content -LiteralPath (Join-Path $Directory 'Program.cs') -Value $program -Encoding UTF8
@@ -256,8 +303,14 @@ function Invoke-PackPhase {
 
     $versions = Get-PinnedVelopackVersions
     Write-Host "Pinned Velopack CLI/SDK pair: $($versions.Cli)"
-    $cliHelp = (& dotnet tool run vpk -- --help 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $cliHelp -notmatch "Velopack CLI\s+$([regex]::Escape($versions.Cli))(?=[^0-9]|$)") {
+    try {
+        Push-Location -LiteralPath $script:RepositoryRoot
+        $cliHelp = (& dotnet tool run vpk -- --help 2>&1) -join "`n"
+        $cliExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($cliExitCode -ne 0 -or $cliHelp -notmatch "Velopack CLI\s+$([regex]::Escape($versions.Cli))(?=[^0-9]|$)") {
         throw "dotnet tool run vpk is not exactly the pinned CLI version $($versions.Cli)."
     }
 
@@ -332,8 +385,8 @@ function Assert-CanonicalPathEquals {
 function ConvertFrom-LaunchEvidenceRecord {
     param([Parameter(Mandatory = $true)][string]$Record)
 
-    $fields = @($Record -split '\|', 3)
-    if ($fields.Count -ne 3) {
+    $fields = @($Record -split '\|', 4)
+    if ($fields.Count -ne 4) {
         throw "Malformed launch evidence record: $Record"
     }
     $timestamp = [DateTimeOffset]::MinValue
@@ -345,7 +398,8 @@ function ConvertFrom-LaunchEvidenceRecord {
     return [pscustomobject]@{
         Timestamp = $timestamp
         ExecutablePath = [IO.Path]::GetFullPath($fields[1])
-        Arguments = $fields[2]
+        RunId = $fields[2]
+        Arguments = $fields[3]
     }
 }
 
@@ -353,7 +407,9 @@ function Assert-LaunchEvidence {
     param(
         [Parameter(Mandatory = $true)][string[]]$Records,
         [Parameter(Mandatory = $true)][string]$ExpectedOldExecutable,
-        [Parameter(Mandatory = $true)][string]$ExpectedNewExecutable
+        [Parameter(Mandatory = $true)][string]$ExpectedNewExecutable,
+        [Parameter(Mandatory = $true)][string]$ExpectedRunId,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$NotBefore
     )
 
     $canonicalOld = [IO.Path]::GetFullPath($ExpectedOldExecutable)
@@ -361,6 +417,9 @@ function Assert-LaunchEvidence {
     $state = 0
     foreach ($rawRecord in $Records) {
         $record = ConvertFrom-LaunchEvidenceRecord -Record $rawRecord
+        if ($record.Timestamp -lt $NotBefore -or $record.RunId -cne $ExpectedRunId) {
+            continue
+        }
         if ($state -eq 0 -and
             [string]::Equals($record.ExecutablePath, $canonicalOld, [StringComparison]::OrdinalIgnoreCase) -and
             $record.Arguments -ceq '--veloapp-obsolete 1.0.0') {
@@ -375,7 +434,7 @@ function Assert-LaunchEvidence {
         }
         if ($state -eq 2 -and
             [string]::Equals($record.ExecutablePath, $canonicalNew, [StringComparison]::OrdinalIgnoreCase) -and
-            $record.Arguments -ceq '--spike-restarted') {
+            $record.Arguments -ceq "--spike-restarted $ExpectedRunId") {
             $state = 3
             break
         }
@@ -389,7 +448,7 @@ function Assert-LaunchEvidence {
 function Invoke-InstallUpgradePhase {
     param([Parameter(Mandatory = $true)][string]$Root)
 
-    $isolatedProfile = Assert-IsolatedWindowsProfile -ExpectedPath $ExpectedIsolatedProfilePath
+    $isolatedProfile = Assert-IsolatedWindowsProfile
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         throw "Pack-phase WorkRoot does not exist: $Root"
     }
@@ -408,6 +467,28 @@ function Invoke-InstallUpgradePhase {
         throw "Isolated profile is not clean; install root already exists: $installRoot"
     }
 
+    $randomBytes = New-Object byte[] 32
+    $randomNumberGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $randomNumberGenerator.GetBytes($randomBytes)
+    } finally {
+        $randomNumberGenerator.Dispose()
+    }
+    $runId = -join @($randomBytes | ForEach-Object { $_.ToString('x2') })
+    $env:VELOPACK_RENAME_SPIKE_RUN_ID = $runId
+
+    $evidenceDirectory = Join-Path $localAppData $script:EvidenceDirectoryName
+    $evidenceLog = Join-Path $evidenceDirectory 'launches.log'
+    $canonicalEvidenceDirectory = [IO.Path]::GetFullPath($evidenceDirectory).TrimEnd('\')
+    $canonicalEvidenceLog = [IO.Path]::GetFullPath($evidenceLog)
+    if (-not $canonicalEvidenceLog.StartsWith($canonicalEvidenceDirectory + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Evidence log escaped its exact profile-local directory: $canonicalEvidenceLog"
+    }
+    if (Test-Path -LiteralPath $evidenceLog) {
+        Remove-Item -LiteralPath $evidenceLog -Force
+    }
+    $runStartedAt = [DateTimeOffset]::UtcNow
+
     Invoke-Checked -FilePath $setup -WorkingDirectory $releaseDirectory -Arguments @('--silent')
     $oldCurrentMain = Join-Path $installRoot "current\$($script:OldMainExe)"
     if (-not (Test-Path -LiteralPath $oldCurrentMain -PathType Leaf)) {
@@ -415,10 +496,9 @@ function Invoke-InstallUpgradePhase {
     }
 
     Invoke-Checked -FilePath $oldCurrentMain -WorkingDirectory (Split-Path -Parent $oldCurrentMain) -Arguments @(
-        '--spike-apply', $releaseDirectory
+        '--spike-apply', $releaseDirectory, $runId
     )
 
-    $evidenceLog = Join-Path $localAppData "$($script:EvidenceDirectoryName)\launches.log"
     $deadline = [DateTime]::UtcNow.AddSeconds(45)
     $validatedRestartTarget = $null
     $expectedNewCurrentMain = Join-Path $installRoot "current\$($script:NewMainExe)"
@@ -430,7 +510,9 @@ function Invoke-InstallUpgradePhase {
                 $validatedRestartTarget = Assert-LaunchEvidence `
                     -Records $launchEvidence `
                     -ExpectedOldExecutable $oldCurrentMain `
-                    -ExpectedNewExecutable $expectedNewCurrentMain
+                    -ExpectedNewExecutable $expectedNewCurrentMain `
+                    -ExpectedRunId $runId `
+                    -NotBefore $runStartedAt
             } catch {
                 $validatedRestartTarget = $null
             }
