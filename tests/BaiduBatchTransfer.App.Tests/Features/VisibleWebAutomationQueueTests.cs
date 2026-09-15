@@ -739,7 +739,7 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
 
         var lease = source.IndexOf("profileCloser.Register", StringComparison.Ordinal);
         var closeGate = source.IndexOf("closeGate = new LoginWindowCloseGate", StringComparison.Ordinal);
-        var prepare = source.IndexOf(".PrepareAsync", StringComparison.Ordinal);
+        var prepare = source.IndexOf(".PrepareAttemptAsync", StringComparison.Ordinal);
         var environment = source.IndexOf("CoreWebView2Environment", StringComparison.Ordinal);
         Assert.True(lease >= 0);
         Assert.True(prepare >= 0);

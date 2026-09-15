@@ -75,13 +75,17 @@ public sealed class OtaDeploymentStructureTests
     [Fact]
     public void InstallerVerifiesInputsBeforeMutationAndInstallsLeastPrivilegeState()
     {
-        var install = ReadDeploymentFile("install.sh");
-        var firstMutation = install.IndexOf("install -d", StringComparison.Ordinal);
+        var install = ReadDeploymentFile("install.sh").ReplaceLineEndings("\n");
+        var publicInstallStart = install.IndexOf(
+            "[ \"$PREFLIGHT_ONLY\" = false ] || die \"--preflight-only requires --loopback-license-transaction\"",
+            StringComparison.Ordinal);
 
+        Assert.True(publicInstallStart > 0, "Installer must have an explicit public-install entrypoint.");
+        var firstMutation = install.IndexOf("install -d", publicInstallStart, StringComparison.Ordinal);
         Assert.True(firstMutation > 0, "Installer must have an explicit mutation boundary.");
-        Assert.True(install.IndexOf("verify_sha256 \"$BINARY_SOURCE\"", StringComparison.Ordinal) is var binaryVerify && binaryVerify >= 0 && binaryVerify < firstMutation);
-        Assert.True(install.IndexOf("verify_sha256 \"$CERTIFICATE_SOURCE\"", StringComparison.Ordinal) is var certificateVerify && certificateVerify >= 0 && certificateVerify < firstMutation);
-        Assert.True(install.IndexOf("verify_sha256 \"$ACTIVE_VHOST\"", StringComparison.Ordinal) is var vhostVerify && vhostVerify >= 0 && vhostVerify < firstMutation);
+        Assert.True(install.IndexOf("verify_sha256 \"$BINARY_SOURCE\"", publicInstallStart, StringComparison.Ordinal) is var binaryVerify && binaryVerify >= publicInstallStart && binaryVerify < firstMutation);
+        Assert.True(install.IndexOf("verify_sha256 \"$CERTIFICATE_SOURCE\"", publicInstallStart, StringComparison.Ordinal) is var certificateVerify && certificateVerify >= publicInstallStart && certificateVerify < firstMutation);
+        Assert.True(install.IndexOf("verify_sha256 \"$ACTIVE_VHOST\"", publicInstallStart, StringComparison.Ordinal) is var vhostVerify && vhostVerify >= publicInstallStart && vhostVerify < firstMutation);
         Assert.Contains("getent group superpan-ota-admin", install, StringComparison.Ordinal);
         Assert.Contains("useradd --system", install, StringComparison.Ordinal);
         Assert.Contains("openssl rand -hex 32", install, StringComparison.Ordinal);
