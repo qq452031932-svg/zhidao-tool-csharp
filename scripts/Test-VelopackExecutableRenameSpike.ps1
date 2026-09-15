@@ -22,24 +22,113 @@ $script:NewMainExe = $script:NewDisplayName + '.exe'
 $script:EvidenceDirectoryName = 'VelopackExecutableRenameSpikeEvidence'
 $script:VelopackUpdatedArgument = '--veloapp-updated'
 
+function Test-IsolationMarker {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProfilePath,
+        [Parameter(Mandatory = $true)][string]$IdentitySid
+    )
+
+    $canonicalProfile = [IO.Path]::GetFullPath($ProfilePath).TrimEnd('\')
+    $markerDirectory = Join-Path $canonicalProfile '.velopack-rename-spike-isolation'
+    $markerPath = Join-Path $markerDirectory 'marker.json'
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+        throw "The profile-bound isolation marker is missing at its canonical path: $markerPath"
+    }
+    if (((Get-Item -LiteralPath $markerDirectory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ((Get-Item -LiteralPath $markerPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The profile-bound isolation marker path must not contain a reparse point.'
+    }
+
+    try {
+        $marker = Get-Content -LiteralPath $markerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        throw "The profile-bound isolation marker is malformed: $($_.Exception.Message)"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$marker.ProfilePath) -or
+        [string]::IsNullOrWhiteSpace([string]$marker.Sid) -or
+        [string]::IsNullOrWhiteSpace([string]$marker.Nonce)) {
+        throw 'The profile-bound isolation marker is malformed because required fields are missing.'
+    }
+    $markerProfile = [IO.Path]::GetFullPath([string]$marker.ProfilePath).TrimEnd('\')
+    if (-not [string]::Equals($markerProfile, $canonicalProfile, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The profile-bound isolation marker profile does not match '$canonicalProfile'."
+    }
+    if (-not [string]::Equals([string]$marker.Sid, $IdentitySid, [StringComparison]::Ordinal)) {
+        throw "The profile-bound isolation marker SID does not match the current Windows identity SID '$IdentitySid'."
+    }
+    try {
+        $nonceBytes = [Convert]::FromBase64String([string]$marker.Nonce)
+    } catch {
+        throw 'The profile-bound isolation marker nonce is malformed.'
+    }
+    if ($nonceBytes.Length -lt 32) {
+        throw 'The profile-bound isolation marker nonce must contain at least 256 bits.'
+    }
+
+    $markerWritable = $false
+    $markerStream = $null
+    try {
+        $markerStream = [IO.File]::Open($markerPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $markerWritable = $true
+    } catch [UnauthorizedAccessException] {
+        $markerWritable = $false
+    } finally {
+        if ($markerStream) { $markerStream.Dispose() }
+    }
+    if ($markerWritable) {
+        throw 'The profile-bound isolation marker is writable by the isolated standard user.'
+    }
+
+    $directoryWritable = $false
+    $probePath = Join-Path $markerDirectory ("write-probe-$([Guid]::NewGuid().ToString('N')).tmp")
+    $probeStream = $null
+    try {
+        $probeStream = [IO.File]::Open($probePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $directoryWritable = $true
+    } catch [UnauthorizedAccessException] {
+        $directoryWritable = $false
+    } finally {
+        if ($probeStream) { $probeStream.Dispose() }
+        if (Test-Path -LiteralPath $probePath) { Remove-Item -LiteralPath $probePath -Force }
+    }
+    if ($directoryWritable) {
+        throw 'The profile-bound isolation marker directory is writable by the isolated standard user.'
+    }
+
+    foreach ($securedPath in @($markerDirectory, $markerPath)) {
+        $acl = Get-Acl -LiteralPath $securedPath
+        if (-not $acl.AreAccessRulesProtected) {
+            throw "The profile-bound isolation marker ACL must disable inheritance: $securedPath"
+        }
+        $owner = New-Object Security.Principal.NTAccount -ArgumentList ([string]$acl.Owner)
+        $ownerSid = $owner.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($ownerSid -cne 'S-1-5-18' -and $ownerSid -cne 'S-1-5-32-544') {
+            throw "The profile-bound isolation marker owner must be SYSTEM or Administrators, actual SID '$ownerSid'."
+        }
+    }
+
+    return [pscustomobject]@{
+        ProfilePath = $canonicalProfile
+        IdentitySid = $IdentitySid
+        MarkerPath = $markerPath
+        Nonce = [string]$marker.Nonce
+    }
+}
+
 function Assert-IsolatedWindowsProfile {
-    param([AllowEmptyString()][string]$ExpectedPath)
-
-    if ($env:VELOPACK_RENAME_SPIKE_ISOLATED_PROFILE -cne 'I_UNDERSTAND_THIS_PROFILE_IS_DISPOSABLE') {
-        throw 'InstallUpgrade requires an isolated Windows profile. Set VELOPACK_RENAME_SPIKE_ISOLATED_PROFILE only inside a disposable Sandbox, VM, or isolated test-user profile.'
-    }
-
     $actualProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
-    if ([string]::IsNullOrWhiteSpace($ExpectedPath)) {
-        throw 'InstallUpgrade requires -ExpectedIsolatedProfilePath for the isolated Windows profile.'
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $identity.User) {
+        throw 'The current Windows identity has no SID.'
     }
-
-    $expectedFullPath = [IO.Path]::GetFullPath($ExpectedPath).TrimEnd('\')
-    $actualFullPath = [IO.Path]::GetFullPath($actualProfile).TrimEnd('\')
-    if (-not [string]::Equals($expectedFullPath, $actualFullPath, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "InstallUpgrade requires an isolated Windows profile. Expected '$expectedFullPath', actual '$actualFullPath'."
+    $validated = Test-IsolationMarker -ProfilePath $actualProfile -IdentitySid $identity.User.Value
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedIsolatedProfilePath)) {
+        $untrustedCallerPath = [IO.Path]::GetFullPath($ExpectedIsolatedProfilePath).TrimEnd('\')
+        if (-not [string]::Equals($untrustedCallerPath, $validated.ProfilePath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The caller-supplied profile path does not match the profile-bound isolation marker.'
+        }
     }
-    return $actualFullPath
+    return $validated.ProfilePath
 }
 
 function Get-PinnedVelopackVersions {
@@ -226,16 +315,75 @@ function Get-ShortcutTarget {
     return [string]$shell.CreateShortcut($Path).TargetPath
 }
 
-function Assert-PathEndsWith {
+function Assert-CanonicalPathEquals {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
         [Parameter(Mandatory = $true)][string]$Actual,
-        [Parameter(Mandatory = $true)][string]$ExpectedSuffix
+        [Parameter(Mandatory = $true)][string]$Expected
     )
-    if (-not $Actual.EndsWith($ExpectedSuffix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "$Label expected suffix '$ExpectedSuffix', actual '$Actual'."
+    $canonicalActual = [IO.Path]::GetFullPath($Actual)
+    $canonicalExpected = [IO.Path]::GetFullPath($Expected)
+    if (-not [string]::Equals($canonicalActual, $canonicalExpected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label expected exact path '$canonicalExpected', actual '$canonicalActual'."
     }
-    Write-Host "$Label=$Actual"
+    Write-Host "$Label=$canonicalActual"
+}
+
+function ConvertFrom-LaunchEvidenceRecord {
+    param([Parameter(Mandatory = $true)][string]$Record)
+
+    $fields = @($Record -split '\|', 3)
+    if ($fields.Count -ne 3) {
+        throw "Malformed launch evidence record: $Record"
+    }
+    $timestamp = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParseExact(
+        $fields[0], 'O', [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind, [ref]$timestamp)) {
+        throw "Malformed launch evidence timestamp: $($fields[0])"
+    }
+    return [pscustomobject]@{
+        Timestamp = $timestamp
+        ExecutablePath = [IO.Path]::GetFullPath($fields[1])
+        Arguments = $fields[2]
+    }
+}
+
+function Assert-LaunchEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Records,
+        [Parameter(Mandatory = $true)][string]$ExpectedOldExecutable,
+        [Parameter(Mandatory = $true)][string]$ExpectedNewExecutable
+    )
+
+    $canonicalOld = [IO.Path]::GetFullPath($ExpectedOldExecutable)
+    $canonicalNew = [IO.Path]::GetFullPath($ExpectedNewExecutable)
+    $state = 0
+    foreach ($rawRecord in $Records) {
+        $record = ConvertFrom-LaunchEvidenceRecord -Record $rawRecord
+        if ($state -eq 0 -and
+            [string]::Equals($record.ExecutablePath, $canonicalOld, [StringComparison]::OrdinalIgnoreCase) -and
+            $record.Arguments -ceq '--veloapp-obsolete 1.0.0') {
+            $state = 1
+            continue
+        }
+        if ($state -eq 1 -and
+            [string]::Equals($record.ExecutablePath, $canonicalNew, [StringComparison]::OrdinalIgnoreCase) -and
+            $record.Arguments -ceq '--veloapp-updated 1.1.0') {
+            $state = 2
+            continue
+        }
+        if ($state -eq 2 -and
+            [string]::Equals($record.ExecutablePath, $canonicalNew, [StringComparison]::OrdinalIgnoreCase) -and
+            $record.Arguments -ceq '--spike-restarted') {
+            $state = 3
+            break
+        }
+    }
+    if ($state -ne 3) {
+        throw 'Launch evidence must contain ordered exact-path old --veloapp-obsolete 1.0.0, new --veloapp-updated 1.1.0, and new --spike-restarted events.'
+    }
+    return $canonicalNew
 }
 
 function Invoke-InstallUpgradePhase {
@@ -272,19 +420,25 @@ function Invoke-InstallUpgradePhase {
 
     $evidenceLog = Join-Path $localAppData "$($script:EvidenceDirectoryName)\launches.log"
     $deadline = [DateTime]::UtcNow.AddSeconds(45)
-    $lifecycleEvidence = $null
-    $restartEvidence = $null
+    $validatedRestartTarget = $null
+    $expectedNewCurrentMain = Join-Path $installRoot "current\$($script:NewMainExe)"
     do {
         Start-Sleep -Milliseconds 250
         if (Test-Path -LiteralPath $evidenceLog) {
             $launchEvidence = @(Get-Content -LiteralPath $evidenceLog -Encoding UTF8)
-            $lifecycleEvidence = $launchEvidence | Where-Object { $_ -like "*$($script:VelopackUpdatedArgument)*" } | Select-Object -Last 1
-            $restartEvidence = $launchEvidence | Where-Object { $_ -like '*--spike-restarted*' } | Select-Object -Last 1
+            try {
+                $validatedRestartTarget = Assert-LaunchEvidence `
+                    -Records $launchEvidence `
+                    -ExpectedOldExecutable $oldCurrentMain `
+                    -ExpectedNewExecutable $expectedNewCurrentMain
+            } catch {
+                $validatedRestartTarget = $null
+            }
         }
-        if ($lifecycleEvidence -and $restartEvidence) { break }
+        if ($validatedRestartTarget) { break }
     } while ([DateTime]::UtcNow -lt $deadline)
-    if (-not $lifecycleEvidence -or -not $restartEvidence) {
-        throw "UpgradeRestartTarget evidence was not recorded within 45 seconds: $evidenceLog"
+    if (-not $validatedRestartTarget) {
+        throw "Exact ordered lifecycle and UpgradeRestartTarget evidence was not recorded within 45 seconds: $evidenceLog"
     }
 
     $rootLauncher = Join-Path $installRoot $script:NewMainExe
@@ -297,11 +451,11 @@ function Invoke-InstallUpgradePhase {
         }
     }
 
-    Assert-PathEndsWith -Label 'InstallRootLauncher' -Actual $rootLauncher -ExpectedSuffix $script:NewMainExe
-    Assert-PathEndsWith -Label 'CurrentMainExecutable' -Actual $currentMain -ExpectedSuffix "current\$($script:NewMainExe)"
-    Assert-PathEndsWith -Label 'DesktopShortcut' -Actual (Get-ShortcutTarget $desktopShortcut) -ExpectedSuffix $script:NewMainExe
-    Assert-PathEndsWith -Label 'StartMenuShortcut' -Actual (Get-ShortcutTarget $startMenuShortcut) -ExpectedSuffix $script:NewMainExe
-    Assert-PathEndsWith -Label 'UpgradeRestartTarget' -Actual (($restartEvidence -split '\|')[1]) -ExpectedSuffix "current\$($script:NewMainExe)"
+    Assert-CanonicalPathEquals -Label 'InstallRootLauncher' -Actual $rootLauncher -Expected $rootLauncher
+    Assert-CanonicalPathEquals -Label 'CurrentMainExecutable' -Actual $currentMain -Expected $expectedNewCurrentMain
+    Assert-CanonicalPathEquals -Label 'DesktopShortcut' -Actual (Get-ShortcutTarget $desktopShortcut) -Expected $expectedNewCurrentMain
+    Assert-CanonicalPathEquals -Label 'StartMenuShortcut' -Actual (Get-ShortcutTarget $startMenuShortcut) -Expected $expectedNewCurrentMain
+    Assert-CanonicalPathEquals -Label 'UpgradeRestartTarget' -Actual $validatedRestartTarget -Expected $expectedNewCurrentMain
     Write-Host 'INSTALL_UPGRADE_PASS'
 }
 
