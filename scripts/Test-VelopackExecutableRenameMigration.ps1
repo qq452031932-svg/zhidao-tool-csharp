@@ -12,6 +12,64 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Text;
+public sealed class MigrationBoundedProcessResult {
+    public int ExitCode;
+    public string StandardOutput;
+    public string StandardError;
+}
+public static class MigrationBoundedProcessRunner {
+    private static bool KillTree(int id) {
+        try {
+            using (var killer = Process.Start(new ProcessStartInfo("taskkill.exe", "/PID " + id + " /T /F") {
+                UseShellExecute = false, CreateNoWindow = true
+            })) {
+                return killer != null && killer.WaitForExit(10000) && killer.ExitCode == 0;
+            }
+        } catch { return false; }
+    }
+    public static MigrationBoundedProcessResult Run(string file, string arguments, string workingDirectory, int timeoutMs, int maximumBytes) {
+        var info = new ProcessStartInfo(file, arguments) {
+            WorkingDirectory = workingDirectory, UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true
+        };
+        using (var process = new Process { StartInfo = info }) {
+            var output = new StringBuilder(); var error = new StringBuilder();
+            var sync = new object(); var bytes = 0; var overflow = false;
+            DataReceivedEventHandler appendOutput = (sender, e) => {
+                if (e.Data == null) return;
+                lock (sync) {
+                    bytes += Encoding.UTF8.GetByteCount(e.Data) + 1;
+                    if (bytes > maximumBytes) overflow = true; else output.Append(e.Data).Append('\n');
+                }
+                if (overflow) KillTree(process.Id);
+            };
+            DataReceivedEventHandler appendError = (sender, e) => {
+                if (e.Data == null) return;
+                lock (sync) {
+                    bytes += Encoding.UTF8.GetByteCount(e.Data) + 1;
+                    if (bytes > maximumBytes) overflow = true; else error.Append(e.Data).Append('\n');
+                }
+                if (overflow) KillTree(process.Id);
+            };
+            process.OutputDataReceived += appendOutput; process.ErrorDataReceived += appendError;
+            if (!process.Start()) throw new InvalidOperationException("Unable to start bounded process.");
+            process.BeginOutputReadLine(); process.BeginErrorReadLine();
+            if (!process.WaitForExit(timeoutMs)) {
+                KillTree(process.Id);
+                if (!process.WaitForExit(10000)) throw new InvalidOperationException("Timed-out process tree could not be terminated.");
+                throw new TimeoutException("Bounded process timed out.");
+            }
+            process.WaitForExit();
+            if (overflow) throw new InvalidOperationException("Bounded process output exceeded the byte limit.");
+            return new MigrationBoundedProcessResult { ExitCode = process.ExitCode, StandardOutput = output.ToString(), StandardError = error.ToString() };
+        }
+    }
+}
+'@
 
 # This gate deliberately has no network client. Its only asset source is the two
 # caller-supplied local directories copied into the run-owned evidence directory.
@@ -22,7 +80,110 @@ $script:ChineseDisplayName = "$([char]0x77E5)$([char]0x9053)$([char]0x7EFC)$([ch
 $script:NewMainExecutableName = $script:ChineseDisplayName + '.exe'
 $script:IsolationDirectoryName = '.velopack-rename-migration-isolation'
 $script:FixtureName = 'migration-gate-fixture.json'
+$script:FixtureSignatureName = 'migration-gate-fixture.json.sig'
+$script:ExpectedPublisherSpkiSha256 = 'f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff'
+$script:PublisherCertificatePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'eng\ota\SuperPan.OtaPublisher.cer'
+$script:MaximumFixtureBytes = 65536
+$script:MaximumDriverOutputBytes = 1048576
 $script:OwnedPaths = New-Object System.Collections.Generic.List[string]
+
+function New-DerElement([byte]$Tag, [byte[]]$Content) {
+    if ($Content.Length -lt 128) { [byte[]]$length = [byte]$Content.Length }
+    else {
+        $lengthBytes = New-Object Collections.Generic.List[byte]
+        $remaining = [uint64]$Content.Length
+        while ($remaining -gt 0) { $lengthBytes.Insert(0, [byte]($remaining -band 0xff)); $remaining = $remaining -shr 8 }
+        [byte[]]$length = @([byte](0x80 -bor $lengthBytes.Count)) + $lengthBytes.ToArray()
+    }
+    $result = New-Object byte[] (1 + $length.Length + $Content.Length)
+    $result[0] = $Tag
+    [Array]::Copy($length, 0, $result, 1, $length.Length)
+    [Array]::Copy($Content, 0, $result, 1 + $length.Length, $Content.Length)
+    return ,$result
+}
+
+function Convert-OidToDerValue([string]$Oid) {
+    if ($Oid -cnotmatch '^[0-2](\.(0|[1-9][0-9]*)){1,}$') { throw 'Certificate public-key OID is invalid.' }
+    [uint64[]]$parts = @($Oid.Split('.') | ForEach-Object { [uint64]::Parse($_, [Globalization.CultureInfo]::InvariantCulture) })
+    if ($parts[0] -lt 2 -and $parts[1] -gt 39) { throw 'Certificate public-key OID is invalid.' }
+    [uint64[]]$values = @([uint64](40 * $parts[0] + $parts[1])) + @($parts | Select-Object -Skip 2)
+    $encoded = New-Object Collections.Generic.List[byte]
+    foreach ($value in $values) {
+        $component = New-Object Collections.Generic.List[byte]
+        $remaining = [uint64]$value
+        do { $component.Insert(0, [byte]($remaining -band 0x7f)); $remaining = $remaining -shr 7 } while ($remaining -gt 0)
+        for ($index = 0; $index -lt $component.Count - 1; $index++) { $component[$index] = [byte]($component[$index] -bor 0x80) }
+        $encoded.AddRange($component)
+    }
+    return ,$encoded.ToArray()
+}
+
+function Get-CertificateSubjectPublicKeyInfo([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
+    [byte[]]$oid = New-DerElement 0x06 (Convert-OidToDerValue $Certificate.PublicKey.Oid.Value)
+    [byte[]]$parameters = $Certificate.PublicKey.EncodedParameters.RawData
+    [byte[]]$algorithm = New-DerElement 0x30 ([byte[]]($oid + $parameters))
+    [byte[]]$keyValue = $Certificate.PublicKey.EncodedKeyValue.RawData
+    [byte[]]$bitString = New-DerElement 0x03 ([byte[]](@(0) + $keyValue))
+    return New-DerElement 0x30 ([byte[]]($algorithm + $bitString))
+}
+
+function Get-CertificateSpkiSha256 {
+    param([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash((Get-CertificateSubjectPublicKeyInfo $Certificate)) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $sha.Dispose() }
+}
+
+function Assert-AssetFileName {
+    param([string]$FileName, [string]$Label)
+    if ([string]::IsNullOrWhiteSpace($FileName) -or [IO.Path]::IsPathRooted($FileName) -or
+        [IO.Path]::GetFileName($FileName) -cne $FileName -or $FileName -in @('.', '..')) {
+        throw "$Label must be one top-level local asset file name."
+    }
+    return $FileName
+}
+
+function Assert-CanonicalSignedFixture {
+    param([string]$FixturePath, [string]$SignaturePath, [string]$CertificatePath, [string]$ExpectedSpki)
+    foreach ($file in @($FixturePath, $SignaturePath, $CertificatePath)) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Signed fixture input is missing: $file" }
+        Assert-NoReparsePoint -ExistingPath $file -Label 'Signed fixture input'
+    }
+    $bytes = [IO.File]::ReadAllBytes($FixturePath)
+    if ($bytes.Length -lt 3 -or $bytes.Length -gt 65536 -or
+        ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) -or
+        $bytes[$bytes.Length - 1] -ne 0x0a -or $bytes -contains 0x0d) {
+        throw 'Migration fixture must be bounded canonical UTF-8 with LF and no BOM.'
+    }
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    try { $json = $utf8.GetString($bytes) } catch { throw 'Migration fixture is not canonical UTF-8.' }
+    try { $fixture = $json | ConvertFrom-Json } catch { throw 'Migration fixture JSON is malformed.' }
+    $expectedProperties = @('new_delta_file','new_full_file','old_full_file','old_portable_file','old_setup_file','schema_version','state_driver_file','state_driver_sha256')
+    $actualProperties = @($fixture.PSObject.Properties.Name | Sort-Object)
+    if (($actualProperties -join "`n") -cne ($expectedProperties -join "`n") -or $fixture.schema_version -ne 1) {
+        throw 'Migration fixture schema is not exactly version 1.'
+    }
+    foreach ($name in @('new_delta_file','new_full_file','old_full_file','old_portable_file','old_setup_file','state_driver_file')) {
+        Assert-AssetFileName -FileName ([string]$fixture.$name) -Label $name | Out-Null
+    }
+    if ([string]$fixture.state_driver_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'state_driver_sha256 is invalid.' }
+    $canonical = ConvertTo-CanonicalJson $fixture
+    $canonicalBytes = $utf8.GetBytes($canonical + "`n")
+    if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$bytes, [byte[]]$canonicalBytes)) { throw 'Migration fixture JSON is not canonical.' }
+    $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new([IO.File]::ReadAllBytes($CertificatePath))
+    try {
+        if ((Get-CertificateSpkiSha256 $certificate) -cne $ExpectedSpki) { throw 'Migration fixture publisher certificate SPKI mismatch.' }
+        $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($certificate)
+        try {
+            $signature = [IO.File]::ReadAllBytes($SignaturePath)
+            if (-not $rsa -or $signature.Length -ne ($rsa.KeySize / 8) -or
+                -not $rsa.VerifyData($bytes, $signature, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
+                throw 'Migration fixture detached RSA SHA-256/PKCS1 signature is invalid.'
+            }
+        } finally { if ($rsa) { $rsa.Dispose() } }
+    } finally { $certificate.Dispose() }
+    return $fixture
+}
 
 function Assert-StrictChildPath {
     param(
@@ -46,6 +207,20 @@ function Assert-NoReparsePoint {
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Label must not be a reparse point: $ExistingPath"
     }
+}
+
+function Assert-NoNonLoopbackNetwork {
+    $adapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object {
+        $_.ifIndex -ne 1 -and [string]$_.InterfaceDescription -notmatch '(?i)loopback'
+    })
+    $enabled = @($adapters | Where-Object { [string]$_.Status -cne 'Disabled' })
+    if ($enabled.Count -ne 0) { throw 'Every non-loopback network adapter must be disabled in the isolated migration environment.' }
+    $defaultRoutes = @(
+        Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop
+        Get-NetRoute -AddressFamily IPv6 -ErrorAction Stop
+    ) | Where-Object { $_.ifIndex -ne 1 -and [string]$_.DestinationPrefix -in @('0.0.0.0/0', '::/0') }
+    if (@($defaultRoutes).Count -ne 0) { throw 'The isolated migration environment must have no IPv4 or IPv6 default route.' }
+    return [ordered]@{ NonLoopbackAdapters = $adapters.Count; DefaultRoutes = 0; VerifiedUtc = [DateTimeOffset]::UtcNow.ToString('O') }
 }
 
 function Assert-NoReparseAncestors {
@@ -228,18 +403,127 @@ function Assert-FileSha256 {
     if ($actual -cne $Expected) { throw "$Label SHA-256 mismatch." }
 }
 
-function Assert-AuthenticodeSamePublisher {
-    param([string]$Driver, [string]$ApplicationExecutable)
-    $driverSignature = Get-AuthenticodeSignature -LiteralPath $Driver
-    $applicationSignature = Get-AuthenticodeSignature -LiteralPath $ApplicationExecutable
-    if ($driverSignature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
-        $applicationSignature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
-        -not $driverSignature.SignerCertificate -or -not $applicationSignature.SignerCertificate) {
-        throw 'The state driver and production application must both have valid Authenticode signatures.'
+function Get-StreamingSha256 {
+    param([string]$File)
+    $stream = [IO.File]::Open($File, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $sha.Dispose(); $stream.Dispose() }
+}
+
+function Get-FileHardLinkCount {
+    param([string]$File)
+    $output = @(& fsutil.exe hardlink list $File 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "Unable to inspect hard links for '$File'." }
+    $links = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($links.Count -ne 1) { throw "State file has $($links.Count) hard links: $File" }
+    return 1
+}
+
+function Assert-ExactProfileFile {
+    param([string]$Actual, [string]$Expected, [long]$MaximumBytes, [string]$Label)
+    $canonicalActual = [IO.Path]::GetFullPath($Actual)
+    $canonicalExpected = [IO.Path]::GetFullPath($Expected)
+    if (-not [string]::Equals($canonicalActual, $canonicalExpected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label path is not the fixed isolated-profile path."
     }
-    if ($driverSignature.SignerCertificate.Thumbprint -cne $applicationSignature.SignerCertificate.Thumbprint) {
-        throw 'The state driver is not signed by the production application publisher.'
+    if (-not (Test-Path -LiteralPath $canonicalActual -PathType Leaf)) { throw "$Label is missing." }
+    Assert-NoReparseAncestors -ExistingPath $canonicalActual -Label $Label
+    $info = Get-Item -LiteralPath $canonicalActual -Force
+    if ($info.Length -lt 1 -or $info.Length -gt $MaximumBytes) { throw "$Label size is outside the allowed bound." }
+    Get-FileHardLinkCount -File $canonicalActual | Out-Null
+    return $info
+}
+
+function Assert-StateEvidence {
+    param([string]$StateJson, [string]$StateJsonPath, [string]$ProfileRoot, [string]$RunId)
+    if ([string]::IsNullOrWhiteSpace($StateJson)) {
+        if ([string]::IsNullOrWhiteSpace($StateJsonPath)) { throw 'State evidence JSON is missing.' }
+        $StateJson = Get-Content -LiteralPath $StateJsonPath -Raw -Encoding UTF8
     }
+    try { $state = $StateJson | ConvertFrom-Json } catch { throw 'State evidence JSON is malformed.' }
+    foreach ($kind in @('account','settings','task')) {
+        $markerName = $kind + '_marker'
+        $countName = $kind + '_marker_count'
+        $hashName = $kind + '_row_sha256'
+        if ([string]$state.$markerName -cne $RunId -or [int]$state.$countName -ne 1 -or
+            [string]$state.$hashName -cnotmatch '^[0-9a-f]{64}$') {
+            throw "$kind marker must be one unique row bound to the current run id and row hash."
+        }
+    }
+    $expectedDatabase = Join-Path $ProfileRoot 'AppData\Local\BaiduBatchTransfer\data\baidu-batch-transfer.db'
+    $expectedLicense = Join-Path $ProfileRoot 'AppData\Local\SuperPan\Licensing\v1\licenses.dat'
+    $database = Assert-ExactProfileFile -Actual ([string]$state.database_path) -Expected $expectedDatabase -MaximumBytes 536870912 -Label 'Database state file'
+    $license = Assert-ExactProfileFile -Actual ([string]$state.license_path) -Expected $expectedLicense -MaximumBytes 1048576 -Label 'License state file'
+    $databaseHash = Get-StreamingSha256 -File $database.FullName
+    $licenseHash = Get-StreamingSha256 -File $license.FullName
+    if ([string]$state.database_file_sha256 -cne $databaseHash -or [long]$state.database_length -ne $database.Length) {
+        throw 'Database state file hash or length is not independently bound to driver evidence.'
+    }
+    if ([string]$state.license_file_sha256 -cne $licenseHash -or [long]$state.license_length -ne $license.Length) {
+        throw 'License state file hash or length is not independently bound to driver evidence.'
+    }
+    if ($state.production_trust_chain -ne $true -or [string]$state.signed_payload_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'The trusted driver did not verify the production-chain license signature.'
+    }
+    $expiry = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParseExact([string]$state.expires_at_utc, 'O', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$expiry) -or
+        $expiry -le [DateTimeOffset]::UtcNow) { throw 'The production-chain isolation license is expired or malformed.' }
+    $activation = [Guid]::Empty
+    if (-not [Guid]::TryParseExact([string]$state.activation_request_id, 'D', [ref]$activation)) { throw 'activation_request_id is invalid.' }
+    if ($state.environment_authorization_is_auxiliary -ne $true -or $state.network_accessed -ne $false -or
+        [string]$state.license_source -cne 'preissued-local-production-chain-license') {
+        throw 'License state evidence is not an offline preissued production-chain authorization.'
+    }
+    return $state
+}
+
+function Assert-StateEvidencePreserved {
+    param($Before, $After)
+    foreach ($field in @(
+        'account_marker','account_marker_count','account_row_sha256','settings_marker','settings_marker_count','settings_row_sha256',
+        'task_marker','task_marker_count','task_row_sha256','database_path','database_file_sha256','database_length',
+        'license_path','license_file_sha256','license_length','signed_payload_sha256','expires_at_utc','activation_request_id','license_source')) {
+        if ([string]$Before.$field -cne [string]$After.$field) { throw "Preserved state field changed: $field" }
+    }
+    if ($After.reactivation_required -ne $false) { throw 'The upgraded application required reactivation.' }
+}
+
+function Assert-UpgradeEvidence {
+    param([string]$EvidenceJson, [string]$FailureInjection, [string]$ExpectedAssetSha256, [long]$ExpectedAssetBytes)
+    try { $upgrade = $EvidenceJson | ConvertFrom-Json } catch { throw 'Upgrade evidence JSON is malformed.' }
+    if ([string]$upgrade.failure_injection -cne $FailureInjection -or [string]$upgrade.asset_consumed_sha256 -cne $ExpectedAssetSha256 -or
+        [long]$upgrade.expected_asset_bytes -ne $ExpectedAssetBytes) { throw 'Upgrade evidence is not bound to the selected local asset.' }
+    if ($upgrade.update_manager_invoked -ne $true) { throw 'The trusted driver did not invoke Velopack UpdateManager.' }
+    if ($FailureInjection -ceq 'None') {
+        if ($upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -ne 0 -or [string]$upgrade.outcome -cne 'updated') {
+            throw 'Successful migration did not execute the Velopack updater successfully.'
+        }
+    } elseif ($FailureInjection -ceq 'DownloadInterrupted') {
+        if ($upgrade.fault_observed -ne $true -or $upgrade.asset_opened -ne $true -or
+            [long]$upgrade.bytes_consumed -le 0 -or [long]$upgrade.bytes_consumed -ge $ExpectedAssetBytes -or
+            [string]$upgrade.old_version_after_failure -cne '1.1.0' -or [string]$upgrade.outcome -cne 'failed-and-rolled-back') {
+            throw 'DownloadInterrupted did not prove a real consumed partial asset and 1.1.0 rollback.'
+        }
+    } else {
+        if ($upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -eq 0 -or $upgrade.fault_observed -ne $true -or
+            [string]$upgrade.old_version_after_failure -cne '1.1.0' -or [string]$upgrade.outcome -cne 'failed-and-rolled-back') {
+            throw 'ApplicationFailed did not prove a real updater failure and 1.1.0 rollback.'
+        }
+    }
+    return $upgrade
+}
+
+function Assert-PublisherExecutable {
+    param([string]$Executable, [string]$ExpectedSpki = $script:ExpectedPublisherSpkiSha256)
+    $signature = Get-AuthenticodeSignature -LiteralPath $Executable
+    if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or -not $signature.SignerCertificate) {
+        throw "Executable is not validly Authenticode signed: $Executable"
+    }
+    if ((Get-CertificateSpkiSha256 $signature.SignerCertificate) -cne $ExpectedSpki) {
+        throw "Executable signer SPKI does not match the fixed production OTA publisher: $Executable"
+    }
+    Assert-PeMachineAmd64 -Executable $Executable -Label ([IO.Path]::GetFileName($Executable))
 }
 
 function Assert-PeMachineAmd64 {
@@ -274,81 +558,78 @@ function Stop-OwnedProcessTree {
     foreach ($id in @($ids | Sort-Object -Descending)) {
         Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
     }
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
+    do {
+        $remaining = @($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($remaining.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+    throw "Owned process tree could not be terminated: $($remaining -join ',')"
+}
+
+function ConvertTo-NativeCommandLine {
+    param([string[]]$Arguments)
+    return (($Arguments | ForEach-Object {
+        $argument = [string]$_
+        if ($argument.IndexOf([char]0) -ge 0) { throw 'A process argument contains a NUL character.' }
+        '"' + [regex]::Replace($argument, '(\\*)"', '$1$1\"') + ([regex]::Match($argument, '\\+$').Value) + '"'
+    }) -join ' ')
+}
+
+function Invoke-BoundedDriver {
+    param([string]$Driver, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 120)
+    Assert-NoNonLoopbackNetwork | Out-Null
+    $result = [MigrationBoundedProcessRunner]::Run(
+        $Driver, (ConvertTo-NativeCommandLine $Arguments), $WorkingDirectory,
+        $TimeoutSeconds * 1000, $script:MaximumDriverOutputBytes)
+    Assert-NoNonLoopbackNetwork | Out-Null
+    if ($result.ExitCode -ne 0) { throw "Trusted state driver failed with exit code $($result.ExitCode): $($result.StandardError)" }
+    if (-not [string]::IsNullOrEmpty($result.StandardError)) { throw 'Trusted state driver wrote unexpected stderr.' }
+    $outputBytes = (New-Object Text.UTF8Encoding($false, $true)).GetBytes($result.StandardOutput)
+    if ($outputBytes.Length -lt 3 -or $outputBytes.Length -gt $script:MaximumDriverOutputBytes -or
+        $outputBytes[$outputBytes.Length - 1] -ne 0x0a -or $outputBytes -contains 0x0d) {
+        throw 'Trusted state driver stdout must be one bounded canonical UTF-8/LF JSON record.'
+    }
+    try { $record = $result.StandardOutput | ConvertFrom-Json } catch { throw 'Trusted state driver stdout is malformed JSON.' }
+    if ((ConvertTo-CanonicalJson $record) + "`n" -cne $result.StandardOutput) { throw 'Trusted state driver stdout JSON is not canonical.' }
+    return $result.StandardOutput
 }
 
 function Invoke-CheckedProcess {
     param([string]$File, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 120, [switch]$ExpectFailure)
-    $start = New-Object Diagnostics.ProcessStartInfo
-    $start.FileName = $File
-    $start.WorkingDirectory = $WorkingDirectory
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    $start.Arguments = ($Arguments | ForEach-Object {
-        $argument = [string]$_
-        if ($argument.IndexOf([char]0) -ge 0) { throw 'A process argument contains a NUL character.' }
-        # CommandLineToArgvW-compatible quoting, including trailing backslashes.
-        '"' + [regex]::Replace($argument, '(\\*)"', '$1$1\"') +
-            ([regex]::Match($argument, '\\+$').Value) + '"'
-    }) -join ' '
-    $process = New-Object Diagnostics.Process
-    $process.StartInfo = $start
-    if (-not $process.Start()) { throw "Unable to start $File" }
+    Assert-NoNonLoopbackNetwork | Out-Null
     try {
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            Stop-OwnedProcessTree -RootProcessId $process.Id
-            throw "Process timed out after $TimeoutSeconds seconds: $File"
+        $result = [MigrationBoundedProcessRunner]::Run($File, (ConvertTo-NativeCommandLine $Arguments), $WorkingDirectory, $TimeoutSeconds * 1000, $script:MaximumDriverOutputBytes)
+        if (-not $ExpectFailure -and $result.ExitCode -ne 0) { throw "Process failed ($($result.ExitCode)): $File`n$($result.StandardOutput)$($result.StandardError)" }
+        if ($ExpectFailure -and $result.ExitCode -eq 0) { throw "Injected failure unexpectedly succeeded: $File" }
+        return [pscustomobject]@{ ExitCode=$result.ExitCode; Output=($result.StandardOutput + $result.StandardError) }
+    } finally { Assert-NoNonLoopbackNetwork | Out-Null }
+}
+
+function Resolve-AssetFile {
+    param([string]$Root, [string]$FileName, [string]$Label)
+    Assert-AssetFileName -FileName $FileName -Label $Label | Out-Null
+    return Resolve-FixturePath -Root $Root -RelativePath $FileName -Label $Label
+}
+
+function Expand-LocalPortableAsset {
+    param([string]$Archive, [string]$Destination)
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $name = ([string]$entry.FullName).Replace('/', '\')
+            if ([string]::IsNullOrWhiteSpace($name) -or [IO.Path]::IsPathRooted($name)) { throw 'Portable archive contains an invalid path.' }
+            $target = Assert-StrictChildPath -Candidate (Join-Path $Destination $name) -Root $Destination -Label 'Portable archive entry'
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                New-Item -ItemType Directory -Path $target -Force | Out-Null
+            } else {
+                $parent = Split-Path -Parent $target
+                if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
+            }
         }
-        $output = $stdoutTask.GetAwaiter().GetResult() + $stderrTask.GetAwaiter().GetResult()
-        if (-not $ExpectFailure -and $process.ExitCode -ne 0) { throw "Process failed ($($process.ExitCode)): $File`n$output" }
-        if ($ExpectFailure -and $process.ExitCode -eq 0) { throw "Injected failure unexpectedly succeeded: $File" }
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $output }
-    } finally { $process.Dispose() }
-}
-
-function Invoke-StateDriver {
-    param([string]$Driver, [string]$Mode, [string]$RunId, [string]$ProfileRoot, [string]$FixturePath, [string]$OutputPath)
-    Invoke-CheckedProcess -File $Driver -WorkingDirectory (Split-Path -Parent $Driver) -Arguments @(
-        $Mode, '--run-id', $RunId, '--profile-root', $ProfileRoot, '--fixture', $FixturePath, '--output', $OutputPath
-    ) | Out-Null
-    if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) { throw "State driver did not write: $OutputPath" }
-    return (Get-Content -LiteralPath $OutputPath -Raw -Encoding UTF8 | ConvertFrom-Json)
-}
-
-function Assert-StateObservation {
-    param($State, [string]$RunId)
-    foreach ($name in @('account_marker', 'settings_marker', 'task_marker')) {
-        if ([string]$State.$name -cne $RunId) { throw "State observation '$name' does not contain the current run marker." }
-    }
-    if ([string]::IsNullOrWhiteSpace([string]$State.database_relative_path)) { throw 'database_relative_path is missing.' }
-    if ([string]::IsNullOrWhiteSpace([string]$State.license_state_relative_path)) { throw 'license_state_relative_path is missing.' }
-    if ($State.production_trust_chain -ne $true) { throw 'The isolation license was not verified by the production_trust_chain.' }
-    if ([string]$State.signed_payload_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'signed_payload_sha256 is invalid.' }
-    $expires = [DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParseExact([string]$State.expires_at_utc, 'O', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$expires)) {
-        throw 'expires_at_utc is invalid.'
-    }
-    if ($expires -le [DateTimeOffset]::UtcNow) { throw 'The production-chain isolation license is expired.' }
-    $activationId = [Guid]::Empty
-    if (-not [Guid]::TryParseExact([string]$State.activation_request_id, 'D', [ref]$activationId)) { throw 'activation_request_id is invalid.' }
-    if ($State.environment_authorization_is_auxiliary -ne $true) { throw 'environment_authorization_is_auxiliary must be acknowledged.' }
-    if ($State.network_accessed -ne $false -or [string]$State.license_source -cne 'preissued-local-production-chain-license') {
-        throw 'The license fixture must be preissued locally and the state driver must not access a network.'
-    }
-    return $State
-}
-
-function Assert-MigrationStatePreserved {
-    param($Before, $After, [string]$RunId)
-    Assert-StateObservation -State $Before -RunId $RunId | Out-Null
-    Assert-StateObservation -State $After -RunId $RunId | Out-Null
-    foreach ($field in @('account_marker','settings_marker','task_marker','database_relative_path','license_state_relative_path','signed_payload_sha256','expires_at_utc','activation_request_id','license_source')) {
-        if ([string]$Before.$field -cne [string]$After.$field) { throw "Migration changed preserved state field '$field'." }
-    }
-    if ($After.reactivation_required -ne $false) { throw 'The upgraded application required reactivation.' }
+    } finally { $zip.Dispose() }
+    foreach ($item in @(Get-ChildItem -LiteralPath $Destination -Force -Recurse)) { Assert-NoReparsePoint -ExistingPath $item.FullName -Label 'Portable archive output' }
 }
 
 function Get-ShortcutTarget {
@@ -385,16 +666,25 @@ function Assert-OldVersionStillLaunches {
 }
 
 function Get-UninstallEntry {
-    param([string]$PackageId)
+    param([string]$InstallRoot)
     $roots = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*')
     $matches = @($roots | ForEach-Object { Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue } |
-        Where-Object { [string]$_.PSChildName -like "*$PackageId*" -or [string]$_.DisplayName -ceq $script:ChineseDisplayName })
-    if ($matches.Count -ne 1) { throw "Expected one UninstallEntry for '$PackageId', found $($matches.Count)." }
-    return [ordered]@{ Key = [string]$matches[0].PSPath; DisplayName = [string]$matches[0].DisplayName; UninstallString = [string]$matches[0].UninstallString }
+        Where-Object { [string]$_.DisplayName -ceq $script:ChineseDisplayName })
+    if ($matches.Count -ne 1) { throw "Expected one exact Chinese UninstallEntry, found $($matches.Count)." }
+    $entry = $matches[0]
+    $expectedUpdater = Join-Path $InstallRoot 'Update.exe'
+    if ([IO.Path]::GetFullPath([string]$entry.InstallLocation).TrimEnd('\') -cne [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')) {
+        throw 'UninstallEntry InstallLocation is not the isolated product install root.'
+    }
+    $uninstallString = [string]$entry.UninstallString
+    if ($uninstallString -notlike "*$expectedUpdater*" -or $uninstallString -notmatch '(?i)(^|\s|\")--?uninstall(\s|$|\")') {
+        throw 'UninstallEntry UninstallString must invoke this install root Update.exe with uninstall semantics.'
+    }
+    return [ordered]@{ Key = [string]$entry.PSPath; DisplayName = [string]$entry.DisplayName; InstallLocation = [string]$entry.InstallLocation; UninstallString = $uninstallString }
 }
 
 function Assert-CleanSetupSurfaces {
-    param([string]$Profile, [string]$PackageId)
+    param([string]$Profile)
     foreach ($shortcut in @(
         (Join-Path $Profile "Desktop\$($script:ChineseDisplayName).lnk"),
         (Join-Path $Profile "Desktop\BaiduBatchTransfer.App.lnk"),
@@ -404,22 +694,22 @@ function Assert-CleanSetupSurfaces {
     }
     $existing = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' |
         ForEach-Object { Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue } |
-        Where-Object { [string]$_.PSChildName -like "*$PackageId*" -or [string]$_.DisplayName -in @($script:ChineseDisplayName, 'BaiduBatchTransfer.App') })
+        Where-Object { [string]$_.DisplayName -in @($script:ChineseDisplayName, 'BaiduBatchTransfer.App') })
     if ($existing.Count -ne 0) { throw 'The isolated profile contains a pre-existing product uninstall entry.' }
 }
 
 function Assert-SetupSurfaces {
-    param([string]$InstallRoot, [string]$CurrentMain, [string]$RootLauncher, [string]$LegacyLauncher, [string]$Profile, [string]$PackageId)
+    param([string]$InstallRoot, [string]$CurrentMain, [string]$RootLauncher, [string]$LegacyLauncher, [string]$Profile)
     $desktopShortcut = Join-Path $Profile ("Desktop\$($script:ChineseDisplayName).lnk")
     $startMenuShortcut = Join-Path $Profile ("AppData\Roaming\Microsoft\Windows\Start Menu\Programs\$($script:ChineseDisplayName).lnk")
     foreach ($required in @($CurrentMain, $RootLauncher, $LegacyLauncher, $desktopShortcut, $startMenuShortcut)) {
         if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required Setup migration surface is missing: $required" }
     }
-    $allowedTargets = @([IO.Path]::GetFullPath($RootLauncher), [IO.Path]::GetFullPath($CurrentMain))
     $desktopTarget = Get-ShortcutTarget $desktopShortcut
     $startMenuTarget = Get-ShortcutTarget $startMenuShortcut
-    if ($desktopTarget -notin $allowedTargets -or $startMenuTarget -notin $allowedTargets) { throw 'Chinese shortcuts do not target the renamed launcher.' }
-    $uninstall = Get-UninstallEntry -PackageId $PackageId
+    $exactCurrent = [IO.Path]::GetFullPath($CurrentMain)
+    if ($desktopTarget -cne $exactCurrent -or $startMenuTarget -cne $exactCurrent) { throw 'Chinese shortcuts must target the exact current Chinese executable.' }
+    $uninstall = Get-UninstallEntry -InstallRoot $InstallRoot
     if ([string]$uninstall.DisplayName -cne $script:ChineseDisplayName) { throw 'UninstallEntry does not use the Chinese product name.' }
     return [ordered]@{
         InstallRoot = $InstallRoot; CurrentDirectory = (Split-Path -Parent $CurrentMain)
@@ -446,15 +736,16 @@ $runId = New-RunId
 $startedUtc = [DateTimeOffset]::UtcNow
 $evidenceRoot = $null
 $evidence = [ordered]@{
-    SchemaVersion = 1; RunId = $runId; StartedUtc = $startedUtc.ToString('O'); FinishedUtc = $null
+    SchemaVersion = 2; RunId = $runId; StartedUtc = $startedUtc.ToString('O'); FinishedUtc = $null
     AssetSource = 'caller-supplied-local-directories'; AssetKind = $AssetKind; Path = $Path
     Scenario = "$AssetKind-$Path"; FailureInjection = $FailureInjection; Succeeded = $false
-    FailureRollbackVerified = $false; VelopackUpdaterVersion = $null
+    FailureRollbackVerified = $false; VelopackUpdaterVersion = $null; Upgrade = $null
     Surfaces = $null; BeforeState = $null; AfterState = $null; Error = $null
 }
 
 try {
     $profile = Assert-IsolatedWindowsProfile
+    Assert-NoNonLoopbackNetwork | Out-Null
     $oldSource = Assert-SafeInputDirectory -InputPath $OldAssets -Label 'OldAssets'
     $newSource = Assert-SafeInputDirectory -InputPath $NewAssets -Label 'NewAssets'
     if ([string]::Equals($oldSource, $newSource, [StringComparison]::OrdinalIgnoreCase)) { throw 'OldAssets and NewAssets must be distinct.' }
@@ -466,10 +757,8 @@ try {
         }
     }
     $evidenceRoot = Assert-NewOwnedDirectory -Directory $intendedEvidenceRoot -RunId $runId
-    $supportedScenarios = @('Setup-Delta', 'Setup-Full', 'Portable-Full')
-    if ($evidence.Scenario -notin $supportedScenarios) {
-        throw "Unsupported migration scenario '$($evidence.Scenario)'. Supported: $($supportedScenarios -join ', ')."
-    }
+    if ($evidence.Scenario -notin @('Setup-Delta','Setup-Full','Portable-Full')) { throw "Unsupported migration scenario '$($evidence.Scenario)'." }
+
     $stagedRoot = Join-Path $evidenceRoot 'staged-assets'
     New-Item -ItemType Directory -Path $stagedRoot | Out-Null
     $script:OwnedPaths.Add($stagedRoot)
@@ -478,128 +767,110 @@ try {
     Copy-LocalAssetTree -Source $oldSource -Destination $stagedOld
     Copy-LocalAssetTree -Source $newSource -Destination $stagedNew
 
-    $fixturePath = Resolve-FixturePath -Root $stagedOld -RelativePath $script:FixtureName -Label 'Migration fixture'
-    $fixture = Get-Content -LiteralPath $fixturePath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($fixture.schema_version -ne 1 -or [string]$fixture.old_version -cne '1.1.0' -or [string]$fixture.new_version -cne '1.1.1') {
-        throw 'Migration fixture must describe versions 1.1.0 to 1.1.1 and schema version 1.'
-    }
-    $driver = Resolve-FixturePath -Root $stagedOld -RelativePath ([string]$fixture.state_driver_relative_path) -Label 'State driver'
+    $fixturePath = Resolve-AssetFile -Root $stagedOld -FileName $script:FixtureName -Label 'Migration fixture'
+    $fixtureSignature = Resolve-AssetFile -Root $stagedOld -FileName $script:FixtureSignatureName -Label 'Migration fixture signature'
+    $fixture = Assert-CanonicalSignedFixture -FixturePath $fixturePath -SignaturePath $fixtureSignature -CertificatePath $script:PublisherCertificatePath -ExpectedSpki $script:ExpectedPublisherSpkiSha256
+    $driver = Resolve-AssetFile -Root $stagedOld -FileName ([string]$fixture.state_driver_file) -Label 'State driver'
     Assert-FileSha256 -File $driver -Expected ([string]$fixture.state_driver_sha256) -Label 'State driver'
+    Assert-PublisherExecutable -Executable $driver
 
+    # ProductIdentity.StablePackageId fixes this topology. Signed fixtures cannot redirect it.
+    $installRoot = Join-Path $profile 'AppData\Local\SuperPan.BaiduBatchTransfer'
+    $currentDirectory = Join-Path $installRoot 'current'
+    $oldMain = Join-Path $currentDirectory $script:OldMainExecutableName
+    $currentMain = Join-Path $currentDirectory $script:NewMainExecutableName
+    $legacy = Join-Path $currentDirectory $script:OldMainExecutableName
+    $rootLauncher = Join-Path $installRoot $script:NewMainExecutableName
+    $updater = Join-Path $installRoot 'Update.exe'
     $dataRoot = Join-Path $profile 'AppData\Local\BaiduBatchTransfer'
     $licenseRoot = Join-Path $profile 'AppData\Local\SuperPan\Licensing\v1'
-    if ((Test-Path -LiteralPath $dataRoot) -or (Test-Path -LiteralPath $licenseRoot)) {
-        throw 'The isolated profile is not clean; existing application data or license state would be at risk.'
+    foreach ($cleanPath in @($installRoot,$dataRoot,$licenseRoot)) {
+        if (Test-Path -LiteralPath $cleanPath) { throw "The isolated profile is not clean: $cleanPath" }
     }
+    Assert-CleanSetupSurfaces -Profile $profile
 
-    $oldPortableRoot = $null
     if ($AssetKind -ceq 'Setup') {
-        $oldSetup = Resolve-FixturePath -Root $stagedOld -RelativePath ([string]$fixture.old_setup_relative_path) -Label 'Old Setup'
-        $localAppData = Join-Path $profile 'AppData\Local'
-        $installRoot = Assert-StrictChildPath -Candidate (Join-Path $localAppData ([string]$fixture.install_root_relative_path)) -Root $localAppData -Label 'InstallRoot'
-        if (Test-Path -LiteralPath $installRoot) { throw "The isolated profile contains a pre-existing InstallRoot: $installRoot" }
-        Assert-CleanSetupSurfaces -Profile $profile -PackageId ([string]$fixture.package_id)
+        $oldSetup = Resolve-AssetFile -Root $stagedOld -FileName ([string]$fixture.old_setup_file) -Label 'Old Setup'
+        Assert-PublisherExecutable -Executable $oldSetup
         Invoke-CheckedProcess -File $oldSetup -Arguments @('--silent') -WorkingDirectory $stagedOld | Out-Null
     } else {
-        $oldPortable = Resolve-FixturePath -Root $stagedOld -RelativePath ([string]$fixture.old_portable_relative_path) -Label 'Old Portable'
-        $oldPortableRoot = Join-Path $evidenceRoot 'portable-install'
-        New-Item -ItemType Directory -Path $oldPortableRoot | Out-Null
-        $script:OwnedPaths.Add($oldPortableRoot)
-        [IO.Compression.ZipFile]::ExtractToDirectory($oldPortable, $oldPortableRoot)
-        $installRoot = Resolve-FixturePath -Root $oldPortableRoot -RelativePath ([string]$fixture.portable_root_relative_path) -Label 'Portable root' -Directory -AllowRoot
+        $oldPortable = Resolve-AssetFile -Root $stagedOld -FileName ([string]$fixture.old_portable_file) -Label 'Old Portable'
+        New-Item -ItemType Directory -Path $installRoot | Out-Null
+        $script:OwnedPaths.Add($installRoot)
+        Expand-LocalPortableAsset -Archive $oldPortable -Destination $installRoot
+        Assert-NoReparseAncestors -ExistingPath $installRoot -Label 'Portable install root'
     }
-    $installRoot = [IO.Path]::GetFullPath($installRoot)
-    $oldMain = Resolve-FixturePath -Root $installRoot -RelativePath ([string]$fixture.old_main_relative_path) -Label 'Old main executable'
-    if ([IO.Path]::GetFileName($oldMain) -cne $script:OldMainExecutableName -or
+
+    if (-not (Test-Path -LiteralPath $oldMain -PathType Leaf) -or
         -not ([Diagnostics.FileVersionInfo]::GetVersionInfo($oldMain).ProductVersion.StartsWith('1.1.0', [StringComparison]::Ordinal))) {
-        throw 'Old main executable must be the real 1.1.0 BaiduBatchTransfer.App.exe.'
+        throw 'Old main executable must be the real fixed-path 1.1.0 executable.'
     }
-    Assert-AuthenticodeSamePublisher -Driver $driver -ApplicationExecutable $oldMain
-    Assert-PeMachineAmd64 -Executable $oldMain -Label 'Old main executable'
-    $updater = Resolve-FixturePath -Root $installRoot -RelativePath ([string]$fixture.updater_relative_path) -Label 'Velopack updater'
+    Assert-PublisherExecutable -Executable $oldMain
+    if (-not (Test-Path -LiteralPath $updater -PathType Leaf)) { throw 'Velopack Update.exe is missing from the fixed install root.' }
     $evidence.VelopackUpdaterVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($updater).ProductVersion
-    $beforePath = Join-Path $evidenceRoot 'state-before.json'
-    $before = Invoke-StateDriver -Driver $driver -Mode 'seed-and-probe' -RunId $runId -ProfileRoot $profile -FixturePath $fixturePath -OutputPath $beforePath
-    Assert-StateObservation -State $before -RunId $runId | Out-Null
+
+    $commonDriverArguments = @('--run-id',$runId,'--profile-root',$profile,'--fixture',$fixturePath)
+    $beforeJson = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('seed-and-probe') + $commonDriverArguments)
+    $before = Assert-StateEvidence -StateJson $beforeJson -ProfileRoot $profile -RunId $runId
     $evidence.BeforeState = $before
 
-    $package = $null
     if ($Path -ceq 'Delta') {
-        $oldFull = Resolve-FixturePath -Root $stagedOld -RelativePath ([string]$fixture.old_full_relative_path) -Label 'Old full package'
-        $delta = Resolve-FixturePath -Root $stagedNew -RelativePath ([string]$fixture.new_delta_relative_path) -Label 'New delta package'
-        $package = Join-Path $evidenceRoot 'reconstructed-new-full.nupkg'
-        Invoke-CheckedProcess -File $updater -Arguments @('patch','--old',$oldFull,'--delta',$delta,'--output',$package) -WorkingDirectory $installRoot | Out-Null
+        Resolve-AssetFile -Root $stagedOld -FileName ([string]$fixture.old_full_file) -Label 'Old full package' | Out-Null
+        $selectedAsset = Resolve-AssetFile -Root $stagedNew -FileName ([string]$fixture.new_delta_file) -Label 'New delta package'
     } else {
-        $full = Resolve-FixturePath -Root $stagedNew -RelativePath ([string]$fixture.new_full_relative_path) -Label 'New full package'
-        $package = Join-Path $evidenceRoot 'selected-new-full.nupkg'
-        Copy-Item -LiteralPath $full -Destination $package
+        $selectedAsset = Resolve-AssetFile -Root $stagedNew -FileName ([string]$fixture.new_full_file) -Label 'New full package'
     }
+    $selectedAssetHash = Get-StreamingSha256 -File $selectedAsset
+    $selectedAssetBytes = (Get-Item -LiteralPath $selectedAsset).Length
+    $restartStarted = [DateTimeOffset]::UtcNow
+    $upgradeJson = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments @(
+        'perform-upgrade','--run-id',$runId,'--profile-root',$profile,'--fixture',$fixturePath,
+        '--old-assets',$stagedOld,'--new-assets',$stagedNew,'--install-root',$installRoot,
+        '--asset',$selectedAsset,'--asset-kind',$AssetKind,'--path',$Path,'--failure-injection',$FailureInjection
+    ) -TimeoutSeconds 300
+    $upgrade = Assert-UpgradeEvidence -EvidenceJson $upgradeJson -FailureInjection $FailureInjection -ExpectedAssetSha256 $selectedAssetHash -ExpectedAssetBytes $selectedAssetBytes
+    $evidence.Upgrade = $upgrade
 
-    if ($FailureInjection -ceq 'DownloadInterrupted') {
-        $partial = Join-Path $evidenceRoot 'injected-partial-download.nupkg'
-        $input = [IO.File]::OpenRead($package)
-        $output = [IO.File]::Open($partial, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try {
-            $remaining = [Math]::Max(1, [Math]::Floor($input.Length / 3))
-            $buffer = New-Object byte[] 65536
-            while ($remaining -gt 0) {
-                $read = $input.Read($buffer, 0, [Math]::Min($buffer.Length, $remaining))
-                if ($read -le 0) { break }
-                $output.Write($buffer, 0, $read); $remaining -= $read
-            }
-        } finally { $input.Dispose(); $output.Dispose() }
+    if ($FailureInjection -cne 'None') {
+        if (-not ([Diagnostics.FileVersionInfo]::GetVersionInfo($oldMain).ProductVersion.StartsWith('1.1.0', [StringComparison]::Ordinal))) {
+            throw 'Injected failure did not leave the exact old executable at version 1.1.0.'
+        }
         Assert-OldVersionStillLaunches -OldExecutable $oldMain -RunId $runId | Out-Null
-        $after = Invoke-StateDriver -Driver $driver -Mode 'probe' -RunId $runId -ProfileRoot $profile -FixturePath $fixturePath -OutputPath (Join-Path $evidenceRoot 'state-after.json')
-        Assert-MigrationStatePreserved -Before $before -After $after -RunId $runId
-        $evidence.AfterState = $after; $evidence.FailureRollbackVerified = $true; $evidence.Succeeded = $true
-    } elseif ($FailureInjection -ceq 'ApplicationFailed') {
-        $corrupt = Join-Path $evidenceRoot 'injected-corrupt-application.nupkg'
-        Copy-Item -LiteralPath $package -Destination $corrupt
-        $stream = [IO.File]::Open($corrupt, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $stream.SetLength([Math]::Max(1, [Math]::Floor($stream.Length / 2))) } finally { $stream.Dispose() }
-        Invoke-CheckedProcess -File $updater -Arguments @('--rootDir',$installRoot,'apply','--norestart','--package',$corrupt) -WorkingDirectory $installRoot -ExpectFailure | Out-Null
-        Assert-OldVersionStillLaunches -OldExecutable $oldMain -RunId $runId | Out-Null
-        $after = Invoke-StateDriver -Driver $driver -Mode 'probe' -RunId $runId -ProfileRoot $profile -FixturePath $fixturePath -OutputPath (Join-Path $evidenceRoot 'state-after.json')
-        Assert-MigrationStatePreserved -Before $before -After $after -RunId $runId
-        $evidence.AfterState = $after; $evidence.FailureRollbackVerified = $true; $evidence.Succeeded = $true
+        $afterJson = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('probe') + $commonDriverArguments)
+        $after = Assert-StateEvidence -StateJson $afterJson -ProfileRoot $profile -RunId $runId
+        Assert-StateEvidencePreserved -Before $before -After $after
+        $evidence.AfterState = $after
+        $evidence.FailureRollbackVerified = $true
+        $evidence.Succeeded = $true
     } else {
-        $restartStarted = [DateTimeOffset]::UtcNow
-        Invoke-CheckedProcess -File $updater -Arguments @('--rootDir',$installRoot,'apply','--package',$package,'--','--migration-gate-restarted',$runId) -WorkingDirectory $installRoot | Out-Null
-        $currentMain = Resolve-FixturePath -Root $installRoot -RelativePath ([string]$fixture.new_main_relative_path) -Label 'CurrentMainExecutable'
-        if ([IO.Path]::GetFileName($currentMain) -cne $script:NewMainExecutableName -or
+        if (-not (Test-Path -LiteralPath $currentMain -PathType Leaf) -or
             -not ([Diagnostics.FileVersionInfo]::GetVersionInfo($currentMain).ProductVersion.StartsWith('1.1.1', [StringComparison]::Ordinal))) {
-            throw 'CurrentMainExecutable must be the real 1.1.1 Chinese executable.'
+            throw 'Current Chinese executable must be the real fixed-path 1.1.1 executable.'
         }
-        Assert-AuthenticodeSamePublisher -Driver $driver -ApplicationExecutable $currentMain
-        Assert-PeMachineAmd64 -Executable $currentMain -Label 'CurrentMainExecutable'
+        foreach ($application in @($currentMain,$rootLauncher,$legacy)) { Assert-PublisherExecutable -Executable $application }
         $restart = Find-ExactProcessPath -ExpectedPath $currentMain -NotBefore $restartStarted
-        $restartEvidence = [ordered]@{ Id = $restart.Id; Path = $restart.Path; StartTimeUtc = $restart.StartTime.ToUniversalTime().ToString('O') }
+        $restartEvidence = [ordered]@{ Id=$restart.Id; Path=$restart.Path; StartTimeUtc=$restart.StartTime.ToUniversalTime().ToString('O') }
         Stop-OwnedProcessTree -RootProcessId $restart.Id
-        $rootLauncher = Resolve-FixturePath -Root $installRoot -RelativePath ([string]$fixture.root_launcher_relative_path) -Label 'InstallRootLauncher'
-        $legacy = Resolve-FixturePath -Root $installRoot -RelativePath ([string]$fixture.legacy_launcher_relative_path) -Label 'LegacyCompatibilityLauncher'
-        if ([IO.Path]::GetFileName($rootLauncher) -cne $script:NewMainExecutableName -or
-            [IO.Path]::GetFileName($legacy) -cne $script:OldMainExecutableName) {
-            throw 'The root launcher or legacy compatibility launcher has the wrong executable name.'
-        }
-        foreach ($launcher in @($rootLauncher, $legacy)) {
-            Assert-AuthenticodeSamePublisher -Driver $driver -ApplicationExecutable $launcher
-            Assert-PeMachineAmd64 -Executable $launcher -Label ([IO.Path]::GetFileName($launcher))
-        }
         if ($AssetKind -ceq 'Setup') {
-            $surfaces = Assert-SetupSurfaces -InstallRoot $installRoot -CurrentMain $currentMain -RootLauncher $rootLauncher -LegacyLauncher $legacy -Profile $profile -PackageId ([string]$fixture.package_id)
+            $surfaces = Assert-SetupSurfaces -InstallRoot $installRoot -CurrentMain $currentMain -RootLauncher $rootLauncher -LegacyLauncher $legacy -Profile $profile
         } else {
-            $surfaces = [ordered]@{ InstallRoot=$installRoot; CurrentDirectory=(Split-Path -Parent $currentMain); InstallRootLauncher=$rootLauncher; CurrentMainExecutable=$currentMain; LegacyCompatibilityLauncher=$legacy; DesktopShortcut=$null; StartMenuShortcut=$null; UninstallEntry=$null }
+            $surfaces = [ordered]@{ InstallRoot=$installRoot; CurrentDirectory=$currentDirectory; InstallRootLauncher=$rootLauncher; CurrentMainExecutable=$currentMain; LegacyCompatibilityLauncher=$legacy; DesktopShortcut=$null; StartMenuShortcut=$null; UninstallEntry=$null }
         }
         $surfaces.UpgradeRestartProcess = $restartEvidence
         $compatStarted = [DateTimeOffset]::UtcNow
-        Start-Process -FilePath $legacy -ArgumentList @('--migration-gate-compat', $runId) -WorkingDirectory (Split-Path -Parent $legacy) | Out-Null
-        $compatTarget = Find-ExactProcessPath -ExpectedPath $currentMain -NotBefore $compatStarted
+        $compatProcess = Start-Process -FilePath $legacy -ArgumentList @('--migration-gate-compat',$runId) -WorkingDirectory $currentDirectory -PassThru
+        try { $compatTarget = Find-ExactProcessPath -ExpectedPath $currentMain -NotBefore $compatStarted }
+        finally { if ($compatProcess -and -not $compatProcess.HasExited) { Stop-OwnedProcessTree -RootProcessId $compatProcess.Id } }
         Stop-OwnedProcessTree -RootProcessId $compatTarget.Id
-        $surfaces.LegacyCompatibilityForwardTarget = $currentMain
-        $after = Invoke-StateDriver -Driver $driver -Mode 'probe' -RunId $runId -ProfileRoot $profile -FixturePath $fixturePath -OutputPath (Join-Path $evidenceRoot 'state-after.json')
-        Assert-MigrationStatePreserved -Before $before -After $after -RunId $runId
-        $evidence.Surfaces = $surfaces; $evidence.AfterState = $after; $evidence.Succeeded = $true
+        $surfaces.LegacyCompatibilityForwardTarget = $compatTarget.Path
+        $afterJson = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments (@('probe') + $commonDriverArguments)
+        $after = Assert-StateEvidence -StateJson $afterJson -ProfileRoot $profile -RunId $runId
+        Assert-StateEvidencePreserved -Before $before -After $after
+        $evidence.Surfaces = $surfaces
+        $evidence.AfterState = $after
+        $evidence.Succeeded = $true
     }
+    Assert-NoNonLoopbackNetwork | Out-Null
 } catch {
     $evidence.Error = $_.Exception.Message
     throw
@@ -608,7 +879,7 @@ try {
         $evidence.FinishedUtc = [DateTimeOffset]::UtcNow.ToString('O')
         Write-CanonicalJson -Value $evidence -Destination (Join-Path $evidenceRoot 'evidence.json')
         $hashes = @(Get-FileInventory -Roots @($evidenceRoot))
-        Write-CanonicalJson -Value ([ordered]@{ SchemaVersion = 1; RunId = $runId; Files = $hashes }) -Destination (Join-Path $evidenceRoot 'files.sha256.json')
+        Write-CanonicalJson -Value ([ordered]@{ SchemaVersion=1; RunId=$runId; Files=$hashes }) -Destination (Join-Path $evidenceRoot 'files.sha256.json')
     }
 }
 
