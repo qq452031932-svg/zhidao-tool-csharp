@@ -27,19 +27,22 @@ function Write-OrVerifyGeneratedFile {
         [Parameter(Mandatory)][string]$Content
     )
 
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $expectedBytes = $encoding.GetBytes($Content)
+
     if ($VerifyOnly) {
         if (-not [System.IO.File]::Exists($Path)) {
             throw "Generated product identity file is missing: $Path"
         }
-        $actual = [System.IO.File]::ReadAllText($Path)
-        if ($actual -cne $Content) {
+        $actualBytes = [System.IO.File]::ReadAllBytes($Path)
+        if ([Convert]::ToBase64String($actualBytes) -cne [Convert]::ToBase64String($expectedBytes)) {
             throw "Generated product identity file is out of date: $Path"
         }
         return
     }
 
     [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($Path)) | Out-Null
-    [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllBytes($Path, $expectedBytes)
 }
 
 function Expand-GeneratedTemplate {

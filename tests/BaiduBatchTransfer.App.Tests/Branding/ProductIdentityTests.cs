@@ -85,6 +85,61 @@ public sealed class ProductIdentityTests
         }
     }
 
+    [Fact]
+    public async Task VerifyOnlyRejectsUtf8BomInIsolatedCopyWithoutChangingIt()
+    {
+        var fixtureRoot = Path.Combine(Path.GetTempPath(), $"product-identity-{Guid.NewGuid():N}");
+        try
+        {
+            CopyIdentityFixture(fixtureRoot);
+            var realGeneratedPath = Path.Combine(
+                RepositoryRoot(), "src", "BaiduBatchTransfer.App", "Branding", "ProductIdentity.Generated.cs");
+            var realGeneratedBytes = await File.ReadAllBytesAsync(realGeneratedPath);
+            var generatedPath = Path.Combine(
+                fixtureRoot, "src", "BaiduBatchTransfer.App", "Branding", "ProductIdentity.Generated.cs");
+            var originalBytes = await File.ReadAllBytesAsync(generatedPath);
+            var bytesWithBom = new byte[] { 0xef, 0xbb, 0xbf }.Concat(originalBytes).ToArray();
+            await File.WriteAllBytesAsync(generatedPath, bytesWithBom);
+
+            var result = await RunGeneratorAsync(fixtureRoot, verifyOnly: true);
+
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("out of date", result.Output, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(bytesWithBom, await File.ReadAllBytesAsync(generatedPath));
+            Assert.Equal(realGeneratedBytes, await File.ReadAllBytesAsync(realGeneratedPath));
+        }
+        finally
+        {
+            if (Directory.Exists(fixtureRoot)) Directory.Delete(fixtureRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task LoaderRejectsConditionalPropertyGroupInIsolatedCopy()
+    {
+        var fixtureRoot = Path.Combine(Path.GetTempPath(), $"product-identity-{Guid.NewGuid():N}");
+        try
+        {
+            CopyIdentityFixture(fixtureRoot);
+            var propsPath = Path.Combine(fixtureRoot, "eng", "ProductIdentity.props");
+            var props = await File.ReadAllTextAsync(propsPath);
+            var conditionalProps = props.Replace(
+                "<PropertyGroup>",
+                "<PropertyGroup Condition=\"'$(Configuration)' == 'Release'\">",
+                StringComparison.Ordinal);
+            await File.WriteAllTextAsync(propsPath, conditionalProps);
+
+            var result = await RunGeneratorAsync(fixtureRoot, verifyOnly: true);
+
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("PropertyGroup", result.Output, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(fixtureRoot)) Directory.Delete(fixtureRoot, recursive: true);
+        }
+    }
+
     private static Dictionary<string, string> LoadCanonicalProperties()
     {
         var document = XDocument.Load(Path.Combine(RepositoryRoot(), "eng", "ProductIdentity.props"));

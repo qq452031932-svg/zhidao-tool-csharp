@@ -45,9 +45,14 @@ function Get-ProductIdentity {
         'ProductDataDirectoryName',
         'ProductLicenseProductId'
     )
-    $propertyElements = @($document.Root.Elements() |
-        Where-Object { $_.Name.LocalName -eq 'PropertyGroup' -and $_.Name.NamespaceName -eq '' } |
-        ForEach-Object { $_.Elements() })
+    $propertyGroups = @($document.Root.Elements() |
+        Where-Object { $_.Name.LocalName -eq 'PropertyGroup' -and $_.Name.NamespaceName -eq '' })
+    foreach ($propertyGroup in $propertyGroups) {
+        if ($propertyGroup.HasAttributes) {
+            throw [System.IO.InvalidDataException]::new('Product identity PropertyGroup must not be conditional or attributed.')
+        }
+    }
+    $propertyElements = @($propertyGroups | ForEach-Object { $_.Elements() })
     $values = [ordered]@{}
 
     foreach ($name in $requiredNames) {
