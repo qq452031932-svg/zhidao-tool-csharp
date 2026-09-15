@@ -57,6 +57,8 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         Assert.Contains("IsInRole", script, StringComparison.Ordinal);
         Assert.Contains("WindowsBuiltInRole]::Administrator", script, StringComparison.Ordinal);
         Assert.Contains("Stop-OwnedProcessTree", script, StringComparison.Ordinal);
+        Assert.Contains("MaximumOfflinePollMilliseconds", script, StringComparison.Ordinal);
+        Assert.Contains("defense-in-depth", script, StringComparison.Ordinal);
         Assert.True(script.Split("Assert-NoNonLoopbackNetwork", StringSplitOptions.None).Length >= 4);
     }
 
@@ -124,9 +126,10 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
     {
         var result = await RunFunctionAsync("Assert-UpgradeEvidence", new Dictionary<string, string>
         {
-            ["EvidenceJson"] = "{\"run_id\":\"RUN\",\"challenge_sha256\":\"" + new string('a', 64) + "\",\"scenario\":\"Setup-Full\",\"asset_kind\":\"Setup\",\"path\":\"Full\",\"failure_injection\":\"ApplicationFailed\"}",
+            ["EvidenceJson"] = "{\"run_id\":\"RUN\",\"challenge_sha256\":\"" + new string('a', 64) + "\",\"scenario\":\"Setup-Full\",\"asset_kind\":\"Setup\",\"path\":\"Full\",\"failure_injection\":\"ApplicationFailed\",\"source_asset_path\":\"C:\\\\source.nupkg\",\"source_asset_sha256\":\"\",\"source_asset_length\":0}",
             ["RunId"] = "RUN", ["ExpectedChallengeSha256"] = new string('a', 64), ["Scenario"] = "Setup-Full",
             ["AssetKind"] = "Setup", ["Path"] = "Full", ["FailureInjection"] = "ApplicationFailed",
+            ["ExpectedAssetPath"] = "C:\\source.nupkg",
             ["ObservedUpdaterJson"] = "null",
         });
         Assert.NotEqual(0, result.ExitCode);
@@ -134,7 +137,102 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
     }
 
     [Fact]
-    public async Task TestScriptCopyActuallyObservesUpdaterAndValidatesChallengeBoundSuccessEvidence()
+    public async Task UpdaterCommandLineWithUrlIsRejected()
+    {
+        var observed = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            Arguments = new[] { "C:\\root\\Update.exe", "apply", "--package", "https://evil.invalid/a.nupkg", "--rootDir", "C:\\root", "--packageDir", "C:\\source" },
+            ParentPidChain = new[] { new { Pid = 2, ParentPid = 1 } },
+        });
+        var result = await RunFunctionAsync("Assert-UpdaterCommandLine", new Dictionary<string, string>
+        {
+            ["ObservedUpdaterJson"] = observed, ["ExpectedUpdater"] = "C:\\root\\Update.exe",
+            ["ExpectedPackage"] = "C:\\source\\a.nupkg", ["InstallRoot"] = "C:\\root",
+            ["LocalReleaseSource"] = "C:\\source", ["RunId"] = "RUN",
+        });
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("URL", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PartialArtifactMustBeExactSourcePrefix()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-prefix-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var source = System.IO.Path.Combine(root, "source.bin");
+        var prefix = System.IO.Path.Combine(root, "prefix.bin");
+        try
+        {
+            await File.WriteAllBytesAsync(source, [1, 2, 3, 4]);
+            await File.WriteAllBytesAsync(prefix, [1, 9]);
+            var result = await RunFunctionAsync("Assert-FileIsExactPrefix", new Dictionary<string, string> { ["Source"] = source, ["Prefix"] = prefix });
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("prefix", result.Output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task IndependentDpapiP256LicenseAuditAcceptsBoundClaimsAndRejectsMismatchedExpiry()
+    {
+        var profile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-license-audit-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(profile);
+            var valid = WriteDpapiLicenseFixture(profile, mismatchClaimsExpiry: false);
+            var accepted = await RunFunctionAsync("Assert-IndependentLicenseAudit", new Dictionary<string, string>
+            {
+                ["StateJson"] = valid.StateJson, ["ProfileRoot"] = profile, ["FixtureJson"] = valid.FixtureJson,
+            });
+            Assert.True(accepted.ExitCode == 0, accepted.Output);
+
+            var invalid = WriteDpapiLicenseFixture(profile, mismatchClaimsExpiry: true);
+            var rejected = await RunFunctionAsync("Assert-IndependentLicenseAudit", new Dictionary<string, string>
+            {
+                ["StateJson"] = invalid.StateJson, ["ProfileRoot"] = profile, ["FixtureJson"] = invalid.FixtureJson,
+            });
+            Assert.NotEqual(0, rejected.ExitCode);
+            Assert.Contains("bindings", rejected.Output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { if (Directory.Exists(profile)) Directory.Delete(profile, recursive: true); }
+    }
+
+    [Fact]
+    public async Task StaleApplicationFailureHookIsRejected()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-stale-hook-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var source = System.IO.Path.Combine(root, "source.nupkg");
+        var hook = System.IO.Path.Combine(root, "hook.json");
+        const string challenge = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        const string updater = "C:\\isolated\\Update.exe";
+        try
+        {
+            await File.WriteAllBytesAsync(source, [1, 2, 3]);
+            var sourceHash = Hash(source);
+            await File.WriteAllTextAsync(hook, "{\"challenge_sha256\":\"" + challenge + "\",\"created_utc\":\"2020-01-01T00:00:00.0000000+00:00\",\"run_id\":\"RUN\",\"scenario\":\"Setup-Full\",\"source_sha256\":\"" + sourceHash + "\"}\n", new UTF8Encoding(false));
+            var observed = System.Text.Json.JsonSerializer.Serialize(new { Path = updater, Pid = 42, StartedUtc = "2026-09-15T00:00:01.0000000+00:00" });
+            var evidence = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["run_id"]="RUN",["challenge_sha256"]=challenge,["scenario"]="Setup-Full",["asset_kind"]="Setup",["path"]="Full",["failure_injection"]="ApplicationFailed",
+                ["source_asset_path"]=source,["source_asset_sha256"]=sourceHash,["source_asset_length"]=3,["updater_pid"]=42,["updater_path"]=updater,["updater_started_utc"]="2026-09-15T00:00:01.0000000+00:00",
+                ["started_utc"]="2026-09-15T00:00:00.0000000+00:00",["completed_utc"]="2026-09-15T00:00:03.0000000+00:00",["update_manager_invoked"]=true,["update_manager_stage"]="apply-failed",
+                ["candidate_hook_trace_path"]=hook,["candidate_hook_challenge_sha256"]=challenge,["candidate_hook_trace_sha256"]=Hash(hook),
+            });
+            var result = await RunFunctionAsync("Assert-UpgradeEvidence", new Dictionary<string, string>
+            {
+                ["EvidenceJson"]=evidence,["RunId"]="RUN",["ExpectedChallengeSha256"]=challenge,["Scenario"]="Setup-Full",["AssetKind"]="Setup",["Path"]="Full",["FailureInjection"]="ApplicationFailed",
+                ["ExpectedAssetPath"]=source,["ExpectedAssetSha256"]=sourceHash,["ExpectedAssetBytes"]="3",["ExpectedUpdaterPath"]=updater,["ObservedUpdaterJson"]=observed,["RunOwnedRoot"]=root,
+                ["WindowStartedUtc"]="2026-09-15T00:00:00.0000000+00:00",["WindowCompletedUtc"]="2026-09-15T00:00:03.0000000+00:00",
+            });
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("stale", result.Output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task TestScriptCopyActuallyObservesUpdaterProcessWithoutClaimingUpgradeSuccess()
     {
         var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-orchestration-{Guid.NewGuid():N}");
         Directory.CreateDirectory(root);
@@ -159,6 +257,14 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             await File.WriteAllTextAsync(harness, """
                 param([string]$ScriptPath,[string]$Driver,[string]$Updater,[string]$WorkingDirectory)
                 $ErrorActionPreference='Stop'
+                Add-Type -TypeDefinition @'
+                using System;using System.Runtime.InteropServices;
+                public static class MigrationNativeCommandLine {
+                  [DllImport("shell32.dll",SetLastError=true)]static extern IntPtr CommandLineToArgvW(string c,out int n);
+                  [DllImport("kernel32.dll")]static extern IntPtr LocalFree(IntPtr p);
+                  public static string[] Split(string c){int n;var p=CommandLineToArgvW(c,out n);var r=new string[n];try{for(int i=0;i<n;i++)r[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(p,i*IntPtr.Size));return r;}finally{LocalFree(p);}}
+                }
+                '@
                 $tokens=$null;$errors=$null
                 $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
                 foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
@@ -166,7 +272,7 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
                 $script:MaximumDriverOutputBytes=1048576
                 $challenge='e'*64
                 $run=Invoke-BoundedDriver -Driver "$PSHOME\powershell.exe" -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$Driver,'-Updater',$Updater,'-ChallengeSha',$challenge) -WorkingDirectory $WorkingDirectory -TimeoutSeconds 15 -ExpectedUpdater $Updater -RequireUpdaterObservation
-                Assert-UpgradeEvidence -EvidenceJson $run.StandardOutput -RunId RUN -ExpectedChallengeSha256 $challenge -Scenario Setup-Full -AssetKind Setup -Path Full -FailureInjection None -ExpectedAssetSha256 ('a'*64) -ExpectedAssetBytes 100 -ExpectedUpdaterPath $Updater -ObservedUpdaterJson (ConvertTo-CanonicalJson $run.ObservedUpdater) -WindowStartedUtc $run.StartedUtc -WindowCompletedUtc $run.CompletedUtc -RunOwnedRoot $WorkingDirectory|Out-Null
+                if(-not$run.ObservedUpdater-or$run.ObservedUpdater.Pid-le 0){throw 'Monitor helper did not observe updater.'}
                 """, new UTF8Encoding(false));
             var startInfo = PowerShell();
             foreach (var argument in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-Driver", driver, "-Updater", updater, "-WorkingDirectory", root }) startInfo.ArgumentList.Add(argument);
@@ -317,11 +423,12 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
     {
         const string updater = "C:\\isolated\\Update.exe";
         var observed = "{\"Path\":\"" + JsonEscape(updater) + "\",\"Pid\":42,\"StartedUtc\":\"2026-09-15T00:00:01.0000000+00:00\"}";
-        var evidence = "{\"asset_kind\":\"Setup\",\"challenge_sha256\":\"" + new string('e',64) + "\",\"completed_utc\":\"2026-09-15T00:00:03.0000000+00:00\",\"failure_injection\":\"DownloadInterrupted\",\"path\":\"Full\",\"run_id\":\"RUN\",\"scenario\":\"Setup-Full\",\"source_asset_length\":100,\"source_asset_sha256\":\"" + new string('a',64) + "\",\"started_utc\":\"2026-09-15T00:00:00.0000000+00:00\",\"update_manager_invoked\":false,\"update_manager_stage\":\"download-failed\",\"updater_path\":\"" + JsonEscape(updater) + "\",\"updater_pid\":42,\"updater_started_utc\":\"2026-09-15T00:00:01.0000000+00:00\"}";
+        const string sourceAsset = "C:\\source.nupkg";
+        var evidence = "{\"asset_kind\":\"Setup\",\"challenge_sha256\":\"" + new string('e',64) + "\",\"completed_utc\":\"2026-09-15T00:00:03.0000000+00:00\",\"failure_injection\":\"DownloadInterrupted\",\"path\":\"Full\",\"run_id\":\"RUN\",\"scenario\":\"Setup-Full\",\"source_asset_path\":\"" + JsonEscape(sourceAsset) + "\",\"source_asset_length\":100,\"source_asset_sha256\":\"" + new string('a',64) + "\",\"started_utc\":\"2026-09-15T00:00:00.0000000+00:00\",\"update_manager_invoked\":false,\"update_manager_stage\":\"download-failed\",\"updater_path\":\"" + JsonEscape(updater) + "\",\"updater_pid\":42,\"updater_started_utc\":\"2026-09-15T00:00:01.0000000+00:00\"}";
         var result = await RunFunctionAsync("Assert-UpgradeEvidence", new Dictionary<string, string>
         {
             ["EvidenceJson"] = evidence, ["RunId"]="RUN", ["ExpectedChallengeSha256"]=new string('e',64), ["Scenario"]="Setup-Full", ["AssetKind"]="Setup", ["Path"]="Full", ["FailureInjection"] = "DownloadInterrupted",
-            ["ExpectedAssetSha256"] = new string('a', 64), ["ExpectedAssetBytes"] = "100",
+            ["ExpectedAssetPath"] = sourceAsset, ["ExpectedAssetSha256"] = new string('a', 64), ["ExpectedAssetBytes"] = "100",
             ["ExpectedUpdaterPath"]=updater, ["ObservedUpdaterJson"]=observed, ["WindowStartedUtc"]="2026-09-14T00:00:00.0000000+00:00", ["WindowCompletedUtc"]="2026-09-16T00:00:00.0000000+00:00",
         });
         Assert.NotEqual(0, result.ExitCode);
@@ -548,6 +655,7 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             await File.WriteAllTextAsync(harness, """
                 param([string]$ScriptPath,[string]$FunctionName,[string]$ArgumentsPath)
                 $ErrorActionPreference='Stop'
+                Add-Type -AssemblyName System.Security
                 $tokens=$null;$errors=$null
                 $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
                 if($errors.Count){throw 'Migration script parse failed.'}
@@ -577,6 +685,53 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             File.Delete(harness);
             File.Delete(argumentsPath);
         }
+    }
+
+    private static (string StateJson, string FixtureJson) WriteDpapiLicenseFixture(string profile, bool mismatchClaimsExpiry)
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        const string requestId = "11111111-1111-1111-1111-111111111111";
+        const string softwareId = "8270e8d7-1791-487d-ad76-0da7a0cbed12";
+        const string machineHash = "machine-hash-1";
+        const string packageName = "production";
+        const string cardId = "card-1";
+        var serverTime = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var outerExpires = DateTimeOffset.UtcNow.AddHours(2);
+        var outerLease = DateTimeOffset.UtcNow.AddHours(1);
+        var claimsExpires = mismatchClaimsExpiry ? DateTimeOffset.UtcNow.AddMinutes(-1) : outerExpires;
+        var claims = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, object?>
+        {
+            ["protocol_version"] = 1, ["request_id"] = requestId, ["server_time"] = serverTime,
+            ["decision"] = "allow", ["code"] = "ok", ["card_id"] = cardId, ["software_id"] = softwareId,
+            ["machine_hash"] = machineHash, ["package_name"] = packageName, ["expires_at"] = claimsExpires,
+            ["lease_until"] = outerLease,
+        });
+        var signature = key.SignData(claims, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
+        var envelope = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["key_id"] = "test-key-1", ["payload"] = Convert.ToBase64String(claims), ["signature"] = Convert.ToBase64String(signature),
+        });
+        var store = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            version = 1,
+            credentials = new[] { new { card = "test-card", activation_request_id = requestId, leases = new[] { new { card_id = cardId, software_id = softwareId, machine_hash = machineHash, package_name = packageName, expires_at = outerExpires, lease_until = outerLease, signed_payload = envelope } } } },
+        });
+        var entropy = SHA256.HashData(Encoding.UTF8.GetBytes("SuperPan.Licensing.State.v1"));
+        var protectedBytes = ProtectedData.Protect(store, entropy, DataProtectionScope.CurrentUser);
+        var licensePath = System.IO.Path.Combine(profile, "AppData", "Local", "SuperPan", "Licensing", "v1", "licenses.dat");
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(licensePath)!);
+        File.WriteAllBytes(licensePath, protectedBytes);
+        var state = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["activation_request_id"] = requestId, ["expires_at_utc"] = outerExpires.ToString("O"),
+            ["lease_until_utc"] = outerLease.ToString("O"), ["machine_hash"] = machineHash, ["package_name"] = packageName,
+            ["signed_payload_sha256"] = HashText(envelope),
+        });
+        var fixture = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["license_signing_key_id"] = "test-key-1", ["license_signing_spki_base64"] = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo()),
+        });
+        return (state, fixture);
     }
 
     private static string Hash(string path) =>

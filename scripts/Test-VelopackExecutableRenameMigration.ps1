@@ -16,6 +16,8 @@ Add-Type -AssemblyName System.Security
 Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Text;
 public sealed class MigrationBoundedProcessResult {
     public int ExitCode;
@@ -68,6 +70,16 @@ public static class MigrationBoundedProcessRunner {
             if (overflow) throw new InvalidOperationException("Bounded process output exceeded the byte limit.");
             return new MigrationBoundedProcessResult { ExitCode = process.ExitCode, StandardOutput = output.ToString(), StandardError = error.ToString() };
         }
+    }
+}
+public static class MigrationNativeCommandLine {
+    [DllImport("shell32.dll", SetLastError=true)] private static extern IntPtr CommandLineToArgvW(string commandLine, out int argc);
+    [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr value);
+    public static string[] Split(string commandLine) {
+        int count; var pointer=CommandLineToArgvW(commandLine, out count);
+        if(pointer==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        try { var result=new string[count]; for(int i=0;i<count;i++) result[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(pointer,i*IntPtr.Size)); return result; }
+        finally { LocalFree(pointer); }
     }
 }
 '@
@@ -240,6 +252,8 @@ function Assert-NoReparsePoint {
 }
 
 function Assert-NoNonLoopbackNetwork {
+    # Primary boundary: a non-admin token with every non-loopback adapter disabled
+    # and no reachable non-loopback route. Polling is defense-in-depth, not a claimed fixed interval.
     $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
         $_.ifIndex -ne 1 -and [string]$_.InterfaceDescription -notmatch '(?i)loopback'
     })
@@ -548,7 +562,8 @@ function Assert-StateEvidencePreserved {
 }
 
 function Assert-IndependentLicenseAudit {
-    param($State,[string]$ProfileRoot,$Fixture)
+    param($State,[string]$StateJson,[string]$ProfileRoot,$Fixture,[string]$FixtureJson)
+    if(-not$State-and$StateJson){$State=$StateJson|ConvertFrom-Json};if(-not$Fixture-and$FixtureJson){$Fixture=$FixtureJson|ConvertFrom-Json}
     $licensePath=Join-Path $ProfileRoot 'AppData\Local\SuperPan\Licensing\v1\licenses.dat'
     Assert-ExactProfileFile -Actual $licensePath -Expected $licensePath -MaximumBytes 1048576 -Label 'License state file'|Out-Null
     $entropy=[Security.Cryptography.SHA256]::Create()
@@ -564,29 +579,55 @@ function Assert-IndependentLicenseAudit {
         $leases=@($credentials[0].leases|Where-Object{[string]$_.software_id-ceq'8270e8d7-1791-487d-ad76-0da7a0cbed12'-and[string]$_.machine_hash-ceq[string]$State.machine_hash})
         if($leases.Count-ne 1){throw 'License ProductId/machine lease is not unique in DPAPI state.'}
         $lease=$leases[0];$expires=[DateTimeOffset]$lease.expires_at;$leaseUntil=[DateTimeOffset]$lease.lease_until
-        if($expires-le[DateTimeOffset]::UtcNow-or $leaseUntil-le[DateTimeOffset]::UtcNow-or $leaseUntil-gt$expires-or $expires.ToString('O')-cne[string]$State.expires_at_utc){throw 'License expiry/lease audit failed.'}
+        if($expires-le[DateTimeOffset]::UtcNow-or $leaseUntil-le[DateTimeOffset]::UtcNow-or $leaseUntil-gt$expires-or $expires.ToString('O')-cne[string]$State.expires_at_utc-or $leaseUntil.ToString('O')-cne[string]$State.lease_until_utc-or[string]$lease.package_name-cne[string]$State.package_name){throw 'License expiry/lease/package audit failed.'}
         try{$envelope=[string]$lease.signed_payload|ConvertFrom-Json;$payload=[Convert]::FromBase64String([string]$envelope.payload);$signature=[Convert]::FromBase64String([string]$envelope.signature)}catch{throw 'Stored signed license envelope is malformed.'}
         if([string]$envelope.key_id-cne[string]$Fixture.license_signing_key_id-or (Get-Utf8Sha256 ([string]$lease.signed_payload))-cne[string]$State.signed_payload_sha256){throw 'Stored license key id or signed-envelope hash audit failed.'}
         $cng=$null;$ecdsa=$null
         try{$cng=Import-P256SubjectPublicKeyInfo ([Convert]::FromBase64String([string]$Fixture.license_signing_spki_base64));$ecdsa=[Security.Cryptography.ECDsaCng]::new($cng);$ecdsa.HashAlgorithm=[Security.Cryptography.CngAlgorithm]::Sha256;if(-not$ecdsa.VerifyData($payload,(Convert-DerEcdsaSignatureToP1363 $signature))){throw 'Stored license production P-256 signature is invalid.'}}
         finally{if($ecdsa){$ecdsa.Dispose()};if($cng){$cng.Dispose()}}
         $claims=$utf8.GetString($payload)|ConvertFrom-Json
-        if([string]$claims.request_id-cne[string]$State.activation_request_id-or[string]$claims.software_id-cne'8270e8d7-1791-487d-ad76-0da7a0cbed12'-or[string]$claims.machine_hash-cne[string]$State.machine_hash-or[string]$claims.decision-cne'allow'-or[string]$claims.code-cne'ok'){throw 'Signed license claims bindings are invalid.'}
+        $claimsExpires=[DateTimeOffset]$claims.expires_at;$claimsLease=[DateTimeOffset]$claims.lease_until;$serverTime=[DateTimeOffset]$claims.server_time
+        if([int]$claims.protocol_version-ne 1-or[string]$claims.request_id-cne[string]$State.activation_request_id-or[string]$claims.software_id-cne'8270e8d7-1791-487d-ad76-0da7a0cbed12'-or[string]$claims.machine_hash-cne[string]$State.machine_hash-or[string]$claims.package_name-cne[string]$lease.package_name-or[string]$claims.card_id-cne[string]$lease.card_id-or$claimsExpires-ne$expires-or$claimsLease-ne$leaseUntil-or$claimsLease-le[DateTimeOffset]::UtcNow-or$claimsLease-gt$claimsExpires-or$serverTime-gt[DateTimeOffset]::UtcNow.AddMinutes(5)-or$serverTime-lt[DateTimeOffset]::UnixEpoch-or[string]$claims.decision-cne'allow'-or[string]$claims.code-cne'ok'){throw 'Signed license protocol/request/software/machine/package/time/decision bindings are invalid.'}
         return [ordered]@{KeyId=[string]$envelope.key_id;SoftwareId=[string]$claims.software_id;MachineHash=[string]$claims.machine_hash;RequestId=[string]$claims.request_id;ExpiresAtUtc=$expires.ToString('O');LeaseUntilUtc=$leaseUntil.ToString('O')}
     } finally { if($plaintext){[Array]::Clear($plaintext,0,$plaintext.Length)} }
+}
+
+function Assert-FileIsExactPrefix {
+    param([string]$Source,[string]$Prefix)
+    $sourceStream=[IO.File]::OpenRead($Source);$prefixStream=[IO.File]::OpenRead($Prefix)
+    try {
+        if($prefixStream.Length-le 0-or$prefixStream.Length-ge$sourceStream.Length){throw 'Partial artifact length is not a strict source prefix.'}
+        $sourceBuffer=New-Object byte[] 65536;$prefixBuffer=New-Object byte[] 65536
+        while(($prefixRead=$prefixStream.Read($prefixBuffer,0,$prefixBuffer.Length))-gt 0){$sourceRead=$sourceStream.Read($sourceBuffer,0,$prefixRead);if($sourceRead-ne$prefixRead){throw 'Partial artifact is not a source prefix.'};for($i=0;$i-lt$prefixRead;$i++){if($sourceBuffer[$i]-ne$prefixBuffer[$i]){throw 'Partial artifact is not a source prefix.'}}}
+    } finally {$sourceStream.Dispose();$prefixStream.Dispose()}
+}
+
+function Assert-UpdaterCommandLine {
+    param($ObservedUpdater,[string]$ObservedUpdaterJson,[string]$ExpectedUpdater,[string]$ExpectedPackage,[string]$InstallRoot,[string]$LocalReleaseSource,[string]$RunId)
+    if(-not$ObservedUpdater-and$ObservedUpdaterJson){$ObservedUpdater=$ObservedUpdaterJson|ConvertFrom-Json}
+    if(-not$ObservedUpdater-or@($ObservedUpdater.ParentPidChain).Count-lt 1){throw 'Observed updater parent PID chain is missing.'}
+    $arguments=@($ObservedUpdater.Arguments)
+    $urlTokens=@($arguments|Where-Object{[string]$_-match'(?i)https?://|^[a-z][a-z0-9+.-]*://'})
+    if($arguments.Count-ne 8-or$urlTokens.Count-ne 0){throw 'Observed updater command line contains an unexpected token or URL.'}
+    $expected=@($ExpectedUpdater,'apply','--package',$ExpectedPackage,'--rootDir',$InstallRoot,'--packageDir',$LocalReleaseSource)
+    foreach($index in @(0,3,5,7)){if(-not[string]::Equals([IO.Path]::GetFullPath([string]$arguments[$index]),[IO.Path]::GetFullPath([string]$expected[$index]),[StringComparison]::OrdinalIgnoreCase)){throw "Observed updater path token $index is not the fixed local apply contract."}}
+    foreach($index in @(1,2,4,6)){if([string]$arguments[$index]-cne[string]$expected[$index]){throw "Observed updater verb token $index is not the fixed local apply contract."}}
+    $marker=Join-Path $LocalReleaseSource ".migration-source-$RunId.json"
+    if(-not(Test-Path -LiteralPath $marker -PathType Leaf)){throw 'Run-owned local release source marker is missing.'}
+    Assert-NoReparseAncestors -ExistingPath $marker -Label 'Local release source marker';Get-FileHardLinkCount $marker|Out-Null
 }
 
 function Assert-UpgradeEvidence {
     param(
         [string]$EvidenceJson, [string]$RunId, [string]$ExpectedChallengeSha256, [string]$Scenario,
-        [string]$AssetKind, [string]$Path, [string]$FailureInjection, [string]$ExpectedAssetSha256,
-        [long]$ExpectedAssetBytes, [string]$ExpectedUpdaterPath, [string]$ObservedUpdaterJson,
+        [string]$AssetKind, [string]$Path, [string]$FailureInjection, [string]$ExpectedAssetPath, [string]$ExpectedAssetSha256,
+        [long]$ExpectedAssetBytes, [string]$ExpectedUpdaterPath, [string]$ExpectedUpdaterPackage, [string]$ObservedUpdaterJson,
         [DateTimeOffset]$WindowStartedUtc, [DateTimeOffset]$WindowCompletedUtc, [string]$RunOwnedRoot
     )
     try { $upgrade = $EvidenceJson | ConvertFrom-Json } catch { throw 'Upgrade evidence JSON is malformed.' }
     if ([string]$upgrade.run_id -cne $RunId -or [string]$upgrade.challenge_sha256 -cne $ExpectedChallengeSha256) { throw 'Upgrade evidence run id or challenge does not match this invocation.' }
     if ([string]$upgrade.scenario -cne $Scenario -or [string]$upgrade.asset_kind -cne $AssetKind -or [string]$upgrade.path -cne $Path -or [string]$upgrade.failure_injection -cne $FailureInjection) { throw 'Upgrade evidence scenario fields do not match this invocation.' }
-    if ([string]$upgrade.source_asset_sha256 -cne $ExpectedAssetSha256 -or [long]$upgrade.source_asset_length -ne $ExpectedAssetBytes) { throw 'Upgrade evidence is not bound to the selected local source asset.' }
+    if (-not[string]::Equals([IO.Path]::GetFullPath([string]$upgrade.source_asset_path),[IO.Path]::GetFullPath($ExpectedAssetPath),[StringComparison]::OrdinalIgnoreCase)-or[string]$upgrade.source_asset_sha256 -cne $ExpectedAssetSha256 -or [long]$upgrade.source_asset_length -ne $ExpectedAssetBytes) { throw 'Upgrade evidence is not bound to the selected local source asset.' }
     try { $observed=$ObservedUpdaterJson|ConvertFrom-Json } catch { throw 'ObservedUpdater evidence is malformed.' }
     if (-not $observed -or [int]$observed.Pid -le 0) { throw 'An independently observed updater process is required.' }
     if ([IO.Path]::GetFullPath([string]$observed.Path) -cne [IO.Path]::GetFullPath($ExpectedUpdaterPath) -or
@@ -603,6 +644,7 @@ function Assert-UpgradeEvidence {
         }
     } elseif ($FailureInjection -ceq 'DownloadInterrupted') {
         $partial=Assert-StrictChildPath -Candidate ([string]$upgrade.partial_artifact_path) -Root $RunOwnedRoot -Label 'Partial download artifact'
+        if(-not[string]::Equals([IO.Path]::GetFullPath($partial),[IO.Path]::GetFullPath($ExpectedUpdaterPackage),[StringComparison]::OrdinalIgnoreCase)){throw 'Driver partial artifact is not the script-created updater package.'}
         if (-not (Test-Path -LiteralPath $partial -PathType Leaf)) { throw 'Partial download artifact was not created.' }
         Assert-NoReparseAncestors -ExistingPath $partial -Label 'Partial download artifact'
         $partialInfo=Get-Item -LiteralPath $partial
@@ -611,9 +653,16 @@ function Assert-UpgradeEvidence {
             [string]$upgrade.old_version_after_failure -cne '1.1.0' -or [string]$upgrade.outcome -cne 'failed-and-rolled-back') {
             throw 'DownloadInterrupted did not prove a real updater/UpdateManager failure over an independently hashed partial artifact and 1.1.0 rollback.'
         }
+        Assert-FileIsExactPrefix -Source ([string]$upgrade.source_asset_path) -Prefix $partial
     } else {
         $hook=Assert-StrictChildPath -Candidate ([string]$upgrade.candidate_hook_trace_path) -Root $RunOwnedRoot -Label 'Candidate failure hook trace'
-        if (-not (Test-Path -LiteralPath $hook -PathType Leaf) -or [string]$upgrade.candidate_hook_challenge_sha256 -cne $ExpectedChallengeSha256 -or [string]$upgrade.candidate_hook_trace_sha256 -cne (Get-StreamingSha256 $hook) -or
+        if(-not(Test-Path -LiteralPath $hook -PathType Leaf)){throw 'Candidate failure hook trace is missing.'};Assert-NoReparseAncestors -ExistingPath $hook -Label 'Candidate failure hook trace';Get-FileHardLinkCount $hook|Out-Null
+        [byte[]]$hookBytes=[IO.File]::ReadAllBytes($hook);$hookUtf8=New-Object Text.UTF8Encoding($false,$true)
+        try{$hookJson=$hookUtf8.GetString($hookBytes);$hookRecord=$hookJson|ConvertFrom-Json}catch{throw 'Candidate hook trace is not canonical UTF-8 JSON.'}
+        $hookNames=@($hookRecord.PSObject.Properties.Name|Sort-Object);$expectedHookNames=@('challenge_sha256','created_utc','run_id','scenario','source_sha256')
+        $hookCreated=[DateTimeOffset]::MinValue
+        if(($hookNames-join"`n")-cne($expectedHookNames-join"`n")-or(ConvertTo-CanonicalJson $hookRecord)+"`n"-cne$hookJson-or-not[DateTimeOffset]::TryParseExact([string]$hookRecord.created_utc,'O',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$hookCreated)-or$hookCreated-lt$WindowStartedUtc-or$hookCreated-gt$WindowCompletedUtc-or[string]$hookRecord.run_id-cne$RunId-or[string]$hookRecord.challenge_sha256-cne$ExpectedChallengeSha256-or[string]$hookRecord.source_sha256-cne$ExpectedAssetSha256-or[string]$hookRecord.scenario-cne$Scenario){throw 'Candidate hook trace contract is stale or not bound to this run.'}
+        if ([string]$upgrade.candidate_hook_challenge_sha256 -cne $ExpectedChallengeSha256 -or [string]$upgrade.candidate_hook_trace_sha256 -cne (Get-StreamingSha256 $hook) -or
             $upgrade.updater_invoked -ne $true -or [int]$upgrade.updater_exit_code -eq 0 -or $upgrade.update_manager_succeeded -ne $false -or [string]$upgrade.update_manager_stage -cne 'apply-failed' -or $upgrade.fault_observed -ne $true -or
             [string]$upgrade.old_version_after_failure -cne '1.1.0' -or [string]$upgrade.outcome -cne 'failed-and-rolled-back') {
             throw 'ApplicationFailed did not prove an observed updater nonzero exit, challenge-bound candidate hook, UpdateManager failure, and 1.1.0 rollback.'
@@ -693,9 +742,11 @@ function Invoke-MonitoredProcess {
     Assert-NoNonLoopbackNetwork | Out-Null
     $process = Start-Process -FilePath $File -ArgumentList (ConvertTo-NativeCommandLine $Arguments) -WorkingDirectory $WorkingDirectory -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -NoNewWindow -PassThru
     $observedUpdater = $null
+    $maximumPollMilliseconds=0.0
     try {
         $deadline = $started.AddSeconds($TimeoutSeconds)
         while (-not $process.HasExited) {
+            $pollStarted=[DateTimeOffset]::UtcNow
             try { Assert-NoNonLoopbackNetwork | Out-Null } catch { Stop-OwnedProcessTree -RootProcessId $process.Id; throw }
             $snapshot=@(Get-CimInstance Win32_Process -ErrorAction Stop)
             $descendantIds=New-Object Collections.Generic.List[int]
@@ -709,13 +760,18 @@ function Invoke-MonitoredProcess {
                     [string]::Equals([IO.Path]::GetFullPath([string]$candidate.ExecutablePath), [IO.Path]::GetFullPath($ExpectedUpdater), [StringComparison]::OrdinalIgnoreCase)) {
                     $creation=$candidate.CreationDate
                     $creationUtc=if($creation-is[DateTime]){([DateTime]$creation).ToUniversalTime()}else{[Management.ManagementDateTimeConverter]::ToDateTime([string]$creation).ToUniversalTime()}
-                    $observedUpdater = [ordered]@{ Pid=[int]$candidate.ProcessId; Path=[IO.Path]::GetFullPath([string]$candidate.ExecutablePath); StartedUtc=$creationUtc.ToString('O') }
+                    $parentChain=New-Object Collections.Generic.List[object];$cursor=$candidate
+                    while($cursor-and[int]$cursor.ProcessId-ne$process.Id){$parentChain.Add([ordered]@{Pid=[int]$cursor.ProcessId;ParentPid=[int]$cursor.ParentProcessId});$parentId=[int]$cursor.ParentProcessId;$cursor=@($snapshot|Where-Object{[int]$_.ProcessId-eq$parentId})|Select-Object -First 1}
+                    if(-not$cursor-or[int]$cursor.ProcessId-ne$process.Id){throw 'Observed updater parent PID chain did not terminate at the trusted driver.'}
+                    [string[]]$parsedArguments=[MigrationNativeCommandLine]::Split([string]$candidate.CommandLine)
+                    $observedUpdater = [ordered]@{ Pid=[int]$candidate.ProcessId; ParentPidChain=$parentChain.ToArray(); Path=[IO.Path]::GetFullPath([string]$candidate.ExecutablePath); CommandLine=[string]$candidate.CommandLine; Arguments=$parsedArguments; StartedUtc=$creationUtc.ToString('O') }
                 }
             }
             foreach ($outputPath in @($stdoutPath,$stderrPath)) {
                 if ((Test-Path -LiteralPath $outputPath) -and (Get-Item -LiteralPath $outputPath).Length -gt $script:MaximumDriverOutputBytes) { Stop-OwnedProcessTree -RootProcessId $process.Id; throw 'Bounded process output exceeded the byte limit.' }
             }
             if ([DateTimeOffset]::UtcNow -ge $deadline) { Stop-OwnedProcessTree -RootProcessId $process.Id; throw "Bounded process timed out after $TimeoutSeconds seconds." }
+            $pollMilliseconds=([DateTimeOffset]::UtcNow-$pollStarted).TotalMilliseconds;if($pollMilliseconds-gt$maximumPollMilliseconds){$maximumPollMilliseconds=$pollMilliseconds}
             Start-Sleep -Milliseconds 20
             $process.Refresh()
         }
@@ -727,7 +783,7 @@ function Invoke-MonitoredProcess {
         $utf8 = New-Object Text.UTF8Encoding($false, $true)
         try { $stdout=$utf8.GetString($stdoutBytes); $stderr=$utf8.GetString($stderrBytes) } catch { throw 'Bounded process output is not strict UTF-8.' }
         $process.Refresh();$exitCode=[int]$process.ExitCode;$processId=[int]$process.Id
-        return [pscustomobject]@{ ExitCode=$exitCode; StandardOutput=$stdout; StandardError=$stderr; ProcessId=$processId; StartedUtc=$started.ToString('O'); CompletedUtc=[DateTimeOffset]::UtcNow.ToString('O'); ObservedUpdater=$observedUpdater }
+        return [pscustomobject]@{ ExitCode=$exitCode; StandardOutput=$stdout; StandardError=$stderr; ProcessId=$processId; StartedUtc=$started.ToString('O'); CompletedUtc=[DateTimeOffset]::UtcNow.ToString('O'); ObservedUpdater=$observedUpdater; MaximumOfflinePollMilliseconds=$maximumPollMilliseconds }
     } finally {
         $process.Dispose()
         foreach ($ownedOutput in @($stdoutPath,$stderrPath)) {
@@ -892,7 +948,7 @@ $evidence = [ordered]@{
     AssetSource = 'caller-supplied-local-directories'; AssetKind = $AssetKind; Path = $Path
     Scenario = "$AssetKind-$Path"; FailureInjection = $FailureInjection; Succeeded = $false
     FailureRollbackVerified = $false; VelopackUpdaterVersion = $null; Upgrade = $null
-    Surfaces = $null; BeforeState = $null; AfterState = $null; BeforeLicenseAudit=$null; AfterLicenseAudit=$null; Error = $null
+    Surfaces = $null; BeforeState = $null; AfterState = $null; BeforeLicenseAudit=$null; AfterLicenseAudit=$null; MaximumOfflinePollMilliseconds=$null; Error = $null
 }
 
 try {
@@ -959,6 +1015,7 @@ try {
     }
     Assert-PublisherExecutable -Executable $oldMain
     if (-not (Test-Path -LiteralPath $updater -PathType Leaf)) { throw 'Velopack Update.exe is missing from the fixed install root.' }
+    Assert-NoReparseAncestors -ExistingPath $updater -Label 'Installed Velopack updater';Get-FileHardLinkCount -File $updater|Out-Null;Assert-PublisherExecutable -Executable $updater
     $evidence.VelopackUpdaterVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($updater).ProductVersion
 
     $commonDriverArguments = @('--run-id',$runId,'--profile-root',$profile,'--fixture',$fixturePath)
@@ -976,15 +1033,29 @@ try {
     }
     $selectedAssetHash = Get-StreamingSha256 -File $selectedAsset
     $selectedAssetBytes = (Get-Item -LiteralPath $selectedAsset).Length
+    if($selectedAssetBytes-lt 2){throw 'Selected local update asset is too small.'}
+    $localReleaseSource=Join-Path $evidenceRoot "local-release-source-$runId"
+    New-Item -ItemType Directory -Path $localReleaseSource|Out-Null;$script:OwnedPaths.Add($localReleaseSource)
+    Write-CanonicalJson -Value ([ordered]@{run_id=$runId;source_asset_sha256=$selectedAssetHash}) -Destination (Join-Path $localReleaseSource ".migration-source-$runId.json") -CreateNew
+    $updaterPackage=Join-Path $localReleaseSource ([IO.Path]::GetFileName($selectedAsset))
+    if($FailureInjection-ceq'DownloadInterrupted'){
+        $updaterPackage=Join-Path $localReleaseSource 'interrupted-partial.nupkg'
+        $input=[IO.File]::OpenRead($selectedAsset);$output=[IO.File]::Open($updaterPackage,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try{$remaining=[Math]::Max(1,[Math]::Floor($input.Length/3));$buffer=New-Object byte[] 65536;while($remaining-gt 0){$read=$input.Read($buffer,0,[Math]::Min($buffer.Length,$remaining));if($read-le 0){break};$output.Write($buffer,0,$read);$remaining-=$read}}finally{$input.Dispose();$output.Dispose()}
+        Assert-FileIsExactPrefix -Source $selectedAsset -Prefix $updaterPackage
+    }else{Copy-Item -LiteralPath $selectedAsset -Destination $updaterPackage}
+    Assert-NoReparseAncestors -ExistingPath $updaterPackage -Label 'Script-created updater package';Get-FileHardLinkCount -File $updaterPackage|Out-Null
     $restartStarted = [DateTimeOffset]::UtcNow
     $upgradeChallenge=New-RunChallenge
     $upgradeRun = Invoke-BoundedDriver -Driver $driver -WorkingDirectory $stagedOld -Arguments @(
         'perform-upgrade','--challenge',$upgradeChallenge.Base64,'--run-id',$runId,'--profile-root',$profile,'--fixture',$fixturePath,
         '--old-assets',$stagedOld,'--new-assets',$stagedNew,'--install-root',$installRoot,
-        '--asset',$selectedAsset,'--asset-kind',$AssetKind,'--path',$Path,'--failure-injection',$FailureInjection
+        '--asset',$selectedAsset,'--updater-package',$updaterPackage,'--local-release-source',$localReleaseSource,'--asset-kind',$AssetKind,'--path',$Path,'--failure-injection',$FailureInjection
     ) -TimeoutSeconds 300 -ExpectedUpdater $updater -RequireUpdaterObservation
+    $evidence.MaximumOfflinePollMilliseconds=$upgradeRun.MaximumOfflinePollMilliseconds
+    Assert-UpdaterCommandLine -ObservedUpdater $upgradeRun.ObservedUpdater -ExpectedUpdater $updater -ExpectedPackage $updaterPackage -InstallRoot $installRoot -LocalReleaseSource $localReleaseSource -RunId $runId
     $upgrade = Assert-UpgradeEvidence -EvidenceJson $upgradeRun.StandardOutput -RunId $runId -ExpectedChallengeSha256 $upgradeChallenge.Sha256 -Scenario $evidence.Scenario -AssetKind $AssetKind -Path $Path -FailureInjection $FailureInjection `
-        -ExpectedAssetSha256 $selectedAssetHash -ExpectedAssetBytes $selectedAssetBytes -ExpectedUpdaterPath $updater -ObservedUpdaterJson (ConvertTo-CanonicalJson $upgradeRun.ObservedUpdater) `
+        -ExpectedAssetPath $selectedAsset -ExpectedAssetSha256 $selectedAssetHash -ExpectedAssetBytes $selectedAssetBytes -ExpectedUpdaterPath $updater -ExpectedUpdaterPackage $updaterPackage -ObservedUpdaterJson (ConvertTo-CanonicalJson $upgradeRun.ObservedUpdater) `
         -WindowStartedUtc $upgradeRun.StartedUtc -WindowCompletedUtc $upgradeRun.CompletedUtc -RunOwnedRoot $evidenceRoot
     $evidence.Upgrade = $upgrade
 
