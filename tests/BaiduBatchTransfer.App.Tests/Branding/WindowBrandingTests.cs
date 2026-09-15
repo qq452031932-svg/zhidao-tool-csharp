@@ -6,7 +6,7 @@ namespace BaiduBatchTransfer.App.Tests.Branding;
 
 public sealed class WindowBrandingTests
 {
-    private const string ProductIconResource = "{StaticResource ProductWindowIcon}";
+    private const string ProductIconResource = "{DynamicResource ProductWindowIcon}";
     private const string ProductIconPackUri = "/知道综合工具;component/Assets/Branding/知道综合工具.png";
     private static readonly XNamespace Presentation = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
     private static readonly XNamespace Xaml = "http://schemas.microsoft.com/winfx/2006/xaml";

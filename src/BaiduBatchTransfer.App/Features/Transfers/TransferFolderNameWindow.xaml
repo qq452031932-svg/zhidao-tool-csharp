@@ -1,7 +1,7 @@
 <Window x:Class="BaiduBatchTransfer.App.Features.Transfers.TransferFolderNameWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="新建文件夹" Icon="{StaticResource ProductWindowIcon}"
+        Title="新建文件夹" Icon="{DynamicResource ProductWindowIcon}"
         Width="380" Height="170" ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
     <Grid Margin="18">

@@ -138,7 +138,7 @@ public sealed class ShareAnalyticsViewStructureTests
                 resources.ReplaceNodes(new XElement(Presentation + "ResourceDictionary",
                     new XElement(Presentation + "ResourceDictionary.MergedDictionaries",
                         new XElement(Presentation + "ResourceDictionary", new XAttribute("Source",
-                            "/BaiduBatchTransfer.App;component/Styles/SuperPanTheme.xaml"))), existingResources));
+                            "/知道综合工具;component/Styles/SuperPanTheme.xaml"))), existingResources));
                 var view = Assert.IsType<UserControl>(XamlReader.Parse(document.ToString()));
                 view.FontFamily = new System.Windows.Media.FontFamily("Microsoft YaHei UI");
                 view.FontSize = 14;

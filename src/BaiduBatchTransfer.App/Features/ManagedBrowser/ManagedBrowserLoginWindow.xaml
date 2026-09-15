@@ -1,7 +1,7 @@
 <Window x:Class="BaiduBatchTransfer.App.Features.ManagedBrowser.ManagedBrowserLoginWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="{Binding Title}" Icon="{StaticResource ProductWindowIcon}"
+        Title="{Binding Title}" Icon="{DynamicResource ProductWindowIcon}"
         Width="650" SizeToContent="Height" ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner">
     <StackPanel Margin="24">

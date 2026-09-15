@@ -1,7 +1,7 @@
 <Window x:Class="BaiduBatchTransfer.App.Features.Acceptance.AcceptanceConfirmationWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="真实写操作现场验收" Icon="{StaticResource ProductWindowIcon}" Width="560" Height="390"
+        Title="真实写操作现场验收" Icon="{DynamicResource ProductWindowIcon}" Width="560" Height="390"
         WindowStartupLocation="CenterOwner" ResizeMode="NoResize">
     <Grid Margin="24">
         <Grid.RowDefinitions>

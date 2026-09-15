@@ -6,8 +6,11 @@ using System.Threading.Channels;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
+[Collection(NonParallelCollection)]
 public sealed partial class ManagedBrowserHelperClientTests
 {
+    public const string NonParallelCollection = "Managed browser helper client timing tests";
+
     private static readonly ManagedBrowserHelperClientOptions Fast = new(
         TimeSpan.FromMilliseconds(300), TimeSpan.FromMilliseconds(120), TimeSpan.FromMilliseconds(100));
 
@@ -724,3 +727,6 @@ public sealed partial class ManagedBrowserHelperClientTests
         }
     }
 }
+
+[CollectionDefinition(ManagedBrowserHelperClientTests.NonParallelCollection, DisableParallelization = true)]
+public sealed class ManagedBrowserHelperClientTimingTestCollection;

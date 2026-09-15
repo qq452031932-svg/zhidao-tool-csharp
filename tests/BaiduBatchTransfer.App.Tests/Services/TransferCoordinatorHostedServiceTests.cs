@@ -184,13 +184,14 @@ public sealed class TransferCoordinatorHostedServiceTests
         public TaskCompletionSource Reconciled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Guid? OperationId { get; private set; }
 
-        public Task<TransferConfirmation> ReconcileAsync(
+        public async Task<TransferConfirmation> ReconcileAsync(
             Guid operationId,
             CancellationToken cancellationToken = default)
         {
             OperationId = operationId;
             Reconciled.TrySetResult();
-            return Task.FromResult(TransferConfirmation.ConfirmedPresent);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return TransferConfirmation.ConfirmedPresent;
         }
     }
 

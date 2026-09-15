@@ -816,7 +816,7 @@ public sealed class JobResultsViewModelTests
                     <UserControl.Resources>
                         <ResourceDictionary>
                             <ResourceDictionary.MergedDictionaries>
-                                <ResourceDictionary Source="/BaiduBatchTransfer.App;component/Styles/SuperPanTheme.xaml" />
+                                <ResourceDictionary Source="/知道综合工具;component/Styles/SuperPanTheme.xaml" />
                             </ResourceDictionary.MergedDictionaries>
                         </ResourceDictionary>
                     </UserControl.Resources>

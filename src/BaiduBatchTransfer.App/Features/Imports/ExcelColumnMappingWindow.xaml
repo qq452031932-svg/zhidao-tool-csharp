@@ -1,7 +1,7 @@
 <Window x:Class="BaiduBatchTransfer.App.Features.Imports.ExcelColumnMappingWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="确认 Excel 列对应" Icon="{StaticResource ProductWindowIcon}" Width="820" Height="620"
+        Title="确认 Excel 列对应" Icon="{DynamicResource ProductWindowIcon}" Width="820" Height="620"
         MinWidth="680" MinHeight="480" WindowStartupLocation="CenterOwner"
         AutomationProperties.Name="Excel 列对应确认窗口">
     <Grid Margin="18">
