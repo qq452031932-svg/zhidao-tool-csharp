@@ -281,7 +281,7 @@ Expected: PASS。
 
 Run: `dotnet publish src/BaiduBatchTransfer.LegacyLauncher/BaiduBatchTransfer.LegacyLauncher.csproj -c Release -r win-x64 --self-contained true -o .artifacts/legacy-launcher-check`
 
-Expected: 生成可独立运行的单文件 `BaiduBatchTransfer.App.exe`；把该 EXE 单独复制到空目录仍能执行缺少目标时的安全失败路径，且不包含主程序业务程序集。
+Expected: 生成可独立运行的单文件 `BaiduBatchTransfer.App.exe`；把该 EXE 单独复制到空目录时显示规范要求的可见错误并返回非零退出码，且不包含主程序业务程序集。记录最终文件大小；如果自包含单文件明显偏大，则改用 framework-dependent apphost 并把其完整最小依赖集纳入包和验证器，不能只复制不可运行的 EXE。
 
 - [ ] **Step 5: 提交**
 
@@ -375,7 +375,7 @@ git commit -m "build: package renamed application entry point"
 
 - [ ] **Step 1: 添加失败夹具与断言**
 
-覆盖缺少中文 EXE/DLL/deps/runtimeconfig、mainExe 仍为旧名、缺少兼容入口、品牌元数据错误、图标缺失、任一 EXE 签名/发布者/架构不一致、Delta 未表达旧名删除与中文名新增等情况。
+覆盖缺少中文 EXE/DLL/deps/runtimeconfig、mainExe 仍为旧名、缺少兼容入口、品牌元数据错误、图标缺失、任一 EXE 签名/发布者/架构不一致、Delta 未表达“旧业务 EXE 内容替换为兼容入口 + 中文主程序新增”等情况。
 
 - [ ] **Step 2: 验证新增测试先失败**
 
@@ -419,7 +419,7 @@ Expected: FAIL，服务端验证器仍写死旧业务产物。
 
 - [ ] **Step 2: 使用生成的 Go 常量迁移验证器**
 
-`package_structure.go` 不再含中文/旧名产品字面量；它从 `product_identity_generated.go` 使用主 EXE、主程序集和兼容 EXE 常量。Delta 必须允许并验证“旧业务主程序删除/中文主程序新增”的迁移结构，同时继续拒绝任意可执行文件注入。
+`package_structure.go` 不再含中文/旧名产品字面量；它从 `product_identity_generated.go` 使用主 EXE、主程序集和兼容 EXE 常量。Delta 必须允许并验证“旧路径上的业务 EXE 被替换或补丁为兼容入口，同时新增中文主程序”的迁移结构；不得要求删除仍需长期保留的旧路径，并继续拒绝任意可执行文件注入。
 
 - [ ] **Step 3: 运行 Go 与生成一致性测试**
 
