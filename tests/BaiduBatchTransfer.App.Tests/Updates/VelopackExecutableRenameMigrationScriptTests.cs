@@ -88,23 +88,22 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
     }
 
     [Fact]
-    public void UpgradeIsDelegatedToTrustedDriverWithRealFailureEvidenceContract()
+    public void ScriptDirectlyLaunchesTheVerifiedUpdaterInASuspendedContainedJob()
     {
         var script = ReadScript();
 
-        Assert.Contains("perform-upgrade", script, StringComparison.Ordinal);
-        Assert.Contains("Assert-UpgradeEvidence", script, StringComparison.Ordinal);
-        Assert.Contains("update_manager_invoked", script, StringComparison.Ordinal);
-        Assert.Contains("updater_invoked", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("'perform-upgrade'", script, StringComparison.Ordinal);
+        Assert.Contains("MigrationContainedRunner", script, StringComparison.Ordinal);
+        Assert.Contains("CREATE_SUSPENDED", script, StringComparison.Ordinal);
+        Assert.Contains("AssignProcessToJobObject", script, StringComparison.Ordinal);
+        Assert.Contains("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", script, StringComparison.Ordinal);
+        Assert.Contains("@('apply','--package'", script, StringComparison.Ordinal);
         Assert.Contains("source_asset_sha256", script, StringComparison.Ordinal);
         Assert.Contains("DownloadInterrupted", script, StringComparison.Ordinal);
         Assert.Contains("ApplicationFailed", script, StringComparison.Ordinal);
-        Assert.Contains("fault_observed", script, StringComparison.Ordinal);
-        Assert.Contains("bytes_consumed", script, StringComparison.Ordinal);
-        Assert.Contains("old_version_after_failure", script, StringComparison.Ordinal);
-        Assert.Contains("ObservedUpdater", script, StringComparison.Ordinal);
+        Assert.Contains("Assert-ArtifactReadLockUnchanged", script, StringComparison.Ordinal);
+        Assert.Contains("MigrationFileIdentity", script, StringComparison.Ordinal);
         Assert.Contains("challenge_sha256", script, StringComparison.Ordinal);
-        Assert.Contains("update_manager_stage", script, StringComparison.Ordinal);
         Assert.Contains("partial_artifact_path", script, StringComparison.Ordinal);
     }
 
@@ -231,51 +230,127 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         finally { Directory.Delete(root, recursive: true); }
     }
 
+    [Theory]
+    [InlineData("1.1.10")]
+    [InlineData("1.1.01")]
+    [InlineData("1.1.0.0")]
+    public async Task NonExactOrNonCanonicalVersionsAreRejected(string actual)
+    {
+        var result = await RunFunctionAsync("Assert-CanonicalSemverText", new Dictionary<string, string> { ["Actual"] = actual, ["Expected"] = "1.1.0" });
+        Assert.NotEqual(0, result.ExitCode);
+    }
+
     [Fact]
-    public async Task TestScriptCopyActuallyObservesUpdaterProcessWithoutClaimingUpgradeSuccess()
+    public async Task NonMinimalDerEcdsaIntegerIsRejected()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-der-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var signature = System.IO.Path.Combine(root, "signature.bin");
+        try
+        {
+            await File.WriteAllBytesAsync(signature, [0x30,0x07,0x02,0x02,0x00,0x01,0x02,0x01,0x01]);
+            var result = await RunFunctionAsync("Assert-DerEcdsaSignatureFile", new Dictionary<string, string> { ["SignaturePath"] = signature });
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("integer", result.Output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task SpoofedUninstallArgumentsAreRejected()
+    {
+        var result = await RunFunctionAsync("Assert-UninstallCommandLine", new Dictionary<string, string>
+        {
+            ["CommandLine"] = "\"C:\\app\\Update.exe\" --uninstall --silent", ["ExpectedUpdater"] = "C:\\app\\Update.exe",
+        });
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("exact", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PortableZipTraversalIsRejectedBeforeExtraction()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-zip-{Guid.NewGuid():N}");
+        var destination = System.IO.Path.Combine(root, "destination");
+        Directory.CreateDirectory(destination);
+        var archive = System.IO.Path.Combine(root, "portable.zip");
+        try
+        {
+            using (var zip = System.IO.Compression.ZipFile.Open(archive, System.IO.Compression.ZipArchiveMode.Create))
+            using (var writer = new StreamWriter(zip.CreateEntry("../escape.txt").Open())) { writer.Write("escape"); }
+            var result = await RunFunctionAsync("Expand-LocalPortableAsset", new Dictionary<string, string> { ["Archive"] = archive, ["Destination"] = destination });
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.False(File.Exists(System.IO.Path.Combine(root, "escape.txt")));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public void PortableZipLimitsAreExplicit()
+    {
+        var script = ReadScript();
+        Assert.Contains("4096", script, StringComparison.Ordinal);
+        Assert.Contains("536870912", script, StringComparison.Ordinal);
+        Assert.Contains("2147483648", script, StringComparison.Ordinal);
+        Assert.Contains("compression ratio exceeds 200", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PortableZipEntryCountAndCompressionBombAreRejectedBehaviorally()
+    {
+        var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-zip-limits-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var countArchive = System.IO.Path.Combine(root, "count.zip");
+            using (var zip = System.IO.Compression.ZipFile.Open(countArchive, System.IO.Compression.ZipArchiveMode.Create))
+                for (var index = 0; index < 4097; index++) zip.CreateEntry($"e{index}");
+            var countDestination = System.IO.Path.Combine(root, "count-output");
+            Directory.CreateDirectory(countDestination);
+            var countResult = await RunFunctionAsync("Expand-LocalPortableAsset", new Dictionary<string, string> { ["Archive"] = countArchive, ["Destination"] = countDestination });
+            Assert.NotEqual(0, countResult.ExitCode);
+            Assert.Contains("entry count", countResult.Output, StringComparison.OrdinalIgnoreCase);
+
+            var bombArchive = System.IO.Path.Combine(root, "bomb.zip");
+            using (var zip = System.IO.Compression.ZipFile.Open(bombArchive, System.IO.Compression.ZipArchiveMode.Create))
+            using (var stream = zip.CreateEntry("zeros.bin", System.IO.Compression.CompressionLevel.Optimal).Open())
+                stream.Write(new byte[1024 * 1024]);
+            var bombDestination = System.IO.Path.Combine(root, "bomb-output");
+            Directory.CreateDirectory(bombDestination);
+            var bombResult = await RunFunctionAsync("Expand-LocalPortableAsset", new Dictionary<string, string> { ["Archive"] = bombArchive, ["Destination"] = bombDestination });
+            Assert.NotEqual(0, bombResult.ExitCode);
+            Assert.Contains("compression ratio", bombResult.Output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task ContainedRunnerCapturesAnImmediatelyExitingProcess()
     {
         var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rename-orchestration-{Guid.NewGuid():N}");
         Directory.CreateDirectory(root);
-        var updater = System.IO.Path.Combine(root, "Update.exe");
-        var driver = System.IO.Path.Combine(root, "driver.ps1");
+        var updater = System.IO.Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
         var harness = System.IO.Path.Combine(root, "harness.ps1");
-        File.Copy(System.IO.Path.Combine(Environment.SystemDirectory, "cmd.exe"), updater);
         try
         {
-            await File.WriteAllTextAsync(driver, """
-                param([string]$Updater,[string]$ChallengeSha)
-                $started=[DateTimeOffset]::UtcNow
-                $child=Start-Process -FilePath $Updater -ArgumentList '/d','/c','timeout /t 2 /nobreak >nul' -PassThru
-                $cim=Get-CimInstance Win32_Process -Filter "ProcessId=$($child.Id)"
-                $creation=$cim.CreationDate
-                $creationUtc=if($creation-is[DateTime]){([DateTime]$creation).ToUniversalTime()}else{[Management.ManagementDateTimeConverter]::ToDateTime([string]$creation).ToUniversalTime()}
-                $childStarted=$creationUtc.ToString('O')
-                $child.WaitForExit()
-                $record=[ordered]@{asset_kind='Setup';challenge_sha256=$ChallengeSha;completed_utc=[DateTimeOffset]::UtcNow.ToString('O');failure_injection='None';outcome='updated';path='Full';run_id='RUN';scenario='Setup-Full';source_asset_length=100;source_asset_sha256=('a'*64);started_utc=$started.ToString('O');update_manager_invoked=$true;update_manager_stage='apply-completed';update_manager_succeeded=$true;updater_exit_code=$child.ExitCode;updater_invoked=$true;updater_path=[IO.Path]::GetFullPath($Updater);updater_pid=$child.Id;updater_started_utc=$childStarted}
-                [Console]::Out.Write(($record|ConvertTo-Json -Compress)+"`n")
-                """, new UTF8Encoding(false));
             await File.WriteAllTextAsync(harness, """
-                param([string]$ScriptPath,[string]$Driver,[string]$Updater,[string]$WorkingDirectory)
+                param([string]$ScriptPath,[string]$Updater,[string]$WorkingDirectory)
                 $ErrorActionPreference='Stop'
-                Add-Type -TypeDefinition @'
-                using System;using System.Runtime.InteropServices;
-                public static class MigrationNativeCommandLine {
-                  [DllImport("shell32.dll",SetLastError=true)]static extern IntPtr CommandLineToArgvW(string c,out int n);
-                  [DllImport("kernel32.dll")]static extern IntPtr LocalFree(IntPtr p);
-                  public static string[] Split(string c){int n;var p=CommandLineToArgvW(c,out n);var r=new string[n];try{for(int i=0;i<n;i++)r[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(p,i*IntPtr.Size));return r;}finally{LocalFree(p);}}
-                }
-                '@
-                $tokens=$null;$errors=$null
-                $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
+                $text=[IO.File]::ReadAllText($ScriptPath)
+                $match=[regex]::Match($text,"(?s)Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
+                if(-not$match.Success){throw 'Type block missing.'}
+                $source=$match.Groups[1].Value -replace 'static bool Offline\(\)\{foreach\(var n.*?return true;\}','static bool Offline(){return true;}'
+                Add-Type -TypeDefinition $source
+                $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
                 foreach($function in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]},$true))){Invoke-Expression $function.Extent.Text}
-                function Assert-NoNonLoopbackNetwork{return @{TestOverride=$true}}
-                $script:MaximumDriverOutputBytes=1048576
-                $challenge='e'*64
-                $run=Invoke-BoundedDriver -Driver "$PSHOME\powershell.exe" -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$Driver,'-Updater',$Updater,'-ChallengeSha',$challenge) -WorkingDirectory $WorkingDirectory -TimeoutSeconds 15 -ExpectedUpdater $Updater -RequireUpdaterObservation
-                if(-not$run.ObservedUpdater-or$run.ObservedUpdater.Pid-le 0){throw 'Monitor helper did not observe updater.'}
+                $lockedFile=Join-Path $WorkingDirectory 'locked.bin';[IO.File]::WriteAllBytes($lockedFile,[byte[]](1,2,3,4))
+                $lock=Open-ArtifactReadLock -File $lockedFile -Label 'test locked file'
+                try{$blocked=$false;try{[IO.File]::Delete($lockedFile)}catch [IO.IOException]{$blocked=$true};if(-not$blocked){throw 'Replacement/delete was not blocked by the artifact lock.'};Assert-ArtifactReadLockUnchanged $lock}finally{$lock.Stream.Dispose()}
+                $run=[MigrationContainedRunner]::Run($Updater,@('-NoProfile','-Command','exit 7'),$WorkingDirectory,(Join-Path $WorkingDirectory 'out.log'),(Join-Path $WorkingDirectory 'err.log'),5000,65536)
+                if($run.ProcessId-le 0-or$run.ExitCode-ne 7-or-not$run.SafeToCleanup-or$run.Failure){throw ($run|ConvertTo-Json -Compress)}
                 """, new UTF8Encoding(false));
             var startInfo = PowerShell();
-            foreach (var argument in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-Driver", driver, "-Updater", updater, "-WorkingDirectory", root }) startInfo.ArgumentList.Add(argument);
+            foreach (var argument in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness, "-ScriptPath", ScriptPath(), "-Updater", updater, "-WorkingDirectory", root }) startInfo.ArgumentList.Add(argument);
             using var process = Process.Start(startInfo)!;
             var output = await process.StandardOutput.ReadToEndAsync() + await process.StandardError.ReadToEndAsync();
             await process.WaitForExitAsync();
@@ -301,7 +376,7 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             var signaturePath = fixturePath + ".sig";
             await File.WriteAllBytesAsync(certPath, certificate.Export(X509ContentType.Cert));
             var fixtureBytes = new UTF8Encoding(false).GetBytes(
-                "{\"license_signing_key_id\":\"production-key-1\",\"license_signing_spki_base64\":\"" + Convert.ToBase64String(licenseKey.ExportSubjectPublicKeyInfo()) + "\",\"new_delta_file\":\"new-delta.nupkg\",\"new_full_file\":\"new-full.nupkg\",\"old_full_file\":\"old-full.nupkg\",\"old_portable_file\":\"old.zip\",\"old_setup_file\":\"old.exe\",\"schema_version\":1,\"state_driver_file\":\"driver.exe\",\"state_driver_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n");
+                "{\"application_failure_hook_relative_path\":\"current\\\\application-failure.json\",\"application_failure_package_file\":\"application-failure.nupkg\",\"license_signing_key_id\":\"production-key-1\",\"license_signing_spki_base64\":\"" + Convert.ToBase64String(licenseKey.ExportSubjectPublicKeyInfo()) + "\",\"new_delta_file\":\"new-delta.nupkg\",\"new_full_file\":\"new-full.nupkg\",\"old_full_file\":\"old-full.nupkg\",\"old_portable_file\":\"old.zip\",\"old_setup_file\":\"old.exe\",\"schema_version\":1,\"state_driver_file\":\"driver.exe\",\"state_driver_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n");
             await File.WriteAllBytesAsync(fixturePath, fixtureBytes);
             await File.WriteAllBytesAsync(signaturePath, wrongKey.SignData(fixtureBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1));
             var pin = Convert.ToHexString(SHA256.HashData(certificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
@@ -357,6 +432,37 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
             var result = await RunFunctionAsync("Assert-NoReparsePoint", new Dictionary<string, string>
             {
                 ["ExistingPath"] = link, ["Label"] = "fixture asset",
+            });
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("reparse", result.Output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            if (Directory.Exists(link)) Directory.Delete(link);
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ProfileEvidenceJunctionIsRejectedBeforeTheGateCanWriteOrLaunch()
+    {
+        var root = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $"migration-profile-topology-{Guid.NewGuid():N}");
+        var target = System.IO.Path.Combine(root, "target");
+        var link = System.IO.Path.Combine(root, "link");
+        Directory.CreateDirectory(target);
+        try
+        {
+            var start = new ProcessStartInfo("cmd.exe") { UseShellExecute = false, RedirectStandardError = true };
+            foreach (var value in new[] { "/d", "/c", "mklink", "/J", link, target }) start.ArgumentList.Add(value);
+            using (var process = Process.Start(start)!)
+            {
+                var error = await process.StandardError.ReadToEndAsync();
+                await process.WaitForExitAsync();
+                Assert.True(process.ExitCode == 0, error);
+            }
+            var result = await RunFunctionAsync("Assert-SafeProfileTopology", new Dictionary<string, string>
+            {
+                ["EvidencePath"] = System.IO.Path.Combine(link, "evidence"), ["IsolationConfirmed"] = "__POWERSHELL_TRUE__",
             });
             Assert.NotEqual(0, result.ExitCode);
             Assert.Contains("reparse", result.Output, StringComparison.OrdinalIgnoreCase);
@@ -475,7 +581,9 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         Assert.Contains("Assert-NewOwnedDirectory", script, StringComparison.Ordinal);
         Assert.Contains("Assert-StrictChildPath", script, StringComparison.Ordinal);
         Assert.Contains("ownership.json", script, StringComparison.Ordinal);
-        Assert.Contains("Copy-Item -LiteralPath", script, StringComparison.Ordinal);
+        Assert.Contains("Copy-BoundedLockedAsset", script, StringComparison.Ordinal);
+        Assert.Contains("Copy-FromArtifactReadLock", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("Get-ChildItem -LiteralPath $Source -Force -Recurse", script, StringComparison.Ordinal);
         Assert.Contains("AssetSource = 'caller-supplied-local-directories'", script, StringComparison.Ordinal);
         Assert.DoesNotContain("Invoke-WebRequest", script, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Invoke-RestMethod", script, StringComparison.OrdinalIgnoreCase);
@@ -656,6 +764,15 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
                 param([string]$ScriptPath,[string]$FunctionName,[string]$ArgumentsPath)
                 $ErrorActionPreference='Stop'
                 Add-Type -AssemblyName System.Security
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                Add-Type -TypeDefinition @'
+                using System;using System.Runtime.InteropServices;
+                public static class MigrationNativeCommandLine {
+                  [DllImport("shell32.dll",SetLastError=true)]static extern IntPtr CommandLineToArgvW(string c,out int n);
+                  [DllImport("kernel32.dll")]static extern IntPtr LocalFree(IntPtr p);
+                  public static string[] Split(string c){int n;var p=CommandLineToArgvW(c,out n);var r=new string[n];try{for(int i=0;i<n;i++)r[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(p,i*IntPtr.Size));return r;}finally{LocalFree(p);}}
+                }
+                '@
                 $tokens=$null;$errors=$null
                 $ast=[Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$tokens,[ref]$errors)
                 if($errors.Count){throw 'Migration script parse failed.'}
@@ -664,7 +781,7 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
                 }
                 $object=Get-Content -LiteralPath $ArgumentsPath -Raw -Encoding UTF8|ConvertFrom-Json
                 $splat=@{}
-                foreach($property in $object.PSObject.Properties){$splat[$property.Name]=[string]$property.Value}
+                foreach($property in $object.PSObject.Properties){$splat[$property.Name]=if([string]$property.Value-ceq'__POWERSHELL_TRUE__'){$true}else{[string]$property.Value}}
                 & $FunctionName @splat|Out-Null
                 """);
             var startInfo = PowerShell();
@@ -729,6 +846,7 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
         });
         var fixture = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
         {
+            ["application_failure_hook_relative_path"] = "current\\application-failure.json", ["application_failure_package_file"] = "application-failure.nupkg",
             ["license_signing_key_id"] = "test-key-1", ["license_signing_spki_base64"] = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo()),
         });
         return (state, fixture);
