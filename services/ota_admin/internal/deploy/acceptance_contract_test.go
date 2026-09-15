@@ -1,8 +1,11 @@
 package deploy
 
 import (
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,13 +59,41 @@ func TestAcceptanceHarnessIsBuildTaggedAndIsolatedFromProduction(t *testing.T) {
 func TestAcceptanceHarnessFixturesExactlyMatchTrackedPowerShellGolden(t *testing.T) {
 	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
 	acceptanceFixtureRoot := filepath.Join(moduleRoot, "cmd", "ota-admin-acceptance", "testdata")
-	for name, want := range map[string]string{
-		"valid-upload.zip": "30b96617dfb888b5ce6daf0e8d3b7bd2b1a94c09d37021919d0b313720148916",
-		"publisher.cer":    "eed6657913e5bf86caac9b8f23928648b83a50b9b06f1e2c738cbb2a13dbc2d5",
+	acceptanceScript := readTask10Script(t, filepath.Join(moduleRoot, "scripts", "build_linux_acceptance.ps1"))
+	type fixtureIdentity struct {
+		gitBlobSHA1           string
+		fileSHA256            string
+		certificateThumbprint string
+	}
+	for name, want := range map[string]fixtureIdentity{
+		"valid-upload.zip": {
+			gitBlobSHA1: "007430324b90fff97b835b46e4b51c5a9e31502f",
+			fileSHA256:  "30b96617dfb888b5ce6daf0e8d3b7bd2b1a94c09d37021919d0b313720148916",
+		},
+		"publisher.cer": {
+			gitBlobSHA1:           "86d490d04699624c2f5504acbed7fe499a20ae10",
+			fileSHA256:            "eed6657913e5bf86caac9b8f23928648b83a50b9b06f1e2c738cbb2a13dbc2d5",
+			certificateThumbprint: "96f6d3166172998f62621f93a1f12932b245a1a9",
+		},
 	} {
-		got := fixtureSHA256(t, filepath.Join(acceptanceFixtureRoot, name))
-		if got != want {
-			t.Fatalf("acceptance fixture %s hash = %s, want audited golden %s", name, got, want)
+		path := filepath.Join(acceptanceFixtureRoot, name)
+		if got := fixtureGitBlobSHA1(t, path); got != want.gitBlobSHA1 {
+			t.Fatalf("acceptance fixture %s Git blob SHA-1 = %s, want %s", name, got, want.gitBlobSHA1)
+		}
+		if got := fixtureSHA256(t, path); got != want.fileSHA256 {
+			t.Fatalf("acceptance fixture %s file SHA-256 = %s, want audited golden %s", name, got, want.fileSHA256)
+		}
+		pin := fmt.Sprintf("@('%s', '%s')", want.gitBlobSHA1, want.fileSHA256)
+		if !strings.Contains(acceptanceScript, pin) {
+			t.Fatalf("acceptance build script does not distinguish Git blob and file hashes for %s", name)
+		}
+		if want.certificateThumbprint != "" {
+			if got := certificateThumbprint(t, path); got != want.certificateThumbprint {
+				t.Fatalf("acceptance certificate thumbprint = %s, want %s", got, want.certificateThumbprint)
+			}
+			if want.certificateThumbprint == want.gitBlobSHA1 {
+				t.Fatal("certificate thumbprint was confused with its Git blob SHA-1")
+			}
 		}
 	}
 	entries, err := os.ReadDir(acceptanceFixtureRoot)
@@ -75,6 +106,32 @@ func TestAcceptanceHarnessFixturesExactlyMatchTrackedPowerShellGolden(t *testing
 			t.Fatalf("acceptance fixture directory contains prohibited key material: %s", entry.Name())
 		}
 	}
+}
+
+func fixtureGitBlobSHA1(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha1.New()
+	_, _ = fmt.Fprintf(digest, "blob %d%c", len(content), 0)
+	_, _ = digest.Write(content)
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func certificateThumbprint(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := x509.ParseCertificate(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha1.Sum(certificate.Raw)
+	return hex.EncodeToString(digest[:])
 }
 
 func fixtureSHA256(t *testing.T, path string) string {
