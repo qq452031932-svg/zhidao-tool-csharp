@@ -77,26 +77,31 @@ public sealed class LegacyLaunchPlanTests
             out _));
     }
 
-    [Fact]
-    public void CreateCannotEscapeLauncherDirectory()
+    [Theory]
+    [InlineData("..\\evil.exe")]
+    [InlineData("subdirectory\\evil.exe")]
+    [InlineData("subdirectory/evil.exe")]
+    [InlineData("C:\\evil.exe")]
+    public void CreateRejectsNonLeafTargetBeforeInspectingFileSystem(string unsafeTarget)
     {
         var launcher = Path.GetFullPath(Path.Combine("install", "BaiduBatchTransfer.App.exe"));
-        var expectedDirectory = Path.GetDirectoryName(launcher)!;
+        var inspectionCount = 0;
 
-        Assert.True(LegacyLaunchPlan.TryCreate(
+        Assert.False(LegacyLaunchPlan.TryCreateForTargetLeaf(
             launcher,
+            unsafeTarget,
             [],
-            _ => LegacyPathState.RegularFile,
+            _ =>
+            {
+                inspectionCount++;
+                return LegacyPathState.RegularFile;
+            },
             out var plan,
-            out var error), error);
+            out var error));
 
-        Assert.NotNull(plan);
-        Assert.Equal(
-            expectedDirectory,
-            Path.GetDirectoryName(plan.TargetPath),
-            ignoreCase: true);
-        Assert.False(Path.GetFileName(plan.TargetPath).Contains(Path.DirectorySeparatorChar));
-        Assert.False(Path.GetFileName(plan.TargetPath).Contains(Path.AltDirectorySeparatorChar));
+        Assert.Null(plan);
+        Assert.NotEmpty(error);
+        Assert.Equal(0, inspectionCount);
     }
 
     [Theory]

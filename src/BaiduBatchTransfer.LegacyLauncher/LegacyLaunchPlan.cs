@@ -40,6 +40,21 @@ public sealed class LegacyLaunchPlan
         IReadOnlyList<string> arguments,
         Func<string, LegacyPathState> inspectPath,
         out LegacyLaunchPlan? plan,
+        out string error) =>
+        TryCreateForTargetLeaf(
+            launcherProcessPath,
+            ProductIdentity.MainExecutableName,
+            arguments,
+            inspectPath,
+            out plan,
+            out error);
+
+    internal static bool TryCreateForTargetLeaf(
+        string? launcherProcessPath,
+        string? targetExecutableLeaf,
+        IReadOnlyList<string> arguments,
+        Func<string, LegacyPathState> inspectPath,
+        out LegacyLaunchPlan? plan,
         out string error)
     {
         ArgumentNullException.ThrowIfNull(arguments);
@@ -65,16 +80,28 @@ public sealed class LegacyLaunchPlan
                 return false;
             }
 
+            if (string.IsNullOrWhiteSpace(targetExecutableLeaf) ||
+                Path.IsPathRooted(targetExecutableLeaf) ||
+                targetExecutableLeaf.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+                !string.Equals(
+                    targetExecutableLeaf,
+                    Path.GetFileName(targetExecutableLeaf),
+                    StringComparison.Ordinal))
+            {
+                error = "新版程序名称不是安全的文件名。";
+                return false;
+            }
+
             launcherDirectory = Path.GetFullPath(launcherDirectory);
             var targetPath = Path.GetFullPath(
-                Path.Combine(launcherDirectory, ProductIdentity.MainExecutableName));
+                Path.Combine(launcherDirectory, targetExecutableLeaf));
 
             if (!string.Equals(
                     launcherDirectory,
                     Path.GetDirectoryName(targetPath),
                     StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(
-                    ProductIdentity.MainExecutableName,
+                    targetExecutableLeaf,
                     Path.GetFileName(targetPath),
                     StringComparison.Ordinal))
             {
@@ -90,7 +117,7 @@ public sealed class LegacyLaunchPlan
 
             if (inspectPath(targetPath) != LegacyPathState.RegularFile)
             {
-                error = $"未找到安全的新版程序：{ProductIdentity.MainExecutableName}";
+                error = $"未找到安全的新版程序：{targetExecutableLeaf}";
                 return false;
             }
 

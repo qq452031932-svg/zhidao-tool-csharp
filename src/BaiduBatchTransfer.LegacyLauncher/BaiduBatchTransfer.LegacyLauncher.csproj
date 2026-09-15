@@ -20,4 +20,8 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="BaiduBatchTransfer.App.Tests" />
+  </ItemGroup>
+
 </Project>
