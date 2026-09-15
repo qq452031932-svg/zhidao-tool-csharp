@@ -1,4 +1,3 @@
-#requires -Version 7.2
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
@@ -13,6 +12,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+Add-Type -AssemblyName System.Security
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 . (Join-Path $PSScriptRoot 'ProductIdentity.ps1')
 $productIdentity = Get-ProductIdentity -Path (Join-Path $repo 'eng\ProductIdentity.props')
@@ -30,19 +30,34 @@ function Assert-NoReparsePointAncestors([string]$Path) {
 function Assert-LocalDrivePath([string]$Path) {
     if ($Path.StartsWith('\\', [StringComparison]::Ordinal) -or [IO.Path]::GetPathRoot($Path) -notmatch '^[A-Za-z]:\\$') { throw 'Production output must use a local drive path.' }
 }
+function Import-P256SubjectPublicKeyInfo([byte[]]$Der) {
+    [byte[]]$prefix = 0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00,0x04
+    if ($Der.Length -ne 91) { throw 'SPKI length is invalid.' }
+    for ($index = 0; $index -lt $prefix.Length; $index++) {
+        if ($Der[$index] -ne $prefix[$index]) { throw 'SPKI encoding is invalid.' }
+    }
+    [byte[]]$blob = 0x45,0x43,0x53,0x31,0x20,0x00,0x00,0x00
+    [Array]::Resize([ref]$blob, 72)
+    [Array]::Copy($Der, 27, $blob, 8, 64)
+    return [Security.Cryptography.CngKey]::Import($blob, [Security.Cryptography.CngKeyBlobFormat]::EccPublicBlob)
+}
+function Get-Sha256Hex([byte[]]$Bytes) {
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha256.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha256.Dispose() }
+}
 $origin = 'https://ota.fanfh.cn'
 $superPanProduct = '8270e8d7-1791-487d-ad76-0da7a0cbed12'
 $smokeProduct = '6ebd0ccf-f462-47db-958e-cfd426451c88'
 if ($CurrentTlsSpkiPin -ceq $NextTlsSpkiPin) { throw 'Current and next TLS SPKI pins must be distinct.' }
 if ($LicenseSigningKeyId -match 'placeholder|changeme|example') { throw 'Installed response-signing key ID is required.' }
 if ($LicenseSigningPublicKey -match 'PRIVATE KEY|BEGIN |placeholder|changeme|example') { throw 'Only canonical public SPKI DER base64 is accepted.' }
-$ec = $null
+$publicKey = $null
 try {
     $der = [Convert]::FromBase64String($LicenseSigningPublicKey)
-    $ec = [Security.Cryptography.ECDsa]::Create()
-    $read = 0; $ec.ImportSubjectPublicKeyInfo($der, [ref]$read)
-    if ($read -ne $der.Length -or $ec.KeySize -ne 256 -or [Convert]::ToBase64String($ec.ExportSubjectPublicKeyInfo()) -cne $LicenseSigningPublicKey) { throw 'noncanonical' }
-} catch { throw 'LicenseSigningPublicKey must be canonical ECDSA P-256 SPKI DER base64.' } finally { if ($null -ne $ec) { $ec.Dispose() } }
+    if ([Convert]::ToBase64String($der) -cne $LicenseSigningPublicKey) { throw 'noncanonical' }
+    $publicKey = Import-P256SubjectPublicKeyInfo $der
+} catch { throw 'LicenseSigningPublicKey must be canonical ECDSA P-256 SPKI DER base64.' } finally { if ($null -ne $publicKey) { $publicKey.Dispose() } }
 
 $helperPackage = [IO.Path]::GetFullPath($ManagedBrowserHelperPackageDirectory)
 Assert-LocalDrivePath $helperPackage
@@ -102,8 +117,16 @@ try {
         if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -cne $thumbprint -or $null -eq $signature.TimeStamperCertificate) { throw 'Authenticode signer or timestamp identity mismatch.' }
         $manifest += [ordered]@{ role = Split-Path (Split-Path $artifact -Parent) -Leaf; file = Split-Path $artifact -Leaf; sha256 = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant(); signerThumbprint = $thumbprint }
     }
-    $files = foreach ($role in @('superpan','smoke-nonshipping','boundary-probe-nonshipping')) { Get-ChildItem -LiteralPath (Join-Path $stage $role) -File -Recurse | ForEach-Object { [ordered]@{ path=($role + '/' + [IO.Path]::GetRelativePath((Join-Path $stage $role), $_.FullName).Replace('\','/')); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } } }
-    $manifestJson = [ordered]@{ sourceCommit=$SourceCommit; origin=$origin; superPanProduct=$superPanProduct; smokeProduct=$smokeProduct; signingKeyId=$LicenseSigningKeyId; signingSpkiDerBase64=$LicenseSigningPublicKey; signingSpkiSha256=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der))).ToLowerInvariant(); currentTlsSpki=$CurrentTlsSpkiPin; nextTlsSpki=$NextTlsSpkiPin; artifacts=$manifest; files=@($files) } | ConvertTo-Json -Depth 5
+    $files = foreach ($role in @('superpan','smoke-nonshipping','boundary-probe-nonshipping')) {
+        $roleRoot = [IO.Path]::GetFullPath((Join-Path $stage $role)).TrimEnd([IO.Path]::DirectorySeparatorChar)
+        $rolePrefix = $roleRoot + [IO.Path]::DirectorySeparatorChar
+        Get-ChildItem -LiteralPath $roleRoot -File -Recurse | ForEach-Object {
+            $filePath = [IO.Path]::GetFullPath($_.FullName)
+            if (-not $filePath.StartsWith($rolePrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Production client file escaped its role root.' }
+            [ordered]@{ path=($role + '/' + $filePath.Substring($rolePrefix.Length).Replace('\','/')); sha256=(Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant() }
+        }
+    }
+    $manifestJson = [ordered]@{ sourceCommit=$SourceCommit; origin=$origin; superPanProduct=$superPanProduct; smokeProduct=$smokeProduct; signingKeyId=$LicenseSigningKeyId; signingSpkiDerBase64=$LicenseSigningPublicKey; signingSpkiSha256=(Get-Sha256Hex $der); currentTlsSpki=$CurrentTlsSpkiPin; nextTlsSpki=$NextTlsSpkiPin; artifacts=$manifest; files=@($files) } | ConvertTo-Json -Depth 5
     $manifestPath = Join-Path $stage 'production-license-clients.json'
     [IO.File]::WriteAllText($manifestPath, $manifestJson + "`n", [Text.UTF8Encoding]::new($false))
     $cms = [Security.Cryptography.Pkcs.SignedCms]::new([Security.Cryptography.Pkcs.ContentInfo]::new([IO.File]::ReadAllBytes($manifestPath)), $true)
