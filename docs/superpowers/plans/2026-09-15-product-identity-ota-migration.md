@@ -12,8 +12,12 @@
 
 ## 文件结构与职责
 
+- `eng/ProductIdentity.props`：唯一人工维护的产品身份源，包含显示名、中文主产物名、旧兼容入口名和必须稳定的包/数据/卡密身份。
+- `scripts/ProductIdentity.ps1`：所有 PowerShell 构建/验证脚本共用的只读身份加载与字段校验函数。
+- `scripts/Update-ProductIdentityGeneratedFiles.ps1`：从 props 确定性生成 C# 与 Go 常量，并支持 `-VerifyOnly` 防漂移。
 - `src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj`：中文程序集名、PE 产品元数据、应用图标、兼容启动器发布内容。
-- `src/BaiduBatchTransfer.App/Branding/ProductIdentity.cs`：运行时使用的显示名、主 EXE 名和旧兼容 EXE 名，不承载 OTA/卡密稳定身份。
+- `src/BaiduBatchTransfer.App/Branding/ProductIdentity.Generated.cs`：由唯一身份源生成的运行时常量，不手工编辑。
+- `src/BaiduBatchTransfer.LegacyLauncher/ProductIdentity.Generated.cs`：由同一身份源生成的兼容入口目标常量，不手工编辑。
 - `src/BaiduBatchTransfer.App/Assets/Branding/知道综合工具.png`：规范化的原始方形品牌图。
 - `src/BaiduBatchTransfer.App/Assets/Branding/知道综合工具.ico`：多分辨率 Windows 图标。
 - `scripts/Convert-ProductIcon.ps1`：从仓库内规范 PNG 确定性生成 ICO 并验证层级。
@@ -28,19 +32,61 @@
 - `scripts/build_ota_release.ps1`：以中文主 EXE、标题和 ICO 调用 Velopack，同时打包兼容入口。
 - `scripts/Test-OtaUploadBundle.ps1`：验证中文主程序、兼容入口、元数据、签名和固定包身份。
 - `scripts/Test-VelopackExecutableRenameMigration.ps1`：在隔离 Windows 环境记录根启动器、快捷方式和自动重启迁移结果。
+- `services/ota_admin/internal/release/product_identity_generated.go`：由唯一身份源生成的服务端包结构常量。
+- `services/ota_admin/internal/release/package_structure.go`、`validator_test.go`：服务端上传时验证新的包内部结构。
 - `tests/BaiduBatchTransfer.App.Tests/Updates/OtaReleaseScriptTests.cs`、`OtaProductionReleaseScriptTests.cs`、`ProductionLicenseBuildScriptTests.cs`：发布链脚本契约回归。
 - `docs/testing/2026-09-15-product-identity-ota-migration-handoff.md`：本地验证证据、仍需用户执行的隔离/线上验收说明。
+
+### Task 0: 先验证 Velopack 主程序改名能力
+
+**Files:**
+- Create: `scripts/Test-VelopackExecutableRenameSpike.ps1`
+- Create: `tests/BaiduBatchTransfer.App.Tests/Updates/VelopackExecutableRenameSpikeScriptTests.cs`
+- Conditional modify only if the pinned pair fails: `.config/dotnet-tools.json`
+- Conditional modify only if the pinned pair fails: `Directory.Packages.props`
+- Conditional modify only if the pinned pair fails: `src/BaiduBatchTransfer.App/packages.lock.json`
+
+- [ ] **Step 1: 写失败的最小样例脚本测试**
+
+脚本必须在临时目录生成两个无业务小程序：旧版主程序 `BaiduBatchTransfer.App.exe` 和新版主程序 `知道综合工具.exe`，用与仓库完全相同的 Velopack CLI/SDK 版本打包。测试要求脚本检查根启动器、`current`、桌面/开始菜单快捷方式、升级重启目标，并拒绝在非隔离 Windows 配置文件中执行安装阶段。
+
+- [ ] **Step 2: 验证测试先失败**
+
+Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter FullyQualifiedName~VelopackExecutableRenameSpikeScriptTests --no-restore`
+
+Expected: FAIL，样例脚本不存在。
+
+- [ ] **Step 3: 实现并运行当前固定版本的最小样例**
+
+先执行不安装的打包/结构阶段；再在一次性 Windows Sandbox/VM 中执行安装升级阶段。必须证明 `--mainExe` 改名后 Velopack 能迁移或重建中文根启动器、中文快捷方式和中文重启目标。
+
+- [ ] **Step 4: 当前 1.2.0 失败时先解决工具链，不修改产品代码**
+
+选择最小的、经样例证明修复主 EXE 改名的 Velopack 版本；CLI 与 SDK 成对升级，更新 lock file，重跑全部 OTA 测试和样例。若仍无法通过，先实现并在样例中验证幂等生命周期迁移钩子。此门未通过不得开始 Task 1。
+
+- [ ] **Step 5: 提交迁移能力证据**
+
+```powershell
+git add scripts/Test-VelopackExecutableRenameSpike.ps1 tests/BaiduBatchTransfer.App.Tests/Updates/VelopackExecutableRenameSpikeScriptTests.cs .config/dotnet-tools.json Directory.Packages.props src/BaiduBatchTransfer.App/packages.lock.json
+git commit -m "test: prove Velopack executable rename path"
+```
 
 ### Task 1: 锁定产品品牌与稳定身份契约
 
 **Files:**
-- Create: `src/BaiduBatchTransfer.App/Branding/ProductIdentity.cs`
+- Create: `eng/ProductIdentity.props`
+- Create: `scripts/ProductIdentity.ps1`
+- Create: `scripts/Update-ProductIdentityGeneratedFiles.ps1`
+- Create: `src/BaiduBatchTransfer.App/Branding/ProductIdentity.Generated.cs`
+- Create: `src/BaiduBatchTransfer.LegacyLauncher/ProductIdentity.Generated.cs`
+- Create: `services/ota_admin/internal/release/product_identity_generated.go`
 - Create: `tests/BaiduBatchTransfer.App.Tests/Branding/ProductIdentityTests.cs`
+- Create: `tests/BaiduBatchTransfer.App.Tests/Updates/ProductIdentityBuildTests.cs`
 - Modify: `src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj`
 
 - [ ] **Step 1: 写失败测试**
 
-测试必须断言：
+测试必须断言唯一 props 身份源与两份生成文件一致：
 
 ```csharp
 Assert.Equal("知道综合工具", ProductIdentity.DisplayName);
@@ -52,23 +98,23 @@ Assert.Equal("BaiduBatchTransfer", ProductIdentity.DataDirectoryName);
 Assert.Equal("8270e8d7-1791-487d-ad76-0da7a0cbed12", ProductIdentity.LicenseProductId);
 ```
 
-结构测试同时读取 csproj，要求 `AssemblyName`、`AssemblyTitle`、`Product`、`Description` 明确设置为中文品牌，但 `PackageId` 和 `LicenseProductId` 未变化。
+结构测试同时要求 csproj 的 `AssemblyName`、`AssemblyTitle`、`Product`、`Description` 均来自 props，而不是再次写字面量；`PackageId` 和 `LicenseProductId` 也来自同一身份源且值未变化。`Update-ProductIdentityGeneratedFiles.ps1 -VerifyOnly` 必须在任何生成文件过期时失败。
 
 - [ ] **Step 2: 验证测试先失败**
 
 Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter FullyQualifiedName~ProductIdentityTests --no-restore`
 
-Expected: FAIL，原因是 `ProductIdentity` 或项目元数据尚不存在。
+Expected: FAIL，原因是唯一身份源、生成文件或项目元数据尚不存在。
 
 - [ ] **Step 3: 添加最小品牌契约与项目元数据**
 
-`ProductIdentity.cs` 使用 `internal static class` 和编译期常量。csproj 添加：
+`eng/ProductIdentity.props` 是唯一人工维护源；`ProductIdentity.ps1` 提供 `Get-ProductIdentity` 并严格验证必需字段，生成脚本调用该函数并以 UTF-8 无 BOM 写出主程序 C#、兼容入口 C# 和 Go 常量。csproj 导入 props 并引用其属性：
 
 ```xml
-<AssemblyName>知道综合工具</AssemblyName>
-<AssemblyTitle>知道综合工具</AssemblyTitle>
-<Product>知道综合工具</Product>
-<Description>百度网盘批量管理工作台</Description>
+<AssemblyName>$(ProductMainAssemblyName)</AssemblyName>
+<AssemblyTitle>$(ProductDisplayName)</AssemblyTitle>
+<Product>$(ProductDisplayName)</Product>
+<Description>$(ProductDescription)</Description>
 ```
 
 不得改变 `RootNamespace`、默认命名空间、`PackageId`、本地数据目录、互斥体或授权产品 ID。
@@ -79,10 +125,18 @@ Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Test
 
 Expected: PASS。
 
+Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Update-ProductIdentityGeneratedFiles.ps1 -VerifyOnly`
+
+Expected: exit 0。
+
+Run: `dotnet build src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj -c Debug --no-restore; dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter FullyQualifiedName~ProductIdentityBuildTests --no-restore`
+
+Expected: 实际生成 `知道综合工具.exe/.dll/.deps.json/.runtimeconfig.json`；测试通过并验证 `ProductName`、`FileDescription`、`ProductVersion`、`FileVersion`，且主业务产物中不存在旧名 EXE/DLL。
+
 - [ ] **Step 5: 提交**
 
 ```powershell
-git add src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj src/BaiduBatchTransfer.App/Branding/ProductIdentity.cs tests/BaiduBatchTransfer.App.Tests/Branding/ProductIdentityTests.cs
+git add eng/ProductIdentity.props scripts/ProductIdentity.ps1 scripts/Update-ProductIdentityGeneratedFiles.ps1 src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj src/BaiduBatchTransfer.App/Branding/ProductIdentity.Generated.cs src/BaiduBatchTransfer.LegacyLauncher/ProductIdentity.Generated.cs services/ota_admin/internal/release/product_identity_generated.go tests/BaiduBatchTransfer.App.Tests/Branding/ProductIdentityTests.cs tests/BaiduBatchTransfer.App.Tests/Updates/ProductIdentityBuildTests.cs
 git commit -m "feat: define product identity contract"
 ```
 
@@ -208,10 +262,13 @@ Expected: FAIL，兼容启动器项目尚不存在。
 兼容项目必须：
 
 ```xml
-<AssemblyName>BaiduBatchTransfer.App</AssemblyName>
+<AssemblyName>$(ProductLegacyAssemblyName)</AssemblyName>
 <OutputType>WinExe</OutputType>
 <TargetFramework>net8.0-windows</TargetFramework>
 <SelfContained>true</SelfContained>
+<PublishSingleFile>true</PublishSingleFile>
+<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+<DebugType>none</DebugType>
 ```
 
 `Program` 使用 `Environment.ProcessPath` 确定入口目录，解析中文目标的最终路径，拒绝越界/重解析点，通过 `ProcessStartInfo.ArgumentList` 转发参数。生命周期调用 `WaitForExit()` 并设置 `Environment.ExitCode`；普通启动创建进程后立即返回。
@@ -224,7 +281,7 @@ Expected: PASS。
 
 Run: `dotnet publish src/BaiduBatchTransfer.LegacyLauncher/BaiduBatchTransfer.LegacyLauncher.csproj -c Release -r win-x64 --self-contained true -o .artifacts/legacy-launcher-check`
 
-Expected: 生成 `BaiduBatchTransfer.App.exe`，不包含主程序业务程序集。
+Expected: 生成可独立运行的单文件 `BaiduBatchTransfer.App.exe`；把该 EXE 单独复制到空目录仍能执行缺少目标时的安全失败路径，且不包含主程序业务程序集。
 
 - [ ] **Step 5: 提交**
 
@@ -253,7 +310,7 @@ Expected: FAIL，脚本仍引用旧主程序集产物。
 
 - [ ] **Step 2: 只替换产物路径，不改变信任参数**
 
-使用脚本局部常量 `$mainExecutableName`、`$mainAssemblyName`；边界验证继续覆盖中文主程序，不把兼容入口当作授权主程序。
+所有脚本 dot-source `scripts/ProductIdentity.ps1` 并调用 `Get-ProductIdentity` 读取 `eng/ProductIdentity.props`，禁止各自复制中文文件名字面量。边界验证继续覆盖中文主程序，不把兼容入口当作授权主程序。
 
 - [ ] **Step 3: 运行脚本契约测试**
 
@@ -295,7 +352,7 @@ Expected: FAIL，当前脚本仍把旧 EXE 作为 `mainExe`。
 
 - [ ] **Step 3: 修改生产和 acceptance 打包流水线**
 
-先分别发布主程序与兼容启动器，再仅复制兼容 EXE 到主 publish 目录。元数据反射从 `知道综合工具.dll` 读取。所有 vpk 参数继续以数组传递；保留 `SuperPan.BaiduBatchTransfer`、`SuperPan.BaiduBatchTransfer.OtaAcceptance` 及固定别名。
+先分别发布主程序与兼容启动器，再仅复制经“空目录单文件运行”验证的兼容 EXE 到主 publish 目录。显示名和文件名从 `eng/ProductIdentity.props` 读取，元数据反射从配置指定的中文 DLL 读取。所有 vpk 参数继续以数组传递；保留 `SuperPan.BaiduBatchTransfer`、`SuperPan.BaiduBatchTransfer.OtaAcceptance` 及固定别名。
 
 - [ ] **Step 4: 运行发布脚本测试**
 
@@ -343,7 +400,45 @@ git add scripts/Test-OtaUploadBundle.ps1 tests/BaiduBatchTransfer.App.Tests/Upda
 git commit -m "test: enforce renamed OTA package layout"
 ```
 
-### Task 8: 建立 Velopack 主程序改名的真实迁移门
+### Task 8: 迁移服务端 OTA 包结构验证器
+
+**Files:**
+- Modify: `services/ota_admin/internal/release/package_structure.go`
+- Modify: `services/ota_admin/internal/release/validator_test.go`
+- Use generated: `services/ota_admin/internal/release/product_identity_generated.go`
+
+- [ ] **Step 1: 更新 Go 测试夹具并确认失败**
+
+Full/Delta/Portable 夹具使用 `知道综合工具.exe/.dll/.deps.json/.runtimeconfig.json`，同时包含 `BaiduBatchTransfer.App.exe` 兼容入口；nuspec `mainExe` 为中文名。新增反例证明旧布局、缺兼容入口或错误 delta 基准会被拒绝。
+
+Run: `go test ./internal/release`
+
+Workdir: `services/ota_admin`
+
+Expected: FAIL，服务端验证器仍写死旧业务产物。
+
+- [ ] **Step 2: 使用生成的 Go 常量迁移验证器**
+
+`package_structure.go` 不再含中文/旧名产品字面量；它从 `product_identity_generated.go` 使用主 EXE、主程序集和兼容 EXE 常量。Delta 必须允许并验证“旧业务主程序删除/中文主程序新增”的迁移结构，同时继续拒绝任意可执行文件注入。
+
+- [ ] **Step 3: 运行 Go 与生成一致性测试**
+
+Run: `go test ./internal/release`
+
+Expected: PASS。
+
+Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Update-ProductIdentityGeneratedFiles.ps1 -VerifyOnly`
+
+Expected: exit 0。
+
+- [ ] **Step 4: 提交**
+
+```powershell
+git add services/ota_admin/internal/release/package_structure.go services/ota_admin/internal/release/validator_test.go services/ota_admin/internal/release/product_identity_generated.go
+git commit -m "feat: validate renamed OTA package on server"
+```
+
+### Task 9: 建立真实产品包的 Velopack 迁移门
 
 **Files:**
 - Create: `scripts/Test-VelopackExecutableRenameMigration.ps1`
@@ -364,7 +459,7 @@ Expected: FAIL，脚本尚不存在。
 
 - [ ] **Step 3: 实现隔离验收脚本**
 
-脚本参数必须显式提供旧资产目录、新候选目录、证据输出目录和隔离确认开关。它只安装/展开传入资产，不连接生产服务，不删除非自身创建目录，并输出 JSON 证据与文件哈希。
+脚本参数必须显式提供旧资产目录、新候选目录、证据输出目录和隔离确认开关。它只安装/展开传入资产，不连接生产 OTA 服务，不删除非自身创建目录，并输出 JSON 证据与文件哈希。每条路径都先写入唯一标记的账号、设置、任务数据库和由生产信任链签发的隔离测试授权，然后在升级后核对同一标记、到期时间与无需重新激活；接受环境授权只能作为辅助证据。
 
 - [ ] **Step 4: 用当前固定 Velopack 1.2.0 运行最小双版本样例**
 
@@ -374,7 +469,7 @@ Run（必须在一次性 Windows Sandbox/VM 内）：
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-VelopackExecutableRenameMigration.ps1 -OldAssets <1.1.0-assets> -NewAssets <1.1.1-candidate> -AssetKind Setup -Path Delta -EvidenceDirectory <temp-evidence> -IUnderstandThisIsAnIsolatedWindowsProfile
 ```
 
-Expected: 中文根启动器、`current/知道综合工具.exe`、中文快捷方式、中文重启进程全部存在，旧入口可转发。
+Expected: 中文根启动器、`current/知道综合工具.exe`、中文快捷方式、中文重启进程全部存在，旧入口可转发；账号、设置、任务与生产链测试授权均保留。
 
 - [ ] **Step 5: 若 1.2.0 失败，成对升级并重新锁定**
 
@@ -382,7 +477,7 @@ Expected: 中文根启动器、`current/知道综合工具.exe`、中文快捷�
 
 - [ ] **Step 6: 分别完成 Setup Delta、Setup Full、Portable 升级**
 
-Expected: 三条路径均通过；Portable 结果不得替代 Setup 快捷方式证据。
+每条路径都必须另外注入一次下载中断或应用失败，验证仍可启动 1.1.0 且账号、设置、任务和授权未被清空。Expected: 三条成功路径和三条失败回退路径均通过；Portable 结果不得替代 Setup 快捷方式证据。
 
 - [ ] **Step 7: 提交脚本、测试与必要的版本锁定**
 
@@ -391,7 +486,7 @@ git add scripts/Test-VelopackExecutableRenameMigration.ps1 tests/BaiduBatchTrans
 git commit -m "test: gate executable rename migration"
 ```
 
-### Task 9: 构建并验证 1.1.1 本地候选包
+### Task 10: 构建并验证 1.1.1 本地候选包
 
 **Files:**
 - Create: `docs/testing/2026-09-15-product-identity-ota-migration-handoff.md`
@@ -413,32 +508,38 @@ Run: `dotnet build src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj -c D
 
 Expected: `bin/Debug/net8.0-windows/知道综合工具.exe` 和同名 DLL/deps/runtimeconfig 存在，旧业务 EXE 不存在。
 
-- [ ] **Step 3: 构建 1.1.1 生产等价候选**
+- [ ] **Step 3: 执行仓库级旧产物引用审计**
+
+Run: `rg -n "BaiduBatchTransfer\.App\.(exe|dll|deps\.json|runtimeconfig\.json)" src scripts services tests`
+
+Expected: 每个命中都被分类为兼容启动器、1.1.0 历史夹具或明确的负向测试；主程序构建、WPF pack URI、卡密脚本、生产/acceptance 打包、客户端验证器和 Go 服务端验证器不得残留旧业务产物引用。分类清单写入交接文档。
+
+- [ ] **Step 4: 构建 1.1.1 生产等价候选**
 
 使用现有生产构建入口、已有签名发布者和 1.1.0 previous release ZIP；版本严格为 `1.1.1`，输出到新的 `.artifacts` 子目录。不得覆盖 1.1.0 归档，不得上传服务器。
 
 Expected: Setup、Portable、1.1.1 Full、1.1.1 Delta、签名 feed/manifest 全部生成并通过 `Test-OtaUploadBundle.ps1`。
 
-- [ ] **Step 4: 验证 PE 元数据、图标与签名**
+- [ ] **Step 5: 验证 PE 元数据、图标与签名**
 
 检查主 EXE 的 `ProductName/FileDescription/ProductVersion/FileVersion`，提取 16/32/48/256 图标做哈希对比；检查主 EXE 与兼容入口使用同一受信发布者签名。
 
-- [ ] **Step 5: 回归卡密到期时间**
+- [ ] **Step 6: 回归卡密到期时间**
 
 运行现有授权 UI/状态测试；在隔离 Release 验收环境使用生产信任链签发的专用测试卡，记录未激活、有限期、永久及升级后不要求重新激活四种结果。卡的创建/消耗写入单独审计记录。
 
-- [ ] **Step 6: 写交接文档**
+- [ ] **Step 7: 写交接文档**
 
 记录 commit、命令、测试计数、候选资产 SHA-256、迁移证据路径、卡密回归结果、生产用户目录未被触碰的证据，以及“尚未上传生产”的明确状态。
 
-- [ ] **Step 7: 提交验证记录**
+- [ ] **Step 8: 提交验证记录**
 
 ```powershell
 git add docs/testing/2026-09-15-product-identity-ota-migration-handoff.md
 git commit -m "docs: record product identity migration acceptance"
 ```
 
-### Task 10: 生产发布准备与用户在线更新指引
+### Task 11: 生产发布准备与用户在线更新指引
 
 **Files:**
 - Modify: `docs/testing/2026-09-15-product-identity-ota-migration-handoff.md`
@@ -453,11 +554,11 @@ git commit -m "docs: record product identity migration acceptance"
 
 - [ ] **Step 3: 最终实现审阅**
 
-使用 `superpowers:requesting-code-review` 审阅完整 diff；修复所有阻断项后重新执行 Task 9 的测试和包验证。
+使用 `superpowers:requesting-code-review` 审阅完整 diff；修复所有阻断项后重新执行 Task 10 的测试和包验证。
 
 - [ ] **Step 4: 停在生产变更边界**
 
-交付本地候选、证据和清单。只有用户随后明确要求上线时，才在服务器 OTA 目录执行 staging 上传和原子切换；上线后再按 Task 10 Step 2 完成真实在线更新验收。
+交付本地候选、证据和清单。只有用户随后明确要求上线时，才在服务器 OTA 目录执行 staging 上传和原子切换；上线后再按 Task 11 Step 2 完成真实在线更新验收。
 
 - [ ] **Step 5: 提交最终文档**
 
