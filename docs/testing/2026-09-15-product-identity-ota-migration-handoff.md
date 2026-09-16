@@ -167,3 +167,15 @@ Portable `current/知道综合工具.exe`：
 3. 上述本地验收完成且用户再次明确授权上线后，才可准备生产 staging、上传和原子切换。本交接不构成上线授权；当前状态是“尚未上传生产”。
 
 历史失败构建日志均保留在相应 `.artifacts/ota-production-*.failure-logs-*` 目录，未删除，以便追溯。
+
+## 本次会话最终交接快照
+
+- 本快照写入前的交接基线提交：`5dd0c995bb60d8bd79d6a9ecb50e63de4da02ca3`。
+- 最终候选源码提交：`0bb6df0e13de0315c946dc144edba06b54111165`。
+- 服务器唯一允许上传的候选：`.artifacts/ota-production-p111-task11-final/SuperPan.BaiduBatchTransfer-1.1.1-win-x64-stable-upload.zip`。
+- 候选大小：`504259441` bytes；SHA-256：`8bb9131033d393510466edfab30462129f987a1b4f5eba9571f1b99a2ea5099e`。
+- 本地首次安装程序：`.artifacts/task11-production-staging-1.1.1-final/SuperPan.BaiduBatchTransfer-Setup.exe`。
+- 本地 Portable：`.artifacts/task11-production-staging-1.1.1-final/SuperPan.BaiduBatchTransfer-Portable.zip`。
+- 最终验证：相关 .NET 门禁 `251/251` 通过；Go 全量测试通过；独立客户端验证 `verified=true`，包含 11 个顶层文件和 2212 条签名证据；真实候选 Go 服务端验证通过；最终代码审阅原 1 项 Critical 与 4 项 Important 均已关闭。
+- 生产状态：未连接、未上传、未修改或切换生产服务器；未覆盖 1.1.0，未删除用户现有 artifacts，也未清理服务器上的其他项目。
+- 上线前仍必须完成：真实六路径 VM/Windows Sandbox 验收、生产信任链测试卡四状态验收，以及用户再次明确给出的生产上线授权。
