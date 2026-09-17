@@ -143,7 +143,9 @@ public sealed class LicenseActivationViewStructureTests
         AssertElementStyle(document, "CardInput", "ActivationTextBoxStyle");
         AssertElementStyle(document, "CardExampleHint", "ActivationBodyHintStyle");
         AssertElementStyle(document, "CardBindingHint", "ActivationBodyHintStyle");
-        AssertElementStyle(document, "ActivationStatusRegion", "ActivationStatusRegionStyle");
+        // 状态区改用继承自 ActivationStatusRegionStyle 的专用样式，
+        // 只多一条“无状态文字时隐藏”的触发器，高对比度设置由基样式继承。
+        AssertElementStyle(document, "ActivationStatusRegion", "ActivationStatusBoxStyle");
         AssertElementStyle(document, "ActivationStatusText", "ActivationStatusTextStyle");
 
         AssertHighContrastSetter(document, "ActivationBodyLabelStyle", "Foreground", "SystemColors.WindowTextBrushKey");

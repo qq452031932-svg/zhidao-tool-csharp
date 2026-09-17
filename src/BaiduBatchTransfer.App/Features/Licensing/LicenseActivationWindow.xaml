@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="{Binding ProductName}" Icon="{DynamicResource ProductWindowIcon}"
         Width="560"
-        Height="620"
+        Height="500"
         MinWidth="360"
         MinHeight="420"
         ResizeMode="CanResize"
@@ -145,14 +145,22 @@
             <Setter Property="Background" Value="#F7F9FB" />
             <Setter Property="BorderBrush" Value="#E6EBEF" />
             <Style.Triggers>
-                <DataTrigger Binding="{Binding StatusMessage}" Value="">
-                    <Setter Property="Visibility" Value="Collapsed" />
-                </DataTrigger>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
                             Value="{DynamicResource {x:Static SystemColors.WindowBrushKey}}" />
                     <Setter Property="BorderBrush"
                             Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <!-- 状态区专用：与示例面板外观一致，但没有状态文字时整块隐藏，
+             否则弹窗中部会留下一个没有任何说明的空框。 -->
+        <Style x:Key="ActivationStatusBoxStyle"
+               TargetType="{x:Type Border}"
+               BasedOn="{StaticResource ActivationStatusRegionStyle}">
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding StatusMessage}" Value="">
+                    <Setter Property="Visibility" Value="Collapsed" />
                 </DataTrigger>
             </Style.Triggers>
         </Style>
@@ -169,6 +177,7 @@
 
     <Grid Margin="24">
         <Border Style="{StaticResource ActivationCardStyle}"
+                VerticalAlignment="Center"
                 BorderThickness="1"
                 CornerRadius="16">
             <Grid>
@@ -205,7 +214,7 @@
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
-                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
@@ -264,7 +273,7 @@
                                    TextWrapping="Wrap"
                                    Text="卡密将绑定当前电脑，请确认后激活" />
                         <Border x:Name="ActivationStatusRegion"
-                                Style="{StaticResource ActivationStatusRegionStyle}"
+                                Style="{StaticResource ActivationStatusBoxStyle}"
                                 Grid.Row="4"
                                 MinHeight="44"
                                 Margin="0,10,0,10"
