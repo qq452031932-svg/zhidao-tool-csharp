@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Common;
@@ -915,7 +915,8 @@ public sealed class AppShellFactory(
     LocalImportDraftCleanupService importDraftCleanupService,
     LocalTerminalHistoryService historyCleanupService,
     ILocalHistoryCleanupInteraction historyCleanupInteraction,
-    ICurrentImportCleanupInteraction currentImportCleanupInteraction) : IAppShellFactory
+    ICurrentImportCleanupInteraction currentImportCleanupInteraction,
+    ILicenseActivationPresenter? licenseActivationPresenter = null) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
@@ -1066,12 +1067,30 @@ public sealed class AppShellFactory(
         var closeRequester = new WpfApplicationCloseRequester(
             uiDispatcher,
             () => mainWindow?.Close());
+        // 授权快照此前从未真实注入，设置中心永远显示“未激活”，即使用户已激活成功。
+        // 这里接上运行时授权状态，并把激活窗作为可再次调起的入口交给设置页。
+        LicenseSettingsSnapshot ReadLicenseSettings()
+        {
+            var summary = licenseAuthorizationState.CurrentSummary;
+            var authorized = licenseAuthorizationState.IsAuthorized;
+            return new LicenseSettingsSnapshot(
+                summary?.PackageName,
+                summary?.ExpiresAt,
+                authorized,
+                isMachineBound: authorized);
+        }
+
         var settingsViewModel = new SettingsViewModel(
             updateService,
             dialogService,
             closeRequester,
             uiContext,
-            buildInfo);
+            buildInfo,
+            licenseSettings: null,
+            presentActivationAsync: licenseActivationPresenter is null
+                ? null
+                : token => licenseActivationPresenter.PresentAsync(token),
+            readLicenseSettings: ReadLicenseSettings);
         var settingsWorkspace = new SettingsView(settingsViewModel);
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),

@@ -1,4 +1,4 @@
-using BaiduBatchTransfer.App.Services;
+﻿using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Updates;
 using BaiduBatchTransfer.App.Features.Licensing;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -21,6 +21,13 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private readonly CancellationTokenSource lifetime = new();
     private readonly object lifecycleGate = new();
     private readonly object snapshotGate = new();
+    private readonly Func<CancellationToken, Task<bool>>? presentActivationAsync;
+    private readonly Func<LicenseSettingsSnapshot>? readLicenseSettings;
+    private string licensePackageName = "未激活";
+    private string licenseExpiresAt = "—";
+    private string licenseAuthorizationStatus = "未授权";
+    private string licenseMachineBindingStatus = "未绑定";
+    private bool canActivateLicense;
     private ApplicationUpdateStatus updateStatus;
     private string currentVersion = string.Empty;
     private string statusMessage = string.Empty;
@@ -54,7 +61,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         IApplicationCloseRequester closeRequester,
         SynchronizationContext synchronizationContext,
         ApplicationBuildInfo? buildInfo = null,
-        LicenseSettingsSnapshot? licenseSettings = null)
+        LicenseSettingsSnapshot? licenseSettings = null,
+        Func<CancellationToken, Task<bool>>? presentActivationAsync = null,
+        Func<LicenseSettingsSnapshot>? readLicenseSettings = null)
     {
         this.updateService = updateService ?? throw new ArgumentNullException(nameof(updateService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
@@ -64,13 +73,10 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         BuildLabel = (buildInfo ?? ApplicationBuildInfo.Current).IsOtaAcceptanceBuild
             ? "OTA 本地验收版"
             : string.Empty;
-        var license = licenseSettings ?? LicenseSettingsSnapshot.NotActivated;
-        LicensePackageName = string.IsNullOrWhiteSpace(license.PackageName)
-            ? "未激活"
-            : license.PackageName;
-        LicenseExpiresAt = license.ExpiryDisplay;
-        LicenseAuthorizationStatus = license.IsAuthorized ? "已授权" : "未授权";
-        LicenseMachineBindingStatus = license.IsMachineBound ? "已绑定当前电脑" : "未绑定";
+        this.presentActivationAsync = presentActivationAsync;
+        this.readLicenseSettings = readLicenseSettings;
+        ActivateLicenseCommand = new AsyncRelayCommand(ActivateLicenseAsync, () => CanActivateLicense);
+        ApplyLicense(licenseSettings ?? readLicenseSettings?.Invoke() ?? LicenseSettingsSnapshot.NotActivated);
 
         CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, CanCheckForUpdates);
         UpdateAndRestartCommand = new AsyncRelayCommand(UpdateAndRestartAsync, CanUpdateAndRestart);
@@ -86,13 +92,42 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
 
     public string BuildLabel { get; }
 
-    public string LicensePackageName { get; }
+    public string LicensePackageName
+    {
+        get => licensePackageName;
+        private set => SetProperty(ref licensePackageName, value);
+    }
 
-    public string LicenseExpiresAt { get; }
+    public string LicenseExpiresAt
+    {
+        get => licenseExpiresAt;
+        private set => SetProperty(ref licenseExpiresAt, value);
+    }
 
-    public string LicenseAuthorizationStatus { get; }
+    public string LicenseAuthorizationStatus
+    {
+        get => licenseAuthorizationStatus;
+        private set => SetProperty(ref licenseAuthorizationStatus, value);
+    }
 
-    public string LicenseMachineBindingStatus { get; }
+    public string LicenseMachineBindingStatus
+    {
+        get => licenseMachineBindingStatus;
+        private set => SetProperty(ref licenseMachineBindingStatus, value);
+    }
+
+    // 未授权时才显示激活入口。此前激活窗只在启动时弹一次，
+    // 用户点了“暂不激活”就只能重启软件才能再激活。
+    public bool CanActivateLicense
+    {
+        get => canActivateLicense;
+        private set
+        {
+            if (SetProperty(ref canActivateLicense, value)) ActivateLicenseCommand.NotifyCanExecuteChanged();
+        }
+    }
+
+    public IAsyncRelayCommand ActivateLicenseCommand { get; }
 
     public string CurrentVersion
     {
@@ -359,4 +394,23 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         SettingsViewModel ViewModel,
         ApplicationUpdateSnapshot Snapshot,
         long Sequence);
+
+    private void ApplyLicense(LicenseSettingsSnapshot license)
+    {
+        LicensePackageName = string.IsNullOrWhiteSpace(license.PackageName)
+            ? "未激活"
+            : license.PackageName;
+        LicenseExpiresAt = license.ExpiryDisplay;
+        LicenseAuthorizationStatus = license.IsAuthorized ? "已授权" : "未授权";
+        LicenseMachineBindingStatus = license.IsMachineBound ? "已绑定当前电脑" : "未绑定";
+        CanActivateLicense = !license.IsAuthorized && presentActivationAsync is not null;
+    }
+
+    private async Task ActivateLicenseAsync(CancellationToken cancellationToken)
+    {
+        if (presentActivationAsync is null) return;
+        await presentActivationAsync(cancellationToken).ConfigureAwait(true);
+        // 无论激活成功与否都重新读取：失败时状态保持不变，成功时立即反映到界面。
+        if (readLicenseSettings is not null) ApplyLicense(readLicenseSettings());
+    }
 }
