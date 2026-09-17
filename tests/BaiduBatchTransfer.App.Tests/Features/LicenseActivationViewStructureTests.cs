@@ -266,7 +266,7 @@ public sealed class LicenseActivationViewStructureTests
                     return completion.Task;
                 })
             {
-                Card = "CARD"
+                Card = "ABCD2345-EFGH6723-JKLM4567-NPQR2345"
             };
             var window = new LicenseActivationWindow(viewModel);
             var cancel = Assert.IsType<Button>(window.FindName("CancelButton"));
@@ -317,7 +317,7 @@ public sealed class LicenseActivationViewStructureTests
                     return new LicenseActivationResult(false, "license_not_found");
                 })
             {
-                Card = "CARD"
+                Card = "ABCD2345-EFGH6723-JKLM4567-NPQR2345"
             };
             var window = new LicenseActivationWindow(viewModel);
             var dispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
@@ -375,7 +375,7 @@ public sealed class LicenseActivationViewStructureTests
                 "知道综合工具",
                 (_, _) => Task.FromResult(new LicenseActivationResult(true, "ok")))
             {
-                Card = "CARD"
+                Card = "ABCD2345-EFGH6723-JKLM4567-NPQR2345"
             };
             var window = new LicenseActivationWindow(viewModel);
             _ = window.Dispatcher.BeginInvoke(new Action(() =>
