@@ -42,19 +42,33 @@
 
 ---
 
-## 3. 最大风险：核心功能一次真实验收都没跑过
+## 3. 最大风险：缺的是"真实验收证据"，不是"门禁没开"
 
-真实百度适配器仍**有意失败关闭**：
+> **勘误（2026-09-17）**：本节初稿沿用了 8 月旧交接的说法，称适配器
+> "有意失败关闭 / `UnavailableAdapterAvailability`"。**该说法已过时，是错的。**
+> 实测 `AppBootstrap.cs:277-283, 552-567` 后更正如下。
 
-- `IAdapterAvailability` → `UnavailableAdapterAvailability`
-- 结果页能力 → `UnavailableJobResultCapabilityAvailability`
-- 应用层结果动作 → `UnavailableJobResultActionCapability`
+适配器门禁**默认是开的**：
 
-也就是说：**449 个提交、约 10.6 万行生产代码、三套子系统（转存分享流水线 / 许可证 / OTA 更新 / 托管浏览器自动化），核心的"真实百度转存"从未验证过一次。**
+```csharp
+// AppBootstrap.cs:280
+acceptanceWriteLeaseOptions.IsEnabled
+    ? RemoteWriteExecutionMode.AcceptanceOnly   // 需启动参数显式开启
+    : RemoteWriteExecutionMode.DirectBackground // ← 默认，真实写入已启用
+```
 
-佐证：导出输出目录 `转存分享结果/` 至今为空——导出功能从未产出过任何真实文件。
+- 不带任何启动参数 → `DirectBackground` → `DirectBackgroundAdapterAvailability`，**真实百度读写已启用**。
+- `AcceptanceOnly`（受控验收模式，逐操作写入租约二次门禁）反而是**需要显式启动参数才进入**的受限模式。
 
-**优先级判断：在一条真实链接跑通之前，不应再新增功能。** 若适配器最终验收失败（例如百度接口给不出精确远端资源 ID），建立在其上的许可证与 OTA 全部作废。
+**因此真正的风险不是"没开"，而是**：门禁已开、代码会真实写用户网盘，
+但**没有任何文档记录过一次成功的真实百度端到端运行**。
+最接近的记录 `docs/testing/managed-transfer-final-submission-handoff.md`（2026-08-30）
+自述：`This is not production activation, a release, or live Baidu acceptance.`
+
+佐证：导出输出目录 `转存分享结果/` 至今为空——导出从未产出过真实文件。
+
+**这比原先的判断更危险**：原以为是"安全地锁着"，实际是"开着但没人验证过"。
+首次真实运行会直接写用户的真实网盘。**第一次跑必须用一次性测试账号。**
 
 ---
 
