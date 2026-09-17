@@ -8,7 +8,7 @@
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <Border Background="White" CornerRadius="10" Padding="16" Margin="0,0,0,12">
+        <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,0,0,14">
             <StackPanel>
                 <WrapPanel>
                     <TextBlock Text="资源：" Foreground="{StaticResource MutedBrush}" />
@@ -46,12 +46,12 @@
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
             <WrapPanel KeyboardNavigation.TabNavigation="Local">
                 <Button Content="下一页" Command="{Binding LoadNextPageCommand}" />
-                <Button Content="刷新结果" Command="{Binding RefreshCommand}" Margin="8,0,0,0" />
-                <Button Content="选中失败" Command="{Binding SelectFailedCommand}" Margin="8,0,0,0" />
-                <Button Content="清除选择" Command="{Binding ClearSelectionCommand}" Margin="8,0,0,0" />
+                <Button Content="刷新结果" Command="{Binding RefreshCommand}" Margin="10,0,0,10" />
+                <Button Content="选中失败" Command="{Binding SelectFailedCommand}" Margin="10,0,0,10" />
+                <Button Content="清除选择" Command="{Binding ClearSelectionCommand}" Margin="10,0,0,10" />
                 <Button Content="复制链接和提取码" Command="{Binding CopyGeneratedShareCommand}"
-                        CommandParameter="{Binding SelectedItem, ElementName=ResultsGrid}" Margin="8,0,0,0" />
-                <Button Content="另存结果表格" Command="{Binding SaveAsCommand}" Margin="8,0,0,0" />
+                        CommandParameter="{Binding SelectedItem, ElementName=ResultsGrid}" Margin="10,0,0,10" />
+                <Button Content="另存结果表格" Command="{Binding SaveAsCommand}" Margin="10,0,0,10" />
                 <Menu VerticalAlignment="Center" Background="Transparent">
                     <MenuItem Header="更多">
                         <MenuItem Header="重试分享" Command="{Binding RetryShareOnlyCommand}" />
