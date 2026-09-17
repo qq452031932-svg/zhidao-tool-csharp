@@ -2,10 +2,10 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="{Binding ProductName}" Icon="{DynamicResource ProductWindowIcon}"
-        Width="520"
-        Height="430"
+        Width="560"
+        Height="620"
         MinWidth="360"
-        MinHeight="280"
+        MinHeight="420"
         ResizeMode="CanResize"
         ShowInTaskbar="False"
         WindowStartupLocation="CenterOwner">
@@ -256,15 +256,15 @@
                                    AutomationProperties.LiveSetting="Polite"
                                    AutomationProperties.Name="授权状态" />
                         </Border>
-                        <TextBlock x:Name="PurchaseHint"
+                        <TextBlock x:Name="ContactHint"
                                Style="{StaticResource ActivationBodyHintStyle}"
                                Grid.Row="5"
                                HorizontalAlignment="Left"
                                VerticalAlignment="Center"
                                FontSize="12"
                                TextWrapping="Wrap"
-                               Text="{Binding PurchaseHintText}"
-                               AutomationProperties.Name="购买卡密方式" />
+                               Text="{Binding ContactHintText}"
+                               AutomationProperties.Name="联系方式" />
                         <StackPanel Grid.Row="5"
                                 HorizontalAlignment="Right"
                                 Orientation="Horizontal">

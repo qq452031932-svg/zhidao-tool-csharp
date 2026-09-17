@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -107,8 +107,8 @@ public sealed class LicenseActivationViewModel : ObservableObject
     public string ProductName { get; }
     public string ActivateButtonText => IsActivating ? "正在激活…" : "立即激活";
 
-    // 购买渠道文案。留空时界面上不显示任何内容，因此未配置也不会出现占位残留。
-    public string PurchaseHintText { get; init; } = string.Empty;
+    // 联系方式文案，纯展示，不是续费入口也不是到期提醒。留空时界面上不显示任何内容。
+    public string ContactHintText { get; init; } = string.Empty;
 
     public string Card
     {

@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 
 namespace BaiduBatchTransfer.App.Features.Licensing;
 
@@ -23,7 +23,7 @@ public sealed class WpfLicenseActivationPresenter(
         cancellationToken.ThrowIfCancellationRequested();
         var viewModel = new LicenseActivationViewModel(productName, activateAsync)
         {
-            PurchaseHintText = "购买卡密请联系微信：swatfanhua",
+            ContactHintText = "购买卡密请联系微信：swatfanhua",
         };
         var window = new LicenseActivationWindow(viewModel);
         var owner = System.Windows.Application.Current?.MainWindow;
