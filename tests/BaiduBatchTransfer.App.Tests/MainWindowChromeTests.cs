@@ -67,10 +67,10 @@ public sealed class MainWindowChromeTests
 
         Assert.Contains("Source=\"Styles/SuperPanTheme.xaml\"", appXaml);
         Assert.Equal(1, appXaml.Split("x:Key=\"BooleanToVisibilityConverter\"", StringSplitOptions.None).Length - 1);
-        Assert.Contains("#18262E", theme);
-        Assert.Contains("#131E24", theme);
-        Assert.Contains("#334B58", theme);
-        Assert.Contains("#1C4A4A", theme);
+        Assert.Contains("#171F25", theme);
+        Assert.Contains("#141B20", theme);
+        Assert.Contains("#2E3B43", theme);
+        Assert.Contains("#1B3F3E", theme);
         Assert.Contains("#17402B", theme);
         Assert.Contains("#43350F", theme);
         Assert.Contains("#4A2226", theme);
