@@ -40,6 +40,59 @@
                     </Trigger>
                 </Style.Triggers>
             </Style>
+            <!-- WPF 默认 Expander 模板会为展开箭头预留缩进，压窄内容宽度并把
+                 工具栏挤成两行。这里用最小模板：标题行可点，内容区占满宽度。 -->
+            <Style x:Key="FlatExpanderStyle" TargetType="Expander">
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="Padding" Value="0" />
+                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Expander">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <ToggleButton x:Name="HeaderToggle"
+                                              IsChecked="{Binding IsExpanded, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                              Background="Transparent" BorderThickness="0"
+                                              Cursor="Hand" Padding="0" HorizontalContentAlignment="Stretch"
+                                              AutomationProperties.Name="展开或收起导入与配置">
+                                    <ToggleButton.Template>
+                                        <ControlTemplate TargetType="ToggleButton">
+                                            <Grid Background="Transparent">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <ContentPresenter />
+                                                <TextBlock x:Name="Chevron" Grid.Column="1" Text="&#xE70E;"
+                                                           FontFamily="Segoe MDL2 Assets" FontSize="12"
+                                                           VerticalAlignment="Center" Margin="8,0,0,0"
+                                                           Foreground="{StaticResource MutedBrush}" />
+                                            </Grid>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsChecked" Value="False">
+                                                    <Setter TargetName="Chevron" Property="Text" Value="&#xE70D;" />
+                                                </Trigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </ToggleButton.Template>
+                                    <ContentPresenter ContentSource="Header" />
+                                </ToggleButton>
+                                <ContentPresenter x:Name="Body" Grid.Row="1" />
+                            </Grid>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsExpanded" Value="False">
+                                    <Setter TargetName="Body" Property="Height" Value="0" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
         </Grid.Resources>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -47,66 +100,69 @@
         </Grid.RowDefinitions>
 
         <Border x:Name="TransferToolbar" Grid.Row="0"
-                Style="{StaticResource BorderedPanelStyle}" Padding="16,14" Margin="0,0,0,12"
+                Style="{StaticResource BorderedPanelStyle}" Padding="10,12" Margin="0,0,0,10"
                 IsEnabled="{Binding CanEditConfiguration}">
-            <Grid>
+            <!-- 配置区可折叠：配好之后收起，把垂直空间让给下方的结果表格。
+                 展开状态下表格只能显示三四行，这正是界面显得拥挤的主因。 -->
+            <Expander x:Name="ConfigurationExpander" IsExpanded="True" Style="{StaticResource FlatExpanderStyle}">
+                <Expander.Header>
+                    <StackPanel Margin="0,0,0,2">
+                        <TextBlock Text="导入与配置" FontSize="15" FontWeight="SemiBold" />
+                        <TextBlock Text="选择来源、目标目录与并发，然后开始转存"
+                                   Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0" />
+                    </StackPanel>
+                </Expander.Header>
+            <Grid Margin="0,12,0,0">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
-                <!-- 分区标题：无名面板会让整块内容读成一片，标题给出落脚点。 -->
-                <StackPanel Grid.Row="0" Margin="0,0,0,14">
-                    <TextBlock Text="导入与配置" FontSize="15" FontWeight="SemiBold" />
-                    <TextBlock Text="选择来源、目标目录与并发，然后开始转存"
-                               Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0" />
-                </StackPanel>
-                <WrapPanel x:Name="TopConfigurationToolbar" Grid.Row="1">
+                <WrapPanel x:Name="TopConfigurationToolbar" Grid.Row="0">
                     <Button Content="导入粘贴内容" Command="{Binding Import.ImportTextCommand}"
-                            Style="{StaticResource SecondaryButtonStyle}" Padding="14,7" Margin="0,0,10,10" />
+                            Style="{StaticResource SecondaryButtonStyle}" Padding="2,4" Margin="0,0,2,6" />
                     <Button Content="选择 Excel" Command="{Binding Import.SelectAndImportExcelCommand}"
-                            Style="{StaticResource SecondaryButtonStyle}" Padding="14,7" Margin="0,0,10,10" />
+                            Style="{StaticResource SecondaryButtonStyle}" Padding="2,4" Margin="0,0,2,6" />
                     <Button Content="清空" Command="{Binding ClearCurrentImportCommand}"
                             AutomationProperties.Name="清空当前导入"
                             AutomationProperties.HelpText="只清除本地待处理导入，不影响百度网盘文件和分享链接"
                             ToolTip="只清除本地待处理导入，不影响百度网盘文件和分享链接"
                             Style="{StaticResource DangerHistoryButton}"
-                            Padding="14,7" Margin="0,0,10,10" />
-                    <StackPanel Orientation="Horizontal" Margin="0,0,20,10">
+                            Padding="2,4" Margin="0,0,2,6" />
+                    <StackPanel Orientation="Horizontal" Margin="0,0,6,6">
                         <TextBlock Text="目标目录" ToolTip="默认目标目录" AutomationProperties.Name="默认目标目录"
                                    VerticalAlignment="Center"
-                                   Foreground="{StaticResource MutedBrush}" Margin="0,0,8,0" />
-                        <Button MinWidth="150" MaxWidth="280"
+                                   Foreground="{StaticResource MutedBrush}" Margin="0,0,6,0" />
+                        <Button MinWidth="100" MaxWidth="180"
                                 Content="{Binding Wizard.DefaultTargetPath}"
                                 ToolTip="{Binding Wizard.DefaultTargetPath}"
                                 Command="{Binding PickTargetDirectoryCommand}"
-                                Style="{StaticResource SecondaryButtonStyle}" Padding="14,7"
+                                Style="{StaticResource SecondaryButtonStyle}" Padding="8,4"
                                 AutomationProperties.Name="选择百度保存目录" />
                     </StackPanel>
-                    <StackPanel Orientation="Horizontal" Margin="0,0,20,10">
+                    <StackPanel Orientation="Horizontal" Margin="0,0,6,6">
                         <TextBlock Text="并发" VerticalAlignment="Center"
-                                   Foreground="{StaticResource MutedBrush}" Margin="0,0,8,0" />
-                        <ComboBox Width="76" ItemsSource="{Binding ConcurrencyOptions}"
+                                   Foreground="{StaticResource MutedBrush}" Margin="0,0,6,0" />
+                        <ComboBox Width="58" ItemsSource="{Binding ConcurrencyOptions}"
                                   SelectedItem="{Binding MaxConcurrency}" />
                     </StackPanel>
-                    <StackPanel Orientation="Horizontal" Margin="0,0,20,10">
+                    <StackPanel Orientation="Horizontal" Margin="0,0,6,6">
                         <TextBlock Text="结果目录" ToolTip="结果保存目录" AutomationProperties.Name="结果保存目录"
                                    VerticalAlignment="Center"
-                                   Foreground="{StaticResource MutedBrush}" Margin="0,0,8,0" />
-                        <TextBox x:Name="ShareResultDirectoryInput" Width="240"
+                                   Foreground="{StaticResource MutedBrush}" Margin="0,0,6,0" />
+                        <TextBox x:Name="ShareResultDirectoryInput" Width="100"
                                  Text="{Binding ShareResultDirectory, UpdateSourceTrigger=PropertyChanged}"
                                  AutomationProperties.Name="本机结果目录" ToolTip="本机结果目录"
                                  VerticalContentAlignment="Center" />
                         <Button Content="选择目录" Command="{Binding PickShareResultDirectoryCommand}"
-                                Style="{StaticResource SecondaryButtonStyle}" Padding="14,7" Margin="8,0,0,0" />
+                                Style="{StaticResource SecondaryButtonStyle}" Padding="6,4" Margin="4,0,0,0" />
                     </StackPanel>
                     <Button x:Name="StartTransferButton" Content="开始转存"
                             Command="{Binding StartCommand}" Style="{StaticResource PrimaryButton}"
                             ToolTip="{Binding ConfigurationMessage}"
                             AutomationProperties.HelpText="{Binding Wizard.ValidationMessage}"
-                            FontWeight="SemiBold" Padding="22,7" Margin="0,0,0,10" />
+                            FontWeight="SemiBold" Padding="10,4" Margin="0,0,0,6" />
                 </WrapPanel>
-                <TextBox x:Name="BulkPasteInput" Grid.Row="2" MinLines="2" MaxLines="8" Margin="0,4,0,0"
+                <TextBox x:Name="BulkPasteInput" Grid.Row="1" MinLines="2" MaxLines="8" Margin="0,4,0,0"
                          Text="{Binding Import.TextContent, UpdateSourceTrigger=PropertyChanged}"
                          AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
                          AutomationProperties.Name="百度分享文字" ToolTip="可一次粘贴多条分享链接，支持标题和提取码"
@@ -118,12 +174,13 @@
                     </TextBox.Style>
                 </TextBox>
             </Grid>
+            </Expander>
         </Border>
 
         <Border x:Name="TransferDataRegion" Grid.Row="1"
-                Style="{StaticResource BorderedPanelStyle}" Padding="0" Margin="0,0,0,8">
+                Style="{StaticResource BorderedPanelStyle}" Padding="0" Margin="0,0,0,4">
             <Grid>
-                <TabControl Margin="8,0,8,8"
+                <TabControl Margin="10,0,10,6"
                             SelectedIndex="{Binding SelectedDataTabIndex}">
                     <TabControl.Resources>
                         <Style TargetType="TabItem">

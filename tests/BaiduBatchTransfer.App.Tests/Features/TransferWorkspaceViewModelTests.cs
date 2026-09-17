@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;

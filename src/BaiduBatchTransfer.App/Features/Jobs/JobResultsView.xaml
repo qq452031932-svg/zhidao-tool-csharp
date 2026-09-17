@@ -8,7 +8,7 @@
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,0,0,14">
+        <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,8" Margin="0,0,0,8">
             <StackPanel>
                 <WrapPanel>
                     <TextBlock Text="资源：" Foreground="{StaticResource MutedBrush}" />
@@ -44,7 +44,7 @@
                 <DataGridTextColumn Header="新提取码" Binding="{Binding GeneratedExtractionCode}" Width="Auto" MinWidth="88" />
             </DataGrid.Columns>
         </DataGrid>
-        <Grid Grid.Row="2" Margin="0,12,0,0">
+        <Grid Grid.Row="2" Margin="0,8,0,0">
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
             <WrapPanel KeyboardNavigation.TabNavigation="Local">
                 <Button Content="下一页" Command="{Binding LoadNextPageCommand}" />
@@ -68,7 +68,7 @@
                     </MenuItem>
                 </Menu>
             </WrapPanel>
-            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,8,0,0">
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,6,0,0">
                 <TextBlock Text="{Binding StatusMessage}" AutomationProperties.LiveSetting="Polite"
                            AutomationProperties.Name="{Binding StatusMessage}" />
                 <TextBlock Text="  已写入：" Margin="16,0,0,0" />
