@@ -291,44 +291,44 @@
                         </Border>
                         <!-- 单行动作区：在 520x430 的下限里两个按钮都必须完整可见，
                              这一约束由 ActivationWindowKeepsActionsVisibleOrScrollAccessibleWhenSpaceShrinks 断言。 -->
-                        <Grid Grid.Row="6">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock x:Name="ContactHint"
-                                       Style="{StaticResource ActivationBodyHintStyle}"
-                                       VerticalAlignment="Center"
-                                       FontSize="12"
-                                       TextWrapping="Wrap"
-                                       Text="{Binding ContactHintText}"
-                                       AutomationProperties.Name="联系方式" />
+                        <!-- 联系方式独占一行居中，按钮行随之居中：两块上下对齐，
+                             不再是左下角一行小字配右下角两个按钮的失衡布局。 -->
+                        <TextBlock x:Name="ContactHint"
+                                   Grid.Row="5"
+                                   Style="{StaticResource ActivationBodyHintStyle}"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   Margin="0,6,0,10"
+                                   FontSize="12"
+                                   TextWrapping="Wrap"
+                                   TextAlignment="Center"
+                                   Text="{Binding ContactHintText}"
+                                   AutomationProperties.Name="联系方式" />
+                        <StackPanel Grid.Row="6"
+                                    Orientation="Horizontal"
+                                    HorizontalAlignment="Center">
                             <Button x:Name="CancelButton"
-                                    Grid.Column="1"
                                     Style="{StaticResource ActivationSecondaryButtonStyle}"
                                     Content="暂不激活"
-                                    MinWidth="96"
+                                    MinWidth="120"
                                     MinHeight="42"
-                                    Margin="10,0,0,0"
                                     Padding="14,8"
                                     Command="{Binding CloseCommand}"
                                     IsCancel="True"
                                     AutomationProperties.Name="暂不激活" />
                             <Button x:Name="ActivateButton"
-                                    Grid.Column="2"
                                     Style="{StaticResource ActivationPrimaryButtonStyle}"
                                     Content="{Binding ActivateButtonText}"
-                                    MinWidth="140"
+                                    MinWidth="160"
                                     MinHeight="42"
-                                    Margin="10,0,0,0"
+                                    Margin="12,0,0,0"
                                     Padding="16,8"
                                     FontSize="15"
                                     FontWeight="SemiBold"
                                     Command="{Binding ActivateCommand}"
                                     IsDefault="True"
                                     AutomationProperties.Name="{Binding ActivateButtonText}" />
-                        </Grid>
+                        </StackPanel>
                     </Grid>
                 </ScrollViewer>
             </Grid>
