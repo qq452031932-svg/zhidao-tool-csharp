@@ -404,6 +404,32 @@ public sealed class ReplacementWorkbookExportTests
     }
 
     [Fact]
+    public void SplitFileNameUsesAccountResultAndTimestamp()
+    {
+        var result = new ReplacementWorkbookFileNameBuilder().BuildSplit("账号A", "成功", Now);
+        Assert.Equal("账号A_成功_20260823091011.xlsx", result);
+    }
+
+    [Fact]
+    public async Task SplitExportPublishesSuccessAndFailureFilesPerAccount()
+    {
+        var account = Guid.NewGuid(); var resource = Guid.NewGuid();
+        var publisher = new SplitCapturingPublisher();
+        var service = new ReplacementWorkbookExportService(
+            new StubProjectionRepository(
+                OriginalDefinition(account),
+                new([OriginalResource(resource)], [
+                    new(resource, account, 1, "Succeeded", ShareOperationStatus.Succeeded, "https://new", "n123", null),
+                    new(Guid.NewGuid(), account, 1, "Failed", null, null, null, "ERR")], null)),
+            new ReplacementWorkbookFileNameBuilder(), new FixedTimeProvider(Now));
+
+        var receipts = await service.ExportSplitToDirectoryAsync(new(Guid.NewGuid()), "out", publisher);
+        Assert.Single(receipts);
+        Assert.Equal("账号A_成功_20260823091011.xlsx", publisher.Files[0].Name);
+        Assert.Contains("成功", publisher.Files[0].Rows.Single().TextCells);
+    }
+
+    [Fact]
     public void SuggestedFileNameBoundsLongSourceNameWithStableHash()
     {
         var source = new string('长', 300) + ".xlsx";
@@ -514,6 +540,16 @@ public sealed class ReplacementWorkbookExportTests
                 Path.Combine(destinationDirectory, finalFileName),
                 rowCount,
                 SheetCount: 1);
+        }
+    }
+
+    private sealed class SplitCapturingPublisher : IReplacementWorkbookFilePublisher
+    {
+        public List<(string Name, List<ReplacementWorkbookRow> Rows)> Files { get; } = [];
+        public async Task<ReplacementWorkbookFilePublishReceipt> PublishAsync(string destinationDirectory, string finalFileName, ReplacementWorkbookLayout layout, IAsyncEnumerable<ReplacementWorkbookRow> rows, CancellationToken cancellationToken = default)
+        {
+            var list = new List<ReplacementWorkbookRow>(); await foreach (var row in rows.WithCancellation(cancellationToken)) list.Add(row);
+            Files.Add((finalFileName, list)); return new(Path.Combine(destinationDirectory, finalFileName), list.Count, 1);
         }
     }
 

@@ -218,6 +218,56 @@ public sealed class JobResultsViewModelTests
     }
 
     [Fact]
+
+    public async Task SelectFailedLoadsAllPagesSelectsOnlyUnsuccessfulStatusesAndClearRemovesSelection()
+    {
+        var failed = Row(1) with { TransferStatus = "Failed", ShareStatus = "Failed" };
+        var paused = Row(2) with { TransferStatus = "Paused", ShareStatus = "Waiting" };
+        var pending = Row(3) with { TransferStatus = "ResultPending", ShareStatus = "ResultPending" };
+        var waiting = Row(4) with { TransferStatus = "Waiting", ShareStatus = "Waiting" };
+        var cancelled = Row(5) with { TransferStatus = "Cancelled", ShareStatus = "Cancelled" };
+        var unknown = Row(6) with { TransferStatus = "FutureState", ShareStatus = null };
+        var success = Row(7) with { TransferStatus = "Succeeded", ShareStatus = "Succeeded" };
+        var workflow = new FakeWorkflow
+        {
+            Pages = [
+                new([failed, success, paused], 7, 1),
+                new([pending, waiting, cancelled, unknown], 7, null),
+            ],
+        };
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        await vm.SelectFailedCommand.ExecuteAsync(null);
+
+        Assert.Equal(6, vm.SelectedFailedCount);
+        Assert.DoesNotContain(success.TransferOperationId, vm.SelectedFailedOperationIds);
+        Assert.Contains(failed.TransferOperationId, vm.SelectedFailedOperationIds);
+        Assert.Contains(unknown.TransferOperationId, vm.SelectedFailedOperationIds);
+        Assert.Equal(2, workflow.RequestedPageSizes.Count);
+
+        await vm.ClearSelectionCommand.ExecuteAsync(null);
+
+        Assert.Empty(vm.SelectedFailedOperationIds);
+        Assert.Equal(0, vm.SelectedFailedCount);
+    }
+
+    [Fact]
+    public async Task FailedSelectionSurvivesRefreshAndDoesNotStartAnyWorkflowAction()
+    {
+        var failed = Row(1) with { TransferStatus = "Failed", ShareStatus = "Failed" };
+        var workflow = new FakeWorkflow { Pages = [new([failed], 1, null)] };
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+        await vm.SelectFailedCommand.ExecuteAsync(null);
+
+        await vm.RefreshAsync();
+
+        Assert.Contains(failed.TransferOperationId, vm.SelectedFailedOperationIds);
+        Assert.Equal(0, workflow.ResumedTransferCalls);
+        Assert.Null(workflow.RetriedShareOperationId);
+    }
+    [Fact]
     public async Task LicenseFailureStopsManualShareRetryBeforeWorkflowMutation()
     {
         var workflow = new FakeWorkflow { Pages = [new([Row(1)], 1, null)] };

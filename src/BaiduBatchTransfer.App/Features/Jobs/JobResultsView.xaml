@@ -47,6 +47,8 @@
             <WrapPanel KeyboardNavigation.TabNavigation="Local">
                 <Button Content="下一页" Command="{Binding LoadNextPageCommand}" />
                 <Button Content="刷新结果" Command="{Binding RefreshCommand}" Margin="8,0,0,0" />
+                <Button Content="选中失败" Command="{Binding SelectFailedCommand}" Margin="8,0,0,0" />
+                <Button Content="清除选择" Command="{Binding ClearSelectionCommand}" Margin="8,0,0,0" />
                 <Button Content="复制链接和提取码" Command="{Binding CopyGeneratedShareCommand}"
                         CommandParameter="{Binding SelectedItem, ElementName=ResultsGrid}" Margin="8,0,0,0" />
                 <Button Content="另存结果表格" Command="{Binding SaveAsCommand}" Margin="8,0,0,0" />

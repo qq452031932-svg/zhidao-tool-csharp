@@ -4,6 +4,8 @@ namespace BaiduBatchTransfer.Application.Jobs;
 
 public sealed record ReplacementWorkbookExportRequest(Guid BatchJobId, int PageSize = 500);
 
+public sealed record SplitReplacementWorkbookReceipt(string AccountDisplayName, string ResultKind, ReplacementWorkbookFilePublishReceipt Receipt);
+
 public sealed record ReplacementWorkbookExportResult(long ExportedRows, string SuggestedFileName)
 {
     public override string ToString() =>
