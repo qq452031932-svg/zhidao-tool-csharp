@@ -2,8 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="{Binding ProductName}" Icon="{DynamicResource ProductWindowIcon}"
-        Width="560"
-        Height="500"
+        Width="600"
+        Height="440"
         MinWidth="360"
         MinHeight="420"
         ResizeMode="CanResize"
@@ -177,7 +177,6 @@
 
     <Grid Margin="24">
         <Border Style="{StaticResource ActivationCardStyle}"
-                VerticalAlignment="Center"
                 BorderThickness="1"
                 CornerRadius="16">
             <Grid>
@@ -207,7 +206,7 @@
                 <ScrollViewer x:Name="ActivationScrollViewer"
                               Grid.Row="1"
                               VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Auto">
+                              HorizontalScrollBarVisibility="Disabled">
                     <Grid x:Name="ActivationBody" Margin="30,12,30,14">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -215,6 +214,7 @@
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" MinHeight="12" />
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
@@ -291,7 +291,7 @@
                         </Border>
                         <!-- 单行动作区：在 520x430 的下限里两个按钮都必须完整可见，
                              这一约束由 ActivationWindowKeepsActionsVisibleOrScrollAccessibleWhenSpaceShrinks 断言。 -->
-                        <Grid Grid.Row="5">
+                        <Grid Grid.Row="6">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
