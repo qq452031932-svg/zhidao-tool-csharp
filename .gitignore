@@ -1,4 +1,14 @@
 .worktrees/
+/.tools/
 **/bin/
 **/obj/
 **/artifacts/
+**/.artifacts/
+**/__pycache__/
+.tmp/
+**/license-local/
+
+# 本地代理/工具产生的临时物，不应进入仓库
+/.superpowers/
+/.codex-patch-probe
+/转存分享结果/
