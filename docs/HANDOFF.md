@@ -108,6 +108,38 @@ var layout = new ReplacementWorkbookLayout(
 
 ## 6. 已知缺陷与红灯（不要描述成"全绿"）
 
+### 6.0 功能分支 Release 构建当前失败 ⛔（2026-09-17 实测）
+
+```text
+dotnet build --configuration Release
+→ 生成失败。0 个警告，1 个错误
+BaiduBatchTransfer.App.csproj(239,5): error MSB3073
+  ValidateManagedBrowserHelperReleasePackage 门禁失败：
+  external manifest differs from the fixed source manifest
+```
+
+**这直接推翻了旧交接"Release 全方案构建：0 警告、0 错误"的记录。**
+
+其余项目均构建成功（Core / Application / Infrastructure / BaiduAdapter /
+SuperPan.Licensing.Client / Benchmarks 及各测试项目），**只有 WPF App 项目失败**。
+
+根因（已定位）：
+
+- 门禁比对 `tools/managed_browser_helper/helper-manifest.json`（已提交）
+  与 `.artifacts/managed-session-pipeline-20260901/helper-bundle-r2/helper-manifest.json`（本地产物）。
+- 差异仅一处：`share_submission.py` 由 22728 字节变为 24763 字节，`buildIdentity` 随之改变。
+- 即：helper 源码在 `5dba75c3`（2026-09-11）更新过，**但本地 bundle 仍是 2026-09-01 的 r2，从未重新生成**。
+
+**衍生的结构性问题**：Release 构建**硬依赖一个被 `.gitignore` 忽略的目录**
+（`**/.artifacts/`）。这意味着**任何全新克隆都无法 Release 构建 App**，
+CI 亦然。重建脚本 `scripts/build_managed_browser_helper.ps1` 存在，
+但它需要联网从 python.org 下载 CPython 3.14.0 嵌入包、从 PyPI 下载 wheel
+（均有 SHA256 固定校验）。
+
+修复路径二选一，**需用户决策**：
+1. 重跑 `scripts/build_managed_browser_helper.ps1` 重新生成 bundle（需联网下载）；
+2. 改为把确定性 bundle 纳入版本管理或制品仓库，解除对 gitignored 本地状态的依赖（治本）。
+
 ### 6.1 两个性能门禁长期未通过
 
 | 用例 | 实测 | 阈值 |
@@ -144,9 +176,10 @@ var layout = new ReplacementWorkbookLayout(
 
 ## 7. 下一步执行顺序
 
+0. **[需用户决策]** 先修复 6.0 的 Release 构建失败——**构建不过，下面每一步都无从谈起**。
 1. **[需用户决策]** 解决 4.1 的列语义矛盾，并据此处置 4.2 的计划文档。
 2. **[需用户决策]** 对 449 个提交收口：合并进主干，或承认 `master` 已死、将功能分支改名为主干。**继续悬着，风险每天递增。**
-3. 在功能分支跑一次全量构建 + 测试，取得**当前真实基线**（旧交接中的数字来自 8 月，已不可信）。
+3. 构建恢复后跑一次全量测试，取得**当前真实基线**（旧交接中的数字来自 8 月，已不可信；Release 构建那一项现已证伪）。
 4. 修复 6.2 列出的问题，并补齐对应测试。
 5. **现场验收最小闭环**：1 个用户自有测试账号 + 1 条无敏感内容链接 → 单账号转存 → 确认精确远端资源 ID 落库 → 分享 → 导出结果 Excel。
 6. 验收通过后再处理 6.1 的性能门禁与大文件拆分。
