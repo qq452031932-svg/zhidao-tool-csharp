@@ -5,29 +5,29 @@
         Title="百度网页操作" Icon="{DynamicResource ProductWindowIcon}"
         Width="1180" Height="820" MinWidth="960" MinHeight="680"
         WindowStartupLocation="CenterOwner">
-    <Grid Background="#F5F8FC">
+    <Grid Background="{StaticResource SurfaceBrush}">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <Border Background="White" BorderBrush="#DCE5EF" BorderThickness="0,0,0,1" Padding="20,14">
+        <Border Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="20,14">
             <StackPanel>
                 <TextBlock Text="百度网页操作" FontSize="22" FontWeight="SemiBold" />
                 <TextBlock Text="软件一次只处理一个账号。需要验证时，请直接在下方可见页面中完成。"
-                           Margin="0,7,0,0" Foreground="#52677B" TextWrapping="Wrap" />
+                           Margin="0,7,0,0" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
             </StackPanel>
         </Border>
-        <Border Grid.Row="1" Margin="16" Background="White" BorderBrush="#DCE5EF" BorderThickness="1">
+        <Border Grid.Row="1" Margin="16" Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="1">
             <wv2:WebView2 x:Name="Browser" />
         </Border>
-        <Border Grid.Row="2" Background="White" BorderBrush="#DCE5EF" BorderThickness="0,1,0,0" Padding="20,12">
+        <Border Grid.Row="2" Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="0,1,0,0" Padding="20,12">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="#24445F"
+                <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}"
                            Text="正在准备可见浏览器……" TextWrapping="Wrap"
                            AutomationProperties.Name="网页操作状态"
                            AutomationProperties.LiveSetting="Assertive" />

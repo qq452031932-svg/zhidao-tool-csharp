@@ -5,24 +5,24 @@
         Title="{Binding WindowTitle}" Icon="{DynamicResource ProductWindowIcon}"
         Width="1120" Height="780" MinWidth="900" MinHeight="620"
         WindowStartupLocation="CenterOwner">
-    <Grid Background="#F5F8FC">
+    <Grid Background="{StaticResource SurfaceBrush}">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <Border Background="White" BorderBrush="#DCE5EF" BorderThickness="0,0,0,1" Padding="20,16">
+        <Border Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="20,16">
             <StackPanel>
                 <TextBlock Text="{Binding Heading}" FontSize="22" FontWeight="SemiBold" />
-                <TextBlock Text="{Binding Instructions}" Margin="0,8,0,0" Foreground="#52677B"
+                <TextBlock Text="{Binding Instructions}" Margin="0,8,0,0" Foreground="{StaticResource MutedBrush}"
                            TextWrapping="Wrap" />
             </StackPanel>
         </Border>
-        <Border Grid.Row="1" Margin="16" Background="White" BorderBrush="#DCE5EF" BorderThickness="1">
+        <Border Grid.Row="1" Margin="16" Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="1">
             <wv2:WebView2 x:Name="Browser" />
         </Border>
-        <Border Grid.Row="2" Background="White" BorderBrush="#DCE5EF" BorderThickness="0,1,0,0" Padding="20,12">
-            <TextBlock Text="{Binding Status}" Foreground="#24445F" TextWrapping="Wrap" />
+        <Border Grid.Row="2" Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="0,1,0,0" Padding="20,12">
+            <TextBlock Text="{Binding Status}" Foreground="{StaticResource TextBrush}" TextWrapping="Wrap" />
         </Border>
     </Grid>
 </Window>

@@ -91,7 +91,7 @@
             </Grid.ColumnDefinitions>
             <TextBlock Text="{Binding StatusMessage}"
                        TextWrapping="Wrap"
-                       Foreground="#B54708"
+                       Foreground="#E8A33D"
                        VerticalAlignment="Center"
                        automation:AutomationProperties.LiveSetting="Polite" />
             <StackPanel Grid.Column="1" Orientation="Horizontal">

@@ -168,8 +168,8 @@
                     </StackPanel>
                     <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="12,0" VerticalAlignment="Center">
                         <TextBlock Text="{Binding TotalCount, StringFormat=全部 {0:N0}}" FontWeight="SemiBold" />
-                        <TextBlock Text="{Binding ValidCount, StringFormat=有效 {0:N0}}" Foreground="#1E8E5A" Margin="8,0,0,0" />
-                        <TextBlock Text="{Binding InvalidCount, StringFormat=失效 {0:N0}}" Foreground="#E5484D" Margin="8,0,0,0" />
+                        <TextBlock Text="{Binding ValidCount, StringFormat=有效 {0:N0}}" Foreground="#3FD68A" Margin="8,0,0,0" />
+                        <TextBlock Text="{Binding InvalidCount, StringFormat=失效 {0:N0}}" Foreground="#FF7B72" Margin="8,0,0,0" />
                     </StackPanel>
                     <Button Grid.Column="3" Content="刷新数据" Command="{Binding RefreshCommand}"
                             ToolTip="{Binding StatusMessage}" AutomationProperties.HelpText="{Binding StatusMessage}"

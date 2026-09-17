@@ -7,7 +7,7 @@
     <StackPanel Margin="24">
         <TextBlock Text="{Binding Title}" FontSize="22" FontWeight="SemiBold" />
         <TextBlock Text="{Binding Instructions}" TextWrapping="Wrap" Margin="0,16,0,12" />
-        <TextBlock Text="{Binding CapabilityNotice}" TextWrapping="Wrap" Foreground="#B54708" Margin="0,0,0,16" />
+        <TextBlock Text="{Binding CapabilityNotice}" TextWrapping="Wrap" Foreground="#E8A33D" Margin="0,0,0,16" />
         <TextBlock Text="浏览器类型（目录中同时存在 Chrome 和 Edge 时必须选择）" TextWrapping="Wrap" />
         <ComboBox ItemsSource="{Binding BrowserFamilies}" DisplayMemberPath="DisplayName"
                   SelectedValuePath="Family" SelectedValue="{Binding SelectedFamily}"

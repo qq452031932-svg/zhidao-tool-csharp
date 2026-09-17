@@ -17,3 +17,6 @@ tools/managed_browser_helper/transfer_source.py text eol=lf
 tools/managed_browser_helper/transfer_source_listing.py text eol=lf
 tools/managed_browser_helper/transfer_submission.py text eol=lf
 tools/managed_browser_helper/transfer_target_baseline.py text eol=lf
+src/BaiduBatchTransfer.App/Branding/ProductIdentity.Generated.cs text eol=lf
+src/BaiduBatchTransfer.LegacyLauncher/ProductIdentity.Generated.cs text eol=lf
+services/ota_admin/internal/release/product_identity_generated.go text eol=lf

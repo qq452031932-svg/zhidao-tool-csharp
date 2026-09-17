@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 
 namespace BaiduBatchTransfer.App.Tests;
 
@@ -67,13 +67,13 @@ public sealed class MainWindowChromeTests
 
         Assert.Contains("Source=\"Styles/SuperPanTheme.xaml\"", appXaml);
         Assert.Equal(1, appXaml.Split("x:Key=\"BooleanToVisibilityConverter\"", StringSplitOptions.None).Length - 1);
-        Assert.Contains("#08B7B7", theme);
-        Assert.Contains("#F7F9FC", theme);
-        Assert.Contains("#E3E8EF", theme);
-        Assert.Contains("#EAF6FF", theme);
-        Assert.Contains("#DFF7E8", theme);
-        Assert.Contains("#FFF6D8", theme);
-        Assert.Contains("#FDE8E8", theme);
+        Assert.Contains("#101E25", theme);
+        Assert.Contains("#0B1519", theme);
+        Assert.Contains("#22343C", theme);
+        Assert.Contains("#14313A", theme);
+        Assert.Contains("#12301F", theme);
+        Assert.Contains("#33290F", theme);
+        Assert.Contains("#3A1A1C", theme);
         Assert.Contains("x:Key=\"ToolbarButtonStyle\"", theme);
         Assert.Contains("Height\" Value=\"34\"", theme);
         Assert.Contains("x:Key=\"SecondaryButtonStyle\"", theme);

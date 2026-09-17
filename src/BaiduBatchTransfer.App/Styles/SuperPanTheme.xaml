@@ -1,12 +1,12 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <Color x:Key="TitleBarColor">#08B7B7</Color>
-    <Color x:Key="PageColor">#F7F9FC</Color>
-    <Color x:Key="BorderColor">#E3E8EF</Color>
-    <Color x:Key="NavSelectedColor">#EAF6FF</Color>
-    <Color x:Key="SuccessRowColor">#DFF7E8</Color>
-    <Color x:Key="WarningRowColor">#FFF6D8</Color>
-    <Color x:Key="FailureRowColor">#FDE8E8</Color>
+    <Color x:Key="TitleBarColor">#101E25</Color>
+    <Color x:Key="PageColor">#0B1519</Color>
+    <Color x:Key="BorderColor">#22343C</Color>
+    <Color x:Key="NavSelectedColor">#14313A</Color>
+    <Color x:Key="SuccessRowColor">#12301F</Color>
+    <Color x:Key="WarningRowColor">#33290F</Color>
+    <Color x:Key="FailureRowColor">#3A1A1C</Color>
 
     <SolidColorBrush x:Key="TitleBarBrush" Color="{StaticResource TitleBarColor}" />
     <SolidColorBrush x:Key="PageBrush" Color="{StaticResource PageColor}" />
@@ -17,11 +17,11 @@
     <SolidColorBrush x:Key="FailureRowBrush" Color="{StaticResource FailureRowColor}" />
 
     <!-- Compatibility tokens retained for the existing views while they migrate to the new shell. -->
-    <SolidColorBrush x:Key="BrandBrush" Color="#1478B8" />
+    <SolidColorBrush x:Key="BrandBrush" Color="#0E7C6E" />
     <SolidColorBrush x:Key="BrandSoftBrush" Color="{StaticResource NavSelectedColor}" />
-    <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFF" />
-    <SolidColorBrush x:Key="TextBrush" Color="#17233D" />
-    <SolidColorBrush x:Key="MutedBrush" Color="#667085" />
+    <SolidColorBrush x:Key="SurfaceBrush" Color="#16242B" />
+    <SolidColorBrush x:Key="TextBrush" Color="#E6EEF2" />
+    <SolidColorBrush x:Key="MutedBrush" Color="#93A9B2" />
 
     <Style TargetType="Window">
         <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
@@ -35,7 +35,7 @@
         <Setter Property="Padding" Value="14,6" />
         <Setter Property="Margin" Value="0,0,8,0" />
         <Setter Property="Cursor" Value="Hand" />
-        <Setter Property="Background" Value="White" />
+        <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
         <Setter Property="BorderThickness" Value="1" />
@@ -74,7 +74,7 @@
     <Style TargetType="ComboBox">
         <Setter Property="Height" Value="34" />
         <Setter Property="Padding" Value="10,4" />
-        <Setter Property="Background" Value="White" />
+        <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
         <Setter Property="BorderThickness" Value="1" />
@@ -118,7 +118,7 @@
                                     MaxHeight="320"
                                     Margin="0,2,0,0"
                                     Padding="2"
-                                    Background="White"
+                                    Background="{StaticResource SurfaceBrush}"
                                     BorderBrush="{StaticResource PanelBorderBrush}"
                                     BorderThickness="1"
                                     CornerRadius="4">
@@ -144,7 +144,7 @@
     <Style TargetType="TextBox">
         <Setter Property="Height" Value="34" />
         <Setter Property="Padding" Value="10,4" />
-        <Setter Property="Background" Value="White" />
+        <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
         <Setter Property="BorderThickness" Value="1" />
@@ -182,7 +182,7 @@
 
     <Style x:Key="SecondaryButtonStyle" TargetType="Button"
            BasedOn="{StaticResource ToolbarButtonStyle}">
-        <Setter Property="Background" Value="White" />
+        <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
         <Setter Property="BorderThickness" Value="1" />
@@ -220,7 +220,7 @@
     </Style>
 
     <Style x:Key="DenseDataGridStyle" TargetType="DataGrid">
-        <Setter Property="Background" Value="White" />
+        <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="GridLinesVisibility" Value="Horizontal" />

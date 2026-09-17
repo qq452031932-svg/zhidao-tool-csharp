@@ -5,29 +5,29 @@
         Title="百度现场验收（仅开发调试）" Icon="{DynamicResource ProductWindowIcon}"
         Width="1180" Height="820" MinWidth="960" MinHeight="680"
         WindowStartupLocation="CenterOwner">
-    <Grid Background="#F5F8FC">
+    <Grid Background="{StaticResource SurfaceBrush}">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <Border Background="White" BorderBrush="#DCE5EF" BorderThickness="0,0,0,1" Padding="20,14">
+        <Border Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="20,14">
             <StackPanel>
                 <TextBlock Text="现场验收模式" FontSize="22" FontWeight="SemiBold" />
-                <TextBlock Margin="0,7,0,0" Foreground="#52677B" TextWrapping="Wrap"
+                <TextBlock Margin="0,7,0,0" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap"
                            Text="此窗口使用一次性的隔离浏览器目录，不读取登录态。页面禁用脚本和交互，仅允许百度官方 HTTPS 的 GET/HEAD 观察请求；不会执行转存、分享或其他远端写入。仅可手动保存已脱敏的接口结构。" />
             </StackPanel>
         </Border>
-        <Border Grid.Row="1" Margin="16" Background="White" BorderBrush="#DCE5EF" BorderThickness="1">
+        <Border Grid.Row="1" Margin="16" Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="1">
             <wv2:WebView2 x:Name="Browser" IsHitTestVisible="False" Focusable="False" />
         </Border>
-        <Border Grid.Row="2" Background="White" BorderBrush="#DCE5EF" BorderThickness="0,1,0,0" Padding="20,12">
+        <Border Grid.Row="2" Background="White" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="0,1,0,0" Padding="20,12">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="#24445F"
+                <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}"
                            Text="正在准备安全验收窗口……" TextWrapping="Wrap" />
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
                     <Button Content="关闭（不保存）" MinWidth="116" Click="OnCancel" />

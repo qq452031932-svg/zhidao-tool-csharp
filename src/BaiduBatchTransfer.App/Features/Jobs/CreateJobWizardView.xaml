@@ -135,7 +135,7 @@
                                 <TextBlock Text="已有分享：" VerticalAlignment="Center" />
                                 <TextBlock Text="{Binding ExistingSharePolicyText}" FontWeight="SemiBold" VerticalAlignment="Center" />
                             </WrapPanel>
-                            <TextBlock Text="{Binding ShareCapabilityStatusMessage}" Foreground="#B54708"
+                            <TextBlock Text="{Binding ShareCapabilityStatusMessage}" Foreground="#E8A33D"
                                        TextWrapping="Wrap" Margin="0,8,0,0" />
                         </StackPanel>
                     </GroupBox>
@@ -145,7 +145,7 @@
                         <Button Content="账号优先级" Command="{Binding UseAccountPriorityCommand}" />
                         <Button Content="暂停等待补充" Command="{Binding UseWaitForCandidatesCommand}" />
                     </WrapPanel>
-                    <TextBlock Text="{Binding WarningMessage}" Foreground="#B54708" TextWrapping="Wrap" Margin="0,8,0,0" />
+                    <TextBlock Text="{Binding WarningMessage}" Foreground="#E8A33D" TextWrapping="Wrap" Margin="0,8,0,0" />
                 </StackPanel>
             </Border>
 
@@ -211,8 +211,8 @@
                     </DataGrid>
                     <TextBlock Text="{Binding RequiredFreeBytes, StringFormat=预计需要本机空间：{0:N0} 字节}" />
                     <TextBlock Text="{Binding AvailableFreeBytes, StringFormat=当前可用本机空间：{0:N0} 字节}" Margin="0,3,0,8" />
-                    <TextBlock Text="{Binding ValidationMessage}" Foreground="#B42318" TextWrapping="Wrap" />
-                    <TextBlock Text="{Binding AdapterStatusMessage}" Foreground="#B54708" TextWrapping="Wrap" Margin="0,4,0,0" />
+                    <TextBlock Text="{Binding ValidationMessage}" Foreground="#FF7B72" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding AdapterStatusMessage}" Foreground="#E8A33D" TextWrapping="Wrap" Margin="0,4,0,0" />
                     <TextBlock Text="{Binding StatusMessage}" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="0,4,0,0" />
                     <CheckBox Content="我已核对模式、账号、配额、目录、同名策略、检测方式和资源不足策略"
                               IsChecked="{Binding IsFinalConfirmationChecked}" Margin="0,12,0,12" />

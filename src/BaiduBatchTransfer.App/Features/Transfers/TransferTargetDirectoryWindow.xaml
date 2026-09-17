@@ -43,7 +43,7 @@
                  AutomationProperties.Name="百度网盘文件夹" />
 
         <TextBlock Grid.Row="3" Margin="0,10,0,0" MinHeight="20"
-                   Text="{Binding ErrorMessage}" Foreground="#C53030"
+                   Text="{Binding ErrorMessage}" Foreground="#FF7B72"
                    TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
 
         <StackPanel Grid.Row="4" Margin="0,14,0,0" Orientation="Horizontal"
