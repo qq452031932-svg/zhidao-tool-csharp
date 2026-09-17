@@ -21,7 +21,10 @@ public sealed class WpfLicenseActivationPresenter(
     public Task<bool> PresentAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var viewModel = new LicenseActivationViewModel(productName, activateAsync);
+        var viewModel = new LicenseActivationViewModel(productName, activateAsync)
+        {
+            PurchaseHintText = "购买卡密请联系微信：swatfanhua",
+        };
         var window = new LicenseActivationWindow(viewModel);
         var owner = System.Windows.Application.Current?.MainWindow;
         if (owner is not null && owner != window) window.Owner = owner;

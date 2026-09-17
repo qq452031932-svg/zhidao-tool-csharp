@@ -1,4 +1,4 @@
-using System.Xml.Linq;
+﻿using System.Xml.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -33,7 +33,7 @@ public sealed class LicenseActivationViewStructureTests
             .ToArray();
         Assert.Contains("软件授权", textBindings);
         Assert.Contains("请输入卡密", textBindings);
-        Assert.Contains("示例：XXXX-XXXX-XXXX", textBindings);
+        Assert.Contains("示例：ABCD2345-EFGH6723-JKLM4567-NPQR2345（4 组，每组 8 位）", textBindings);
         Assert.Contains("卡密将绑定当前电脑，请确认后激活", textBindings);
         Assert.Contains("{Binding StatusMessage}", textBindings);
         Assert.Contains("{Binding ProductName}", textBindings);
@@ -86,7 +86,7 @@ public sealed class LicenseActivationViewStructureTests
             value.Contains("StatusMessage", StringComparison.Ordinal));
         Assert.Contains("授权状态", automationNames);
         Assert.Contains("卡密输入", automationNames);
-        Assert.Contains("卡密格式示例：XXXX-XXXX-XXXX", automationNames);
+        Assert.Contains("卡密格式示例：4 组，每组 8 位，用横线分隔", automationNames);
         Assert.Contains("{Binding ActivateButtonText}", automationNames);
         Assert.Contains("暂不激活", automationNames);
     }

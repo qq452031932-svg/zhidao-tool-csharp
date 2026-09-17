@@ -1,4 +1,4 @@
-using BaiduBatchTransfer.App.Features.Licensing;
+﻿using BaiduBatchTransfer.App.Features.Licensing;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -17,12 +17,13 @@ public sealed class LicenseActivationViewModelTests
             });
         LicenseActivationCloseRequestedEventArgs? closeRequest = null;
         viewModel.CloseRequested += (_, request) => closeRequest = request;
-        viewModel.Card = " \uFF33\uFF30-\uFF11\uFF12\uFF13 ";
+        // \u5168\u89D2\u3001\u5C0F\u5199\u3001\u7F3A\u6A2A\u7EBF\u3001\u9996\u5C3E\u7A7A\u767D\u7684\u6DF7\u5408\u8F93\u5165\uFF0C\u5E94\u5F52\u4E00\u5316\u4E3A\u670D\u52A1\u7AEF\u8981\u6C42\u7684 4 \u7EC4 8 \u4F4D\u5927\u5199\u5F62\u6001\u3002
+        viewModel.Card = " \uFF41bcd2345efgh6723 jklm4567-npqr2345 ";
 
         await viewModel.ActivateCommand.ExecuteAsync(null);
 
-        Assert.Equal("SP-123", submittedCard);
-        Assert.Equal("SP-123", viewModel.Card);
+        Assert.Equal("ABCD2345-EFGH6723-JKLM4567-NPQR2345", submittedCard);
+        Assert.Equal("ABCD2345-EFGH6723-JKLM4567-NPQR2345", viewModel.Card);
         Assert.Equal("激活成功", viewModel.StatusMessage);
         Assert.True(Assert.IsType<LicenseActivationCloseRequestedEventArgs>(closeRequest).IsActivated);
     }
@@ -44,7 +45,7 @@ public sealed class LicenseActivationViewModelTests
                 return completion.Task;
             })
         {
-            Card = "CARD"
+            Card = "ABCD2345-EFGH6723-JKLM4567-NPQR2345"
         };
         viewModel.CloseRequested += (_, _) => closeRequests++;
 
@@ -79,7 +80,7 @@ public sealed class LicenseActivationViewModelTests
                 return completion.Task;
             })
         {
-            Card = "CARD"
+            Card = "ABCD2345-EFGH6723-JKLM4567-NPQR2345"
         };
         var changes = new List<string?>();
         viewModel.PropertyChanged += (_, args) => changes.Add(args.PropertyName);
@@ -119,7 +120,7 @@ public sealed class LicenseActivationViewModelTests
             "SuperPan",
             (_, _) => Task.FromResult(new LicenseActivationResult(false, code)))
         {
-            Card = "SECRET-CARD"
+            Card = "ABCD2345-EFGH6723-JKLM4567-NPQR2345"
         };
         var closeRequests = 0;
         viewModel.CloseRequested += (_, _) => closeRequests++;
@@ -163,7 +164,7 @@ public sealed class LicenseActivationViewModelTests
             "SuperPan",
             (_, _) => throw new InvalidOperationException("card=SECRET machine=PRIVATE signature=INTERNAL"))
         {
-            Card = "SECRET"
+            Card = "ABCD2345-EFGH6723-JKLM4567-NPQR2345"
         };
 
         await viewModel.ActivateCommand.ExecuteAsync(null);

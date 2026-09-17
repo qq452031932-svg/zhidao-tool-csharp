@@ -220,8 +220,9 @@
                                Grid.Row="2"
                                Margin="0,8,0,0"
                                FontSize="12"
-                               Text="示例：XXXX-XXXX-XXXX"
-                               AutomationProperties.Name="卡密格式示例：XXXX-XXXX-XXXX" />
+                               Text="示例：ABCD2345-EFGH6723-JKLM4567-NPQR2345（4 组，每组 8 位）"
+                               TextWrapping="Wrap"
+                               AutomationProperties.Name="卡密格式示例：4 组，每组 8 位，用横线分隔" />
                         <TextBlock x:Name="CardBindingHint"
                                Style="{StaticResource ActivationBodyHintStyle}"
                                Grid.Row="3"
@@ -229,6 +230,16 @@
                                FontSize="12"
                                Text="卡密将绑定当前电脑，请确认后激活"
                                TextWrapping="Wrap" />
+                        <TextBlock x:Name="CardProgressHint"
+                               Style="{StaticResource ActivationBodyHintStyle}"
+                               Grid.Row="3"
+                               Margin="0,5,0,0"
+                               FontSize="12"
+                               HorizontalAlignment="Right"
+                               VerticalAlignment="Top"
+                               Text="{Binding CardProgressHint}"
+                               AutomationProperties.LiveSetting="Polite"
+                               AutomationProperties.Name="卡密输入进度" />
                         <Border x:Name="ActivationStatusRegion"
                             Style="{StaticResource ActivationStatusRegionStyle}"
                             Grid.Row="4"
@@ -245,6 +256,15 @@
                                    AutomationProperties.LiveSetting="Polite"
                                    AutomationProperties.Name="授权状态" />
                         </Border>
+                        <TextBlock x:Name="PurchaseHint"
+                               Style="{StaticResource ActivationBodyHintStyle}"
+                               Grid.Row="5"
+                               HorizontalAlignment="Left"
+                               VerticalAlignment="Center"
+                               FontSize="12"
+                               TextWrapping="Wrap"
+                               Text="{Binding PurchaseHintText}"
+                               AutomationProperties.Name="购买卡密方式" />
                         <StackPanel Grid.Row="5"
                                 HorizontalAlignment="Right"
                                 Orientation="Horizontal">
