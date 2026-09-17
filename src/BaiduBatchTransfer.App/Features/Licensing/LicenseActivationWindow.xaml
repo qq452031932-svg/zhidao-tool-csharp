@@ -145,6 +145,9 @@
             <Setter Property="Background" Value="#0B1C24" />
             <Setter Property="BorderBrush" Value="#1F3F4C" />
             <Style.Triggers>
+                <DataTrigger Binding="{Binding StatusMessage}" Value="">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
                             Value="{DynamicResource {x:Static SystemColors.WindowBrushKey}}" />
