@@ -57,8 +57,8 @@ public sealed class LicenseActivationViewStructureTests
         Assert.Contains("Text=\"{Binding Card, Mode=TwoWay", markup, StringComparison.Ordinal);
         Assert.Contains("Command=\"{Binding ActivateCommand}\"", markup, StringComparison.Ordinal);
         Assert.Contains("Command=\"{Binding CloseCommand}\"", markup, StringComparison.Ordinal);
-        Assert.Contains("#00796B", markup, StringComparison.Ordinal);
-        Assert.Contains("Property=\"Background\" Value=\"White\"", markup, StringComparison.Ordinal);
+        Assert.Contains("#0E7C6E", markup, StringComparison.Ordinal);
+        Assert.Contains("Property=\"Background\" Value=\"#11242E\"", markup, StringComparison.Ordinal);
         Assert.DoesNotContain("续费", markup, StringComparison.Ordinal);
         Assert.DoesNotContain("支付", markup, StringComparison.Ordinal);
         Assert.DoesNotContain("购买", markup, StringComparison.Ordinal);
@@ -113,8 +113,8 @@ public sealed class LicenseActivationViewStructureTests
         var subtitleForeground = StyleSetterValue(document, "ActivationHeaderSubtitleStyle", "Foreground");
         var buttonBackground = StyleSetterValue(document, "ActivationPrimaryButtonStyle", "Background");
         var buttonForeground = StyleSetterValue(document, "ActivationPrimaryButtonStyle", "Foreground");
-        Assert.Equal("#00796B", headerBackground);
-        Assert.Equal(headerBackground, buttonBackground);
+        Assert.Equal("#11242E", headerBackground);
+        Assert.Equal("#0E7C6E", buttonBackground);
         Assert.True(ContrastRatio(titleForeground, headerBackground) >= 4.5);
         Assert.True(ContrastRatio(subtitleForeground, headerBackground) >= 4.5);
         Assert.True(ContrastRatio(buttonForeground, buttonBackground) >= 4.5);

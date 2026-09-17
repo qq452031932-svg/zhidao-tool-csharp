@@ -9,10 +9,23 @@
         ResizeMode="CanResize"
         ShowInTaskbar="False"
         WindowStartupLocation="CenterOwner">
+    <Window.Style>
+        <Style TargetType="{x:Type Window}" BasedOn="{StaticResource {x:Type Window}}">
+            <Setter Property="Background" Value="#081319" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
+                    <Setter Property="Background"
+                            Value="{DynamicResource {x:Static SystemColors.WindowBrushKey}}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </Window.Style>
     <Window.Resources>
+        <!-- 深色玻璃卡片。品牌色与对比度在 LicenseActivationViewStructureTests 中有断言：
+             正文与背景的对比度必须 ≥ 4.5，高对比度模式必须改用系统画刷。 -->
         <Style x:Key="ActivationCardStyle" TargetType="{x:Type Border}">
-            <Setter Property="Background" Value="White" />
-            <Setter Property="BorderBrush" Value="#D6E5E1" />
+            <Setter Property="Background" Value="#11242E" />
+            <Setter Property="BorderBrush" Value="#1F3F4C" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -23,38 +36,38 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationHeaderStyle" TargetType="{x:Type Border}">
-            <Setter Property="Background" Value="#00796B" />
+            <Setter Property="Background" Value="#11242E" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
-                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                            Value="{DynamicResource {x:Static SystemColors.WindowBrushKey}}" />
                 </DataTrigger>
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationHeaderTitleStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="White" />
+            <Setter Property="Foreground" Value="#FFFFFF" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
-                            Value="{DynamicResource {x:Static SystemColors.HighlightTextBrushKey}}" />
+                            Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}" />
                 </DataTrigger>
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationHeaderSubtitleStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#D9FFF7" />
+            <Setter Property="Foreground" Value="#9FBAC4" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
-                            Value="{DynamicResource {x:Static SystemColors.HighlightTextBrushKey}}" />
+                            Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}" />
                 </DataTrigger>
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationPrimaryButtonStyle"
                TargetType="{x:Type Button}"
                BasedOn="{StaticResource {x:Type Button}}">
-            <Setter Property="Background" Value="#00796B" />
-            <Setter Property="BorderBrush" Value="#00796B" />
-            <Setter Property="Foreground" Value="White" />
+            <Setter Property="Background" Value="#0E7C6E" />
+            <Setter Property="BorderBrush" Value="#17A493" />
+            <Setter Property="Foreground" Value="#FFFFFF" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -69,9 +82,9 @@
         <Style x:Key="ActivationSecondaryButtonStyle"
                TargetType="{x:Type Button}"
                BasedOn="{StaticResource {x:Type Button}}">
-            <Setter Property="Background" Value="White" />
-            <Setter Property="BorderBrush" Value="#9CB9B3" />
-            <Setter Property="Foreground" Value="#365A53" />
+            <Setter Property="Background" Value="#16303B" />
+            <Setter Property="BorderBrush" Value="#2A4F5C" />
+            <Setter Property="Foreground" Value="#C6DCE3" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -84,7 +97,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationBodyLabelStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#173B36" />
+            <Setter Property="Foreground" Value="#E8F3F6" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
@@ -93,7 +106,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationBodyHintStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#647773" />
+            <Setter Property="Foreground" Value="#93AAB3" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
@@ -104,8 +117,14 @@
         <Style x:Key="ActivationTextBoxStyle"
                TargetType="{x:Type TextBox}"
                BasedOn="{StaticResource {x:Type TextBox}}">
-            <Setter Property="BorderBrush" Value="#AACBC4" />
+            <Setter Property="Background" Value="#0B1C24" />
+            <Setter Property="Foreground" Value="#E8F3F6" />
+            <Setter Property="BorderBrush" Value="#27505F" />
+            <Setter Property="CaretBrush" Value="#17A493" />
             <Style.Triggers>
+                <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                    <Setter Property="BorderBrush" Value="#17A493" />
+                </Trigger>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
                             Value="{DynamicResource {x:Static SystemColors.WindowBrushKey}}" />
@@ -123,8 +142,8 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationStatusRegionStyle" TargetType="{x:Type Border}">
-            <Setter Property="Background" Value="#F3F8F7" />
-            <Setter Property="BorderBrush" Value="#D6E5E1" />
+            <Setter Property="Background" Value="#0B1C24" />
+            <Setter Property="BorderBrush" Value="#1F3F4C" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -135,7 +154,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationStatusTextStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#365A53" />
+            <Setter Property="Foreground" Value="#D7E7EC" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
@@ -144,24 +163,11 @@
             </Style.Triggers>
         </Style>
     </Window.Resources>
-    <Window.Style>
-        <Style TargetType="{x:Type Window}"
-               BasedOn="{StaticResource {x:Type Window}}">
-            <Setter Property="Background" Value="#EDF4F2" />
-            <Style.Triggers>
-                <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
-                    <Setter Property="Background"
-                            Value="{DynamicResource {x:Static SystemColors.WindowBrushKey}}" />
-                    <Setter Property="Foreground"
-                            Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}" />
-                </DataTrigger>
-            </Style.Triggers>
-        </Style>
-    </Window.Style>
-    <Grid Margin="28">
+
+    <Grid Margin="24">
         <Border Style="{StaticResource ActivationCardStyle}"
                 BorderThickness="1"
-                CornerRadius="12">
+                CornerRadius="16">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
@@ -170,18 +176,19 @@
 
                 <Border x:Name="ActivationHeader"
                         Style="{StaticResource ActivationHeaderStyle}"
-                        MinHeight="112"
-                        CornerRadius="11,11,0,0"
-                        Padding="30,22">
-                    <StackPanel VerticalAlignment="Center">
-                        <TextBlock Text="{Binding ProductName}"
-                                   Style="{StaticResource ActivationHeaderTitleStyle}"
-                                   FontSize="25"
-                                   FontWeight="SemiBold" />
+                        CornerRadius="16,16,0,0"
+                        Padding="30,16,30,6">
+                    <StackPanel HorizontalAlignment="Center">
                         <TextBlock Text="软件授权"
+                                   Style="{StaticResource ActivationHeaderTitleStyle}"
+                                   FontSize="22"
+                                   FontWeight="Bold"
+                                   HorizontalAlignment="Center" />
+                        <TextBlock Text="{Binding ProductName}"
                                    Style="{StaticResource ActivationHeaderSubtitleStyle}"
-                                   Margin="0,6,0,0"
-                                   FontSize="14" />
+                                   FontSize="13"
+                                   Margin="0,4,0,0"
+                                   HorizontalAlignment="Center" />
                     </StackPanel>
                 </Border>
 
@@ -189,7 +196,7 @@
                               Grid.Row="1"
                               VerticalScrollBarVisibility="Auto"
                               HorizontalScrollBarVisibility="Auto">
-                    <Grid x:Name="ActivationBody" Margin="30,24,30,0">
+                    <Grid x:Name="ActivationBody" Margin="30,12,30,14">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
@@ -205,90 +212,111 @@
                                    FontSize="14"
                                    FontWeight="SemiBold" />
                         <TextBox x:Name="CardInput"
-                             Style="{StaticResource ActivationTextBoxStyle}"
-                             Grid.Row="1"
-                             Height="48"
-                             Margin="0,8,0,0"
-                             Padding="12,10"
-                             VerticalContentAlignment="Center"
-                             BorderThickness="1"
-                             FontSize="15"
-                             Text="{Binding Card, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                             AutomationProperties.Name="卡密输入" />
-                        <TextBlock x:Name="CardExampleHint"
-                               Style="{StaticResource ActivationBodyHintStyle}"
-                               Grid.Row="2"
-                               Margin="0,8,0,0"
-                               FontSize="12"
-                               Text="示例：ABCD2345-EFGH6723-JKLM4567-NPQR2345（4 组，每组 8 位）"
-                               TextWrapping="Wrap"
-                               AutomationProperties.Name="卡密格式示例：4 组，每组 8 位，用横线分隔" />
-                        <TextBlock x:Name="CardBindingHint"
-                               Style="{StaticResource ActivationBodyHintStyle}"
-                               Grid.Row="3"
-                               Margin="0,5,0,0"
-                               FontSize="12"
-                               Text="卡密将绑定当前电脑，请确认后激活"
-                               TextWrapping="Wrap" />
-                        <TextBlock x:Name="CardProgressHint"
-                               Style="{StaticResource ActivationBodyHintStyle}"
-                               Grid.Row="3"
-                               Margin="0,5,0,0"
-                               FontSize="12"
-                               HorizontalAlignment="Right"
-                               VerticalAlignment="Top"
-                               Text="{Binding CardProgressHint}"
-                               AutomationProperties.LiveSetting="Polite"
-                               AutomationProperties.Name="卡密输入进度" />
-                        <Border x:Name="ActivationStatusRegion"
-                            Style="{StaticResource ActivationStatusRegionStyle}"
-                            Grid.Row="4"
-                            MinHeight="44"
-                            Margin="0,15,0,16"
-                            Padding="12,10"
-                            VerticalAlignment="Top"
-                            BorderThickness="1"
-                            CornerRadius="6">
-                        <TextBlock x:Name="ActivationStatusText"
-                                   Style="{StaticResource ActivationStatusTextStyle}"
-                                   Text="{Binding StatusMessage}"
-                                   TextWrapping="Wrap"
-                                   AutomationProperties.LiveSetting="Polite"
-                                   AutomationProperties.Name="授权状态" />
+                                 Style="{StaticResource ActivationTextBoxStyle}"
+                                 Grid.Row="1"
+                                 Height="48"
+                                 Margin="0,8,0,0"
+                                 Padding="14,8"
+                                 VerticalContentAlignment="Center"
+                                 BorderThickness="1"
+                                 FontSize="16"
+                                 FontFamily="Consolas, Microsoft YaHei UI"
+                                 Text="{Binding Card, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                 AutomationProperties.Name="卡密输入" />
+                        <Border Grid.Row="2"
+                                Style="{StaticResource ActivationStatusRegionStyle}"
+                                BorderThickness="1"
+                                CornerRadius="8"
+                                Margin="0,8,0,0"
+                                Padding="12,8">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="CardExampleHint"
+                                           Style="{StaticResource ActivationBodyHintStyle}"
+                                           FontSize="12"
+                                           TextWrapping="Wrap"
+                                           VerticalAlignment="Center"
+                                           Text="示例：ABCD2345-EFGH6723-JKLM4567-NPQR2345（4 组，每组 8 位）"
+                                           AutomationProperties.Name="卡密格式示例：4 组，每组 8 位，用横线分隔" />
+                                <TextBlock x:Name="CardProgressHint"
+                                           Grid.Column="1"
+                                           Style="{StaticResource ActivationBodyHintStyle}"
+                                           FontSize="12"
+                                           Margin="12,0,0,0"
+                                           VerticalAlignment="Center"
+                                           Text="{Binding CardProgressHint}"
+                                           AutomationProperties.LiveSetting="Polite"
+                                           AutomationProperties.Name="卡密输入进度" />
+                            </Grid>
                         </Border>
-                        <TextBlock x:Name="ContactHint"
-                               Style="{StaticResource ActivationBodyHintStyle}"
-                               Grid.Row="5"
-                               HorizontalAlignment="Left"
-                               VerticalAlignment="Center"
-                               FontSize="12"
-                               TextWrapping="Wrap"
-                               Text="{Binding ContactHintText}"
-                               AutomationProperties.Name="联系方式" />
-                        <StackPanel Grid.Row="5"
-                                HorizontalAlignment="Right"
-                                Orientation="Horizontal">
-                        <Button x:Name="CancelButton"
-                                Style="{StaticResource ActivationSecondaryButtonStyle}"
-                                Content="暂不激活"
-                                MinWidth="104"
-                                MinHeight="40"
-                                Padding="14,8"
-                                Command="{Binding CloseCommand}"
-                                IsCancel="True"
-                                AutomationProperties.Name="暂不激活" />
-                        <Button x:Name="ActivateButton"
-                                Style="{StaticResource ActivationPrimaryButtonStyle}"
-                                Content="{Binding ActivateButtonText}"
-                                MinWidth="112"
-                                MinHeight="40"
-                                Padding="14,8"
-                                Margin="12,0,0,0"
-                                FontWeight="SemiBold"
-                                Command="{Binding ActivateCommand}"
-                                IsDefault="True"
-                                AutomationProperties.Name="{Binding ActivateButtonText}" />
-                        </StackPanel>
+                        <TextBlock x:Name="CardBindingHint"
+                                   Style="{StaticResource ActivationBodyHintStyle}"
+                                   Grid.Row="3"
+                                   Margin="0,8,0,0"
+                                   FontSize="12"
+                                   HorizontalAlignment="Center"
+                                   TextWrapping="Wrap"
+                                   Text="卡密将绑定当前电脑，请确认后激活" />
+                        <Border x:Name="ActivationStatusRegion"
+                                Style="{StaticResource ActivationStatusRegionStyle}"
+                                Grid.Row="4"
+                                MinHeight="44"
+                                Margin="0,10,0,10"
+                                Padding="12,8"
+                                VerticalAlignment="Top"
+                                BorderThickness="1"
+                                CornerRadius="8">
+                            <TextBlock x:Name="ActivationStatusText"
+                                       Style="{StaticResource ActivationStatusTextStyle}"
+                                       Text="{Binding StatusMessage}"
+                                       FontSize="13"
+                                       TextWrapping="Wrap"
+                                       AutomationProperties.LiveSetting="Polite"
+                                       AutomationProperties.Name="授权状态" />
+                        </Border>
+                        <!-- 单行动作区：在 520x430 的下限里两个按钮都必须完整可见，
+                             这一约束由 ActivationWindowKeepsActionsVisibleOrScrollAccessibleWhenSpaceShrinks 断言。 -->
+                        <Grid Grid.Row="5">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="ContactHint"
+                                       Style="{StaticResource ActivationBodyHintStyle}"
+                                       VerticalAlignment="Center"
+                                       FontSize="12"
+                                       TextWrapping="Wrap"
+                                       Text="{Binding ContactHintText}"
+                                       AutomationProperties.Name="联系方式" />
+                            <Button x:Name="CancelButton"
+                                    Grid.Column="1"
+                                    Style="{StaticResource ActivationSecondaryButtonStyle}"
+                                    Content="暂不激活"
+                                    MinWidth="96"
+                                    MinHeight="42"
+                                    Margin="10,0,0,0"
+                                    Padding="14,8"
+                                    Command="{Binding CloseCommand}"
+                                    IsCancel="True"
+                                    AutomationProperties.Name="暂不激活" />
+                            <Button x:Name="ActivateButton"
+                                    Grid.Column="2"
+                                    Style="{StaticResource ActivationPrimaryButtonStyle}"
+                                    Content="{Binding ActivateButtonText}"
+                                    MinWidth="140"
+                                    MinHeight="42"
+                                    Margin="10,0,0,0"
+                                    Padding="16,8"
+                                    FontSize="15"
+                                    FontWeight="SemiBold"
+                                    Command="{Binding ActivateCommand}"
+                                    IsDefault="True"
+                                    AutomationProperties.Name="{Binding ActivateButtonText}" />
+                        </Grid>
                     </Grid>
                 </ScrollViewer>
             </Grid>
