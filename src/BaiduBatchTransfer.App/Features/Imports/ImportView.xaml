@@ -34,7 +34,7 @@
             <StackPanel>
                 <TextBlock Text="{Binding StatisticsText}" FontWeight="SemiBold" />
                 <TextBlock Text="{Binding StatusMessage}" Margin="0,6,0,0" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
-                <TextBlock Text="{Binding AdapterStatusMessage}" Margin="0,4,0,0" Foreground="#E8A33D" TextWrapping="Wrap" />
+                <TextBlock Text="{Binding AdapterStatusMessage}" Margin="0,4,0,0" Foreground="#B54708" TextWrapping="Wrap" />
             </StackPanel>
         </Border>
         <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0">

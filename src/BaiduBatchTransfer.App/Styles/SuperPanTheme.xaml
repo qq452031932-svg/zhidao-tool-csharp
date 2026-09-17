@@ -1,12 +1,12 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <Color x:Key="TitleBarColor">#171F25</Color>
-    <Color x:Key="PageColor">#141B20</Color>
-    <Color x:Key="BorderColor">#2E3B43</Color>
-    <Color x:Key="NavSelectedColor">#1B3F3E</Color>
-    <Color x:Key="SuccessRowColor">#17402B</Color>
-    <Color x:Key="WarningRowColor">#43350F</Color>
-    <Color x:Key="FailureRowColor">#4A2226</Color>
+    <Color x:Key="TitleBarColor">#FFFFFF</Color>
+    <Color x:Key="PageColor">#F4F6F8</Color>
+    <Color x:Key="BorderColor">#E3E8ED</Color>
+    <Color x:Key="NavSelectedColor">#E3F6F2</Color>
+    <Color x:Key="SuccessRowColor">#E9F8EF</Color>
+    <Color x:Key="WarningRowColor">#FFF7E6</Color>
+    <Color x:Key="FailureRowColor">#FDEBEC</Color>
 
     <SolidColorBrush x:Key="TitleBarBrush" Color="{StaticResource TitleBarColor}" />
     <SolidColorBrush x:Key="PageBrush" Color="{StaticResource PageColor}" />
@@ -17,14 +17,14 @@
     <SolidColorBrush x:Key="FailureRowBrush" Color="{StaticResource FailureRowColor}" />
 
     <!-- Compatibility tokens retained for the existing views while they migrate to the new shell. -->
-    <SolidColorBrush x:Key="BrandBrush" Color="#0E7C6E" />
+    <SolidColorBrush x:Key="BrandBrush" Color="#0F766E" />
     <SolidColorBrush x:Key="BrandSoftBrush" Color="{StaticResource NavSelectedColor}" />
-    <SolidColorBrush x:Key="SurfaceBrush" Color="#1D262C" />
-    <SolidColorBrush x:Key="TextBrush" Color="#F2F8FA" />
-    <SolidColorBrush x:Key="MutedBrush" Color="#AFC4CD" />
-    <SolidColorBrush x:Key="ElevatedBrush" Color="#27333A" />
-    <SolidColorBrush x:Key="AccentBrush" Color="#2FD0B4" />
-    <SolidColorBrush x:Key="GridLineBrush" Color="#232E35" />
+    <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="TextBrush" Color="#1A2B33" />
+    <SolidColorBrush x:Key="MutedBrush" Color="#64757F" />
+    <SolidColorBrush x:Key="ElevatedBrush" Color="#F7F9FB" />
+    <SolidColorBrush x:Key="AccentBrush" Color="#0D9488" />
+    <SolidColorBrush x:Key="GridLineBrush" Color="#EDF1F4" />
 
     <Style TargetType="Window">
         <Setter Property="FontFamily" Value="Microsoft YaHei UI" />

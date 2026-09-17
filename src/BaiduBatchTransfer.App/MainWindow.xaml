@@ -236,7 +236,7 @@
                                                 <ColumnDefinition Width="*" />
                                             </Grid.ColumnDefinitions>
                                             <Grid Width="30" Height="30" VerticalAlignment="Top">
-                                                <Ellipse Fill="#2FB9A6" />
+                                                <Ellipse Fill="{StaticResource AccentBrush}" />
                                                 <TextBlock Text="盘" Foreground="White" FontSize="12"
                                                            FontWeight="SemiBold"
                                                            HorizontalAlignment="Center"

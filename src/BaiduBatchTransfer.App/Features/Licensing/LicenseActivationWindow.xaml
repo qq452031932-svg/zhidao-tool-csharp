@@ -11,7 +11,7 @@
         WindowStartupLocation="CenterOwner">
     <Window.Style>
         <Style TargetType="{x:Type Window}" BasedOn="{StaticResource {x:Type Window}}">
-            <Setter Property="Background" Value="#081319" />
+            <Setter Property="Background" Value="#F4F6F8" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -24,8 +24,8 @@
         <!-- 深色玻璃卡片。品牌色与对比度在 LicenseActivationViewStructureTests 中有断言：
              正文与背景的对比度必须 ≥ 4.5，高对比度模式必须改用系统画刷。 -->
         <Style x:Key="ActivationCardStyle" TargetType="{x:Type Border}">
-            <Setter Property="Background" Value="#11242E" />
-            <Setter Property="BorderBrush" Value="#1F3F4C" />
+            <Setter Property="Background" Value="#FFFFFF" />
+            <Setter Property="BorderBrush" Value="#E6EBEF" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -36,7 +36,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationHeaderStyle" TargetType="{x:Type Border}">
-            <Setter Property="Background" Value="#11242E" />
+            <Setter Property="Background" Value="#FFFFFF" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -45,7 +45,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationHeaderTitleStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#FFFFFF" />
+            <Setter Property="Foreground" Value="#111827" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
@@ -54,7 +54,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationHeaderSubtitleStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#9FBAC4" />
+            <Setter Property="Foreground" Value="#65747E" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
@@ -65,8 +65,8 @@
         <Style x:Key="ActivationPrimaryButtonStyle"
                TargetType="{x:Type Button}"
                BasedOn="{StaticResource {x:Type Button}}">
-            <Setter Property="Background" Value="#0E7C6E" />
-            <Setter Property="BorderBrush" Value="#17A493" />
+            <Setter Property="Background" Value="#0F766E" />
+            <Setter Property="BorderBrush" Value="#0D9488" />
             <Setter Property="Foreground" Value="#FFFFFF" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
@@ -82,9 +82,9 @@
         <Style x:Key="ActivationSecondaryButtonStyle"
                TargetType="{x:Type Button}"
                BasedOn="{StaticResource {x:Type Button}}">
-            <Setter Property="Background" Value="#16303B" />
-            <Setter Property="BorderBrush" Value="#2A4F5C" />
-            <Setter Property="Foreground" Value="#C6DCE3" />
+            <Setter Property="Background" Value="#FFFFFF" />
+            <Setter Property="BorderBrush" Value="#D5DCE2" />
+            <Setter Property="Foreground" Value="#41525C" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -97,7 +97,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationBodyLabelStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#E8F3F6" />
+            <Setter Property="Foreground" Value="#1A2B33" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
@@ -106,7 +106,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationBodyHintStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#93AAB3" />
+            <Setter Property="Foreground" Value="#65747E" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
@@ -117,13 +117,13 @@
         <Style x:Key="ActivationTextBoxStyle"
                TargetType="{x:Type TextBox}"
                BasedOn="{StaticResource {x:Type TextBox}}">
-            <Setter Property="Background" Value="#0B1C24" />
-            <Setter Property="Foreground" Value="#E8F3F6" />
-            <Setter Property="BorderBrush" Value="#27505F" />
-            <Setter Property="CaretBrush" Value="#17A493" />
+            <Setter Property="Background" Value="#F7F9FB" />
+            <Setter Property="Foreground" Value="#1A2B33" />
+            <Setter Property="BorderBrush" Value="#D5DCE2" />
+            <Setter Property="CaretBrush" Value="#0D9488" />
             <Style.Triggers>
                 <Trigger Property="IsKeyboardFocusWithin" Value="True">
-                    <Setter Property="BorderBrush" Value="#17A493" />
+                    <Setter Property="BorderBrush" Value="#0D9488" />
                 </Trigger>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Background"
@@ -142,8 +142,8 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationStatusRegionStyle" TargetType="{x:Type Border}">
-            <Setter Property="Background" Value="#0B1C24" />
-            <Setter Property="BorderBrush" Value="#1F3F4C" />
+            <Setter Property="Background" Value="#F7F9FB" />
+            <Setter Property="BorderBrush" Value="#E6EBEF" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding StatusMessage}" Value="">
                     <Setter Property="Visibility" Value="Collapsed" />
@@ -157,7 +157,7 @@
             </Style.Triggers>
         </Style>
         <Style x:Key="ActivationStatusTextStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="Foreground" Value="#D7E7EC" />
+            <Setter Property="Foreground" Value="#1A2B33" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Source={x:Static SystemParameters.HighContrast}}" Value="True">
                     <Setter Property="Foreground"
