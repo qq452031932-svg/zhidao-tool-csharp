@@ -30,16 +30,18 @@
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                   ScrollViewer.CanContentScroll="True" SelectionMode="Single">
             <DataGrid.Columns>
-                <DataGridTextColumn Header="序号" Binding="{Binding CandidateSequence}" Width="80" />
-                <DataGridTextColumn Header="标题" Binding="{Binding ResolvedTitle}" Width="2*" />
-                <DataGridTextColumn Header="账号" Binding="{Binding AccountDisplayName}" Width="*" />
-                <DataGridTextColumn Header="原链接" Binding="{Binding OriginalShareUrl}" Width="2*" />
-                <DataGridTextColumn Header="百度保存目录" Binding="{Binding TargetPath}" Width="*" />
-                <DataGridTextColumn Header="转存状态" Binding="{Binding TransferStatusText}" Width="120" />
-                <DataGridTextColumn Header="转存提示" Binding="{Binding TransferDetailMessage}" Width="2*" />
-                <DataGridTextColumn Header="分享状态" Binding="{Binding ShareStatusText}" Width="120" />
-                <DataGridTextColumn Header="新分享链接" Binding="{Binding GeneratedShareUrl}" Width="2*" />
-                <DataGridTextColumn Header="新提取码" Binding="{Binding GeneratedExtractionCode}" Width="120" />
+                <!-- 短内容列按内容自适应，长文本列按比例并设最小宽度：原先 440px 的固定列
+                     吃掉了大部分宽度，标题与链接被压到几十像素而截断。 -->
+                <DataGridTextColumn Header="序号" Binding="{Binding CandidateSequence}" Width="Auto" MinWidth="56" />
+                <DataGridTextColumn Header="标题" Binding="{Binding ResolvedTitle}" Width="2*" MinWidth="140" />
+                <DataGridTextColumn Header="账号" Binding="{Binding AccountDisplayName}" Width="Auto" MinWidth="88" />
+                <DataGridTextColumn Header="原链接" Binding="{Binding OriginalShareUrl}" Width="2*" MinWidth="160" />
+                <DataGridTextColumn Header="百度保存目录" Binding="{Binding TargetPath}" Width="*" MinWidth="120" />
+                <DataGridTextColumn Header="转存状态" Binding="{Binding TransferStatusText}" Width="Auto" MinWidth="84" />
+                <DataGridTextColumn Header="转存提示" Binding="{Binding TransferDetailMessage}" Width="2*" MinWidth="140" />
+                <DataGridTextColumn Header="分享状态" Binding="{Binding ShareStatusText}" Width="Auto" MinWidth="84" />
+                <DataGridTextColumn Header="新分享链接" Binding="{Binding GeneratedShareUrl}" Width="2*" MinWidth="160" />
+                <DataGridTextColumn Header="新提取码" Binding="{Binding GeneratedExtractionCode}" Width="Auto" MinWidth="88" />
             </DataGrid.Columns>
         </DataGrid>
         <Grid Grid.Row="2" Margin="0,12,0,0">

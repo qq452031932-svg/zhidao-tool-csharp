@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.ComponentModel;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Domain;
 using System.Globalization;
@@ -44,6 +44,13 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
     public string RemainingCapacityText => FormatCapacity(RemainingCapacity);
     public string CapacityUsedText => FormatCapacity(CapacityUsed);
     public string CapacityTotalText => FormatCapacity(CapacityTotal);
+    // 供账号卡片的容量条使用。0~100，容量未知时为 0，便于界面直接隐藏进度条。
+    public double CapacityUsedPercent => CapacityTotal is null || CapacityUsed is null || CapacityTotal.Value <= 0
+        ? 0
+        : Math.Clamp(CapacityUsed.Value * 100d / CapacityTotal.Value, 0, 100);
+
+    public bool HasCapacityInfo => CapacityTotal is not null && CapacityUsed is not null && CapacityTotal.Value > 0;
+
     public string CapacitySummaryText => CapacityTotal is null || CapacityUsed is null
         ? "容量未知"
         : $"已用 {CapacityUsedText} / {CapacityTotalText}";

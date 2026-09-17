@@ -180,9 +180,9 @@
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
                                     <ToggleButton x:Name="AccountCard"
-                                                  MinHeight="96"
+                                                  MinHeight="104"
                                                   Margin="0,0,0,10"
-                                                  Padding="10"
+                                                  Padding="12"
                                                   Focusable="True"
                                                   IsThreeState="False"
                                                   IsChecked="{Binding IsSelected, Mode=TwoWay}"
@@ -232,10 +232,10 @@
                                         </ToggleButton.Style>
                                         <Grid>
                                             <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="34" />
+                                                <ColumnDefinition Width="42" />
                                                 <ColumnDefinition Width="*" />
                                             </Grid.ColumnDefinitions>
-                                            <Grid Width="30" Height="30" VerticalAlignment="Top">
+                                            <Grid Width="38" Height="38" VerticalAlignment="Top">
                                                 <Ellipse Fill="{StaticResource AccentBrush}" />
                                                 <TextBlock Text="盘" Foreground="White" FontSize="12"
                                                            FontWeight="SemiBold"
@@ -248,23 +248,47 @@
                                                     </Ellipse.Fill>
                                                 </Ellipse>
                                             </Grid>
-                                            <StackPanel Grid.Column="1" Margin="8,0,0,0">
-                                                <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"
-                                                           TextTrimming="CharacterEllipsis" />
-                                                <Border x:Name="AccountStatusPill"
-                                                        HorizontalAlignment="Left"
-                                                        Background="{StaticResource PageBrush}"
-                                                        CornerRadius="3"
-                                                        Padding="5,1"
-                                                        Margin="0,3,0,0">
-                                                    <TextBlock Text="{Binding StatusText}"
-                                                               Foreground="{StaticResource BrandBrush}"
-                                                               FontSize="11" />
-                                                </Border>
+                                            <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                                                <!-- 状态徽章移到与账号名同一行的右端，容量下方补一条使用率进度条：
+                                                     纯文字的“已用 x / y”看不出余量多少。 -->
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"
+                                                               VerticalAlignment="Center"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                    <Border x:Name="AccountStatusPill"
+                                                            Grid.Column="1"
+                                                            VerticalAlignment="Center"
+                                                            Margin="6,0,0,0"
+                                                            Background="{StaticResource NavSelectedBrush}"
+                                                            CornerRadius="9"
+                                                            Padding="8,2">
+                                                        <TextBlock Text="{Binding StatusText}"
+                                                                   Foreground="{StaticResource BrandBrush}"
+                                                                   FontWeight="SemiBold"
+                                                                   FontSize="11" />
+                                                    </Border>
+                                                </Grid>
                                                 <TextBlock Text="{Binding CapacitySummaryText}"
                                                            Foreground="{StaticResource MutedBrush}"
                                                            FontSize="11"
-                                                           Margin="0,7,0,0" />
+                                                           Margin="0,9,0,0" />
+                                                <ProgressBar Height="5"
+                                                             Margin="0,5,0,0"
+                                                             Minimum="0" Maximum="100"
+                                                             Value="{Binding CapacityUsedPercent, Mode=OneWay}"
+                                                             Background="{StaticResource PageBrush}"
+                                                             Foreground="{StaticResource AccentBrush}"
+                                                             BorderThickness="0"
+                                                             AutomationProperties.Name="容量使用率">
+                                                    <ProgressBar.Visibility>
+                                                        <Binding Path="HasCapacityInfo"
+                                                                 Converter="{StaticResource BooleanToVisibilityConverter}" />
+                                                    </ProgressBar.Visibility>
+                                                </ProgressBar>
                                             </StackPanel>
                                         </Grid>
                                     </ToggleButton>
