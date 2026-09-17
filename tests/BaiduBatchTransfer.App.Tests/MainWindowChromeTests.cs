@@ -26,8 +26,8 @@ public sealed class MainWindowChromeTests
         var xaml = ReadAppFile("MainWindow.xaml");
         var body = ExtractGridColumnDefinitions(xaml, "ShellBody");
 
-        Assert.Contains("<ColumnDefinition Width=\"240\" />", body);
-        Assert.Contains("<ColumnDefinition Width=\"170\" />", body);
+        Assert.Contains("<ColumnDefinition Width=\"260\" />", body);
+        Assert.Contains("<ColumnDefinition Width=\"200\" />", body);
         Assert.Contains("<ColumnDefinition Width=\"*\" />", body);
         Assert.DoesNotContain("<ColumnDefinition Width=\"180\" />", body);
         Assert.DoesNotContain("<RowDefinition Height=\"36\" />", xaml);

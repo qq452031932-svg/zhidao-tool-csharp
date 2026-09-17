@@ -53,8 +53,15 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
-                <WrapPanel x:Name="TopConfigurationToolbar" Grid.Row="0">
+                <!-- 分区标题：无名面板会让整块内容读成一片，标题给出落脚点。 -->
+                <StackPanel Grid.Row="0" Margin="0,0,0,14">
+                    <TextBlock Text="导入与配置" FontSize="15" FontWeight="SemiBold" />
+                    <TextBlock Text="选择来源、目标目录与并发，然后开始转存"
+                               Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0" />
+                </StackPanel>
+                <WrapPanel x:Name="TopConfigurationToolbar" Grid.Row="1">
                     <Button Content="导入粘贴内容" Command="{Binding Import.ImportTextCommand}"
                             Style="{StaticResource SecondaryButtonStyle}" Padding="14,7" Margin="0,0,10,10" />
                     <Button Content="选择 Excel" Command="{Binding Import.SelectAndImportExcelCommand}"
@@ -99,7 +106,7 @@
                             AutomationProperties.HelpText="{Binding Wizard.ValidationMessage}"
                             FontWeight="SemiBold" Padding="22,7" Margin="0,0,0,10" />
                 </WrapPanel>
-                <TextBox x:Name="BulkPasteInput" Grid.Row="1" MinLines="2" MaxLines="8" Margin="0,4,0,0"
+                <TextBox x:Name="BulkPasteInput" Grid.Row="2" MinLines="2" MaxLines="8" Margin="0,4,0,0"
                          Text="{Binding Import.TextContent, UpdateSourceTrigger=PropertyChanged}"
                          AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
                          AutomationProperties.Name="百度分享文字" ToolTip="可一次粘贴多条分享链接，支持标题和提取码"

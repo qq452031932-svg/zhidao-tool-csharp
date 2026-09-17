@@ -1,4 +1,4 @@
-using BaiduBatchTransfer.App;
+﻿using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.App.Services;
@@ -27,7 +27,7 @@ public sealed class MainWindowViewModelTests
             .Select(column => AttributeValue(column, "Width") ?? string.Empty)
             .ToArray();
 
-        Assert.Equal(["240", "10", "170", "10", "*"], columns);
+        Assert.Equal(["260", "16", "200", "16", "*"], columns);
 
         var accountRail = FindNamedElement(document, "AccountRail");
         var accountCommands = accountRail.Descendants(PresentationNamespace + "Button")

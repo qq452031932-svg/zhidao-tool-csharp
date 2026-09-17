@@ -211,15 +211,25 @@
         <Setter Property="Margin" Value="0,0,0,14" />
     </Style>
 
+    <!-- 导航项：34px 高、6px 间隔的文字按钮读起来像一串标签；加高到 44px 并给
+         选中项一块完整的浅色底，导航才会被看成一组可点的区块。 -->
     <Style x:Key="NavItemStyle" TargetType="Button"
            BasedOn="{StaticResource ToolbarButtonStyle}">
+        <Setter Property="Height" Value="44" />
+        <Setter Property="Padding" Value="16,10" />
+        <Setter Property="FontSize" Value="14" />
         <Setter Property="Background" Value="Transparent" />
         <Setter Property="BorderBrush" Value="Transparent" />
         <Setter Property="BorderThickness" Value="0" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
         <Setter Property="HorizontalContentAlignment" Value="Center" />
         <Setter Property="HorizontalAlignment" Value="Stretch" />
-        <Setter Property="Margin" Value="0,0,0,6" />
+        <Setter Property="Margin" Value="0,0,0,4" />
+        <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Background" Value="{StaticResource ElevatedBrush}" />
+            </Trigger>
+        </Style.Triggers>
     </Style>
 
     <Style x:Key="DenseDataGridStyle" TargetType="DataGrid">
