@@ -32,7 +32,7 @@
     <PackageId Condition="'$(PackageId)' == ''">SuperPan.BaiduBatchTransfer</PackageId>
     <UpdateChannel Condition="'$(UpdateChannel)' == ''">win-x64-stable</UpdateChannel>
     <AdapterBuildVersion Condition="'$(AdapterBuildVersion)' == ''">managed-browser-v3</AdapterBuildVersion>
-    <ManagedBrowserHelperPackageDirectory Condition="'$(ManagedBrowserHelperPackageDirectory)' == ''">$(MSBuildProjectDirectory)\..\..\.artifacts\managed-session-pipeline-20260901\helper-bundle-r2</ManagedBrowserHelperPackageDirectory>
+    <ManagedBrowserHelperPackageDirectory Condition="'$(ManagedBrowserHelperPackageDirectory)' == ''">$(MSBuildProjectDirectory)\..\..\.artifacts\managed-session-pipeline-20260901\helper-bundle-r3</ManagedBrowserHelperPackageDirectory>
   </PropertyGroup>
 
   <PropertyGroup>

@@ -6,3 +6,13 @@ tools/managed_browser_helper/requirements.lock text eol=lf
 tools/managed_browser_helper/helper-manifest.json text eol=lf
 tools/managed_browser_helper/license-inputs/* text eol=lf
 tools/managed_browser_helper/THIRD_PARTY_NOTICES.txt text eol=lf whitespace=-blank-at-eol,-blank-at-eof
+tools/managed_browser_helper/identity_query.py text eol=lf
+tools/managed_browser_helper/session_operations.py text eol=lf
+tools/managed_browser_helper/share_submission.py text eol=lf
+tools/managed_browser_helper/transfer_directory_listing.py text eol=lf
+tools/managed_browser_helper/transfer_directory_mutation.py text eol=lf
+tools/managed_browser_helper/transfer_picker.py text eol=lf
+tools/managed_browser_helper/transfer_source.py text eol=lf
+tools/managed_browser_helper/transfer_source_listing.py text eol=lf
+tools/managed_browser_helper/transfer_submission.py text eol=lf
+tools/managed_browser_helper/transfer_target_baseline.py text eol=lf
