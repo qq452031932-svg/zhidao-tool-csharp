@@ -27,7 +27,7 @@ public sealed class MainWindowViewModelTests
             .Select(column => AttributeValue(column, "Width") ?? string.Empty)
             .ToArray();
 
-        Assert.Equal(["260", "16", "200", "16", "*"], columns);
+        Assert.Equal(["200", "16", "*", "16", "Auto"], columns);
 
         var accountRail = FindNamedElement(document, "AccountRail");
         var accountCommands = accountRail.Descendants(PresentationNamespace + "Button")
@@ -40,13 +40,13 @@ public sealed class MainWindowViewModelTests
         var featureRail = FindNamedElement(document, "FeatureRail");
         var featureButtons = featureRail.Descendants(PresentationNamespace + "Button").ToArray();
         Assert.Equal(
-            ["首页", "监控反馈", "批量转存", "广告插入", "文件排除", "数据统计", "设置中心"],
+            ["首页", "批量转存", "监控反馈", "广告插入", "文件排除", "数据统计", "设置中心"],
             featureButtons.Select(button => AttributeValue(button, "Content")));
         Assert.Equal(
             [
                 "{Binding ShowHomeCommand}",
-                "{Binding ShowShareDataCommand}",
                 "{Binding ShowBatchTransferCommand}",
+                "{Binding ShowShareDataCommand}",
                 "{Binding ShowAdInsertionCommand}",
                 "{Binding ShowFileExclusionCommand}",
                 "{Binding ShowStatisticsCommand}",
@@ -446,7 +446,7 @@ public sealed class MainWindowViewModelTests
         Assert.Contains("选择一个工作模块", featureCopy);
         var featureButtons = featureRail.Descendants(PresentationNamespace + "Button").ToArray();
         Assert.Equal(
-            ["首页", "监控反馈", "批量转存", "广告插入", "文件排除", "数据统计", "设置中心"],
+            ["首页", "批量转存", "监控反馈", "广告插入", "文件排除", "数据统计", "设置中心"],
             featureButtons.Select(button => AttributeValue(button, "Content")));
         Assert.All(featureButtons, button => Assert.Contains(
             button.Descendants(PresentationNamespace + "DataTrigger"),

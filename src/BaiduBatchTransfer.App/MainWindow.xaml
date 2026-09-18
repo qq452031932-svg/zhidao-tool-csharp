@@ -123,182 +123,194 @@
 
         <Grid x:Name="ShellBody" Grid.Row="2" Margin="12">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="260" />
-                <ColumnDefinition Width="16" />
                 <ColumnDefinition Width="200" />
                 <ColumnDefinition Width="16" />
                 <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="16" />
+                <ColumnDefinition Width="Auto" MinWidth="64" />
             </Grid.ColumnDefinitions>
-            <Border x:Name="AccountRail" Grid.Column="0"
+            <Border x:Name="AccountRail" Grid.Column="4"
                     Style="{StaticResource BorderedPanelStyle}"
                     Background="{StaticResource SurfaceBrush}"
                     BorderBrush="{StaticResource PanelBorderBrush}"
                     BorderThickness="1"
                     Padding="18">
-                <DockPanel>
-                    <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
-                        <Button Content="添加百度账号" Command="{Binding OpenAccountLoginCommand}"
-                                Style="{StaticResource SecondaryButtonStyle}" Margin="0" />
-                        <Grid Margin="0,8,0,0">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="8" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <Button Content="账号管理" Command="{Binding OpenAccountManagementCommand}"
-                                    Style="{StaticResource SecondaryButtonStyle}" Margin="0" Padding="8,4" />
-                            <Button Grid.Column="2" Content="刷新账号" Command="{Binding RefreshAccountsCommand}"
-                                    Style="{StaticResource SecondaryButtonStyle}" Margin="0" Padding="8,4"
-                                    AutomationProperties.Name="刷新百度账号列表" />
-                        </Grid>
-                        <TextBlock Text="{Binding AccountManagementStatusMessage}"
-                                   Foreground="{StaticResource MutedBrush}"
-                                   FontSize="11"
-                                   TextWrapping="Wrap"
-                                   Margin="0,8,0,0"
-                                   AutomationProperties.Name="{Binding AccountManagementStatusMessage}" />
-                    </StackPanel>
-
-                    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
-                        <TextBlock Text="账号管理" FontSize="16" FontWeight="SemiBold" />
-                        <TextBlock Text="百度网盘账号" Foreground="{StaticResource MutedBrush}"
-                                   FontSize="12" Margin="0,3,0,0" />
-                        <Border Background="{StaticResource PageBrush}" CornerRadius="4"
-                                Padding="8,5" Margin="0,10,0,0">
-                            <TextBlock x:Name="AccountStatusLiveRegion"
-                                       Text="{Binding AccountStatusMessage}"
+                <!-- 账号管理改为可折叠：它在右侧且内容较长，配好账号后收起来，
+                     把横向空间让给中间的工作区。交互与转存页的“导入与配置”一致。 -->
+                <Expander x:Name="AccountRailExpander" IsExpanded="True"
+                          Style="{StaticResource FlatExpanderStyle}">
+                    <Expander.Header>
+                        <StackPanel>
+                            <TextBlock Text="账号管理" FontSize="16" FontWeight="SemiBold" />
+                            <TextBlock Text="百度网盘账号" Foreground="{StaticResource MutedBrush}"
+                                       FontSize="12" Margin="0,3,0,0" />
+                        </StackPanel>
+                    </Expander.Header>
+                    <DockPanel>
+                        <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                            <Button Content="添加百度账号" Command="{Binding OpenAccountLoginCommand}"
+                                    Style="{StaticResource SecondaryButtonStyle}" Margin="0" />
+                            <Grid Margin="0,8,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="8" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Button Content="账号管理" Command="{Binding OpenAccountManagementCommand}"
+                                        Style="{StaticResource SecondaryButtonStyle}" Margin="0" Padding="8,4" />
+                                <Button Grid.Column="2" Content="刷新账号" Command="{Binding RefreshAccountsCommand}"
+                                        Style="{StaticResource SecondaryButtonStyle}" Margin="0" Padding="8,4"
+                                        AutomationProperties.Name="刷新百度账号列表" />
+                            </Grid>
+                            <TextBlock Text="{Binding AccountManagementStatusMessage}"
                                        Foreground="{StaticResource MutedBrush}"
-                                       FontSize="12"
-                                       AutomationProperties.Name="{Binding AccountStatusMessage}"
-                                       AutomationProperties.LiveSetting="Polite" />
-                        </Border>
-                    </StackPanel>
+                                       FontSize="11"
+                                       TextWrapping="Wrap"
+                                       Margin="0,8,0,0"
+                                       AutomationProperties.Name="{Binding AccountManagementStatusMessage}" />
+                        </StackPanel>
 
-                    <ScrollViewer VerticalScrollBarVisibility="Auto"
-                                  HorizontalScrollBarVisibility="Disabled">
-                        <ItemsControl ItemsSource="{Binding Accounts}">
-                            <ItemsControl.ItemTemplate>
-                                <DataTemplate>
-                                    <ToggleButton x:Name="AccountCard"
-                                                  MinHeight="104"
-                                                  Margin="0,0,0,10"
-                                                  Padding="12"
-                                                  Focusable="True"
-                                                  IsThreeState="False"
-                                                  IsChecked="{Binding IsSelected, Mode=TwoWay}"
-                                                  AutomationProperties.Name="{Binding DisplayName, StringFormat=选择账号：{0}}"
-                                                  AutomationProperties.HelpText="按空格键切换账号选择状态">
-                                        <ToggleButton.Style>
-                                            <Style TargetType="ToggleButton">
-                                                <Setter Property="Background" Value="White" />
-                                                <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
-                                                <Setter Property="BorderThickness" Value="1" />
-                                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                                                <Setter Property="VerticalContentAlignment" Value="Stretch" />
-                                                <Setter Property="IsEnabled" Value="True" />
-                                                <Setter Property="Cursor" Value="Hand" />
-                                                <Setter Property="Template">
-                                                    <Setter.Value>
-                                                        <ControlTemplate TargetType="ToggleButton">
-                                                            <Border x:Name="CardBorder"
-                                                                    Background="{TemplateBinding Background}"
-                                                                    BorderBrush="{TemplateBinding BorderBrush}"
-                                                                    BorderThickness="{TemplateBinding BorderThickness}"
-                                                                    CornerRadius="6"
-                                                                    Padding="{TemplateBinding Padding}">
-                                                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
-                                                                                  VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
-                                                            </Border>
-                                                            <ControlTemplate.Triggers>
-                                                                <Trigger Property="IsKeyboardFocused" Value="True">
-                                                                    <Setter TargetName="CardBorder" Property="BorderBrush" Value="{StaticResource BrandBrush}" />
-                                                                    <Setter TargetName="CardBorder" Property="BorderThickness" Value="2" />
-                                                                </Trigger>
-                                                            </ControlTemplate.Triggers>
-                                                        </ControlTemplate>
-                                                    </Setter.Value>
-                                                </Setter>
-                                                <Style.Triggers>
-                                                    <DataTrigger Binding="{Binding DataContext.BatchTransferWorkspace.DataContext.CanEditConfiguration, RelativeSource={RelativeSource FindAncestor, AncestorType={x:Type Window}}}"
-                                                                 Value="False">
-                                                        <Setter Property="IsEnabled" Value="False" />
-                                                    </DataTrigger>
-                                                    <Trigger Property="IsChecked" Value="True">
-                                                        <Setter Property="Background" Value="{StaticResource NavSelectedBrush}" />
-                                                        <Setter Property="BorderBrush" Value="{StaticResource BrandBrush}" />
-                                                    </Trigger>
-                                                </Style.Triggers>
-                                            </Style>
-                                        </ToggleButton.Style>
-                                        <Grid>
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="42" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
-                                            <Grid Width="38" Height="38" VerticalAlignment="Top">
-                                                <Ellipse Fill="{StaticResource AccentBrush}" />
-                                                <TextBlock Text="盘" Foreground="White" FontSize="12"
-                                                           FontWeight="SemiBold"
-                                                           HorizontalAlignment="Center"
-                                                           VerticalAlignment="Center" />
-                                                <Ellipse>
-                                                    <Ellipse.Fill>
-                                                        <ImageBrush ImageSource="{Binding AvatarUri}"
-                                                                    Stretch="UniformToFill" />
-                                                    </Ellipse.Fill>
-                                                </Ellipse>
-                                            </Grid>
-                                            <StackPanel Grid.Column="1" Margin="10,0,0,0">
-                                                <!-- 状态徽章移到与账号名同一行的右端，容量下方补一条使用率进度条：
-                                                     纯文字的“已用 x / y”看不出余量多少。 -->
-                                                <Grid>
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="*" />
-                                                        <ColumnDefinition Width="Auto" />
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"
-                                                               VerticalAlignment="Center"
-                                                               TextTrimming="CharacterEllipsis" />
-                                                    <Border x:Name="AccountStatusPill"
-                                                            Grid.Column="1"
-                                                            VerticalAlignment="Center"
-                                                            Margin="6,0,0,0"
-                                                            Background="{StaticResource NavSelectedBrush}"
-                                                            CornerRadius="9"
-                                                            Padding="8,2">
-                                                        <TextBlock Text="{Binding StatusText}"
-                                                                   Foreground="{StaticResource BrandBrush}"
-                                                                   FontWeight="SemiBold"
-                                                                   FontSize="11" />
-                                                    </Border>
+                        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+                            <TextBlock Text="账号管理" FontSize="16" FontWeight="SemiBold" />
+                            <TextBlock Text="百度网盘账号" Foreground="{StaticResource MutedBrush}"
+                                       FontSize="12" Margin="0,3,0,0" />
+                            <Border Background="{StaticResource PageBrush}" CornerRadius="4"
+                                    Padding="8,5" Margin="0,10,0,0">
+                                <TextBlock x:Name="AccountStatusLiveRegion"
+                                           Text="{Binding AccountStatusMessage}"
+                                           Foreground="{StaticResource MutedBrush}"
+                                           FontSize="12"
+                                           AutomationProperties.Name="{Binding AccountStatusMessage}"
+                                           AutomationProperties.LiveSetting="Polite" />
+                            </Border>
+                        </StackPanel>
+
+                        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled">
+                            <ItemsControl ItemsSource="{Binding Accounts}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <ToggleButton x:Name="AccountCard"
+                                                      MinHeight="104"
+                                                      Margin="0,0,0,10"
+                                                      Padding="12"
+                                                      Focusable="True"
+                                                      IsThreeState="False"
+                                                      IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                                      AutomationProperties.Name="{Binding DisplayName, StringFormat=选择账号：{0}}"
+                                                      AutomationProperties.HelpText="按空格键切换账号选择状态">
+                                            <ToggleButton.Style>
+                                                <Style TargetType="ToggleButton">
+                                                    <Setter Property="Background" Value="White" />
+                                                    <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
+                                                    <Setter Property="BorderThickness" Value="1" />
+                                                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                                    <Setter Property="VerticalContentAlignment" Value="Stretch" />
+                                                    <Setter Property="IsEnabled" Value="True" />
+                                                    <Setter Property="Cursor" Value="Hand" />
+                                                    <Setter Property="Template">
+                                                        <Setter.Value>
+                                                            <ControlTemplate TargetType="ToggleButton">
+                                                                <Border x:Name="CardBorder"
+                                                                        Background="{TemplateBinding Background}"
+                                                                        BorderBrush="{TemplateBinding BorderBrush}"
+                                                                        BorderThickness="{TemplateBinding BorderThickness}"
+                                                                        CornerRadius="6"
+                                                                        Padding="{TemplateBinding Padding}">
+                                                                    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                                                      VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+                                                                </Border>
+                                                                <ControlTemplate.Triggers>
+                                                                    <Trigger Property="IsKeyboardFocused" Value="True">
+                                                                        <Setter TargetName="CardBorder" Property="BorderBrush" Value="{StaticResource BrandBrush}" />
+                                                                        <Setter TargetName="CardBorder" Property="BorderThickness" Value="2" />
+                                                                    </Trigger>
+                                                                </ControlTemplate.Triggers>
+                                                            </ControlTemplate>
+                                                        </Setter.Value>
+                                                    </Setter>
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding DataContext.BatchTransferWorkspace.DataContext.CanEditConfiguration, RelativeSource={RelativeSource FindAncestor, AncestorType={x:Type Window}}}"
+                                                                     Value="False">
+                                                            <Setter Property="IsEnabled" Value="False" />
+                                                        </DataTrigger>
+                                                        <Trigger Property="IsChecked" Value="True">
+                                                            <Setter Property="Background" Value="{StaticResource NavSelectedBrush}" />
+                                                            <Setter Property="BorderBrush" Value="{StaticResource BrandBrush}" />
+                                                        </Trigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </ToggleButton.Style>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="42" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <Grid Width="38" Height="38" VerticalAlignment="Top">
+                                                    <Ellipse Fill="{StaticResource AccentBrush}" />
+                                                    <TextBlock Text="盘" Foreground="White" FontSize="12"
+                                                               FontWeight="SemiBold"
+                                                               HorizontalAlignment="Center"
+                                                               VerticalAlignment="Center" />
+                                                    <Ellipse>
+                                                        <Ellipse.Fill>
+                                                            <ImageBrush ImageSource="{Binding AvatarUri}"
+                                                                        Stretch="UniformToFill" />
+                                                        </Ellipse.Fill>
+                                                    </Ellipse>
                                                 </Grid>
-                                                <TextBlock Text="{Binding CapacitySummaryText}"
-                                                           Foreground="{StaticResource MutedBrush}"
-                                                           FontSize="11"
-                                                           Margin="0,9,0,0" />
-                                                <ProgressBar Height="5"
-                                                             Margin="0,5,0,0"
-                                                             Minimum="0" Maximum="100"
-                                                             Value="{Binding CapacityUsedPercent, Mode=OneWay}"
-                                                             Background="{StaticResource PageBrush}"
-                                                             Foreground="{StaticResource AccentBrush}"
-                                                             BorderThickness="0"
-                                                             AutomationProperties.Name="容量使用率">
-                                                    <ProgressBar.Visibility>
-                                                        <Binding Path="HasCapacityInfo"
-                                                                 Converter="{StaticResource BooleanToVisibilityConverter}" />
-                                                    </ProgressBar.Visibility>
-                                                </ProgressBar>
-                                            </StackPanel>
-                                        </Grid>
-                                    </ToggleButton>
-                                </DataTemplate>
-                            </ItemsControl.ItemTemplate>
-                        </ItemsControl>
-                    </ScrollViewer>
-                </DockPanel>
+                                                <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                                                    <!-- 状态徽章移到与账号名同一行的右端，容量下方补一条使用率进度条：
+                                                         纯文字的“已用 x / y”看不出余量多少。 -->
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="Auto" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"
+                                                                   VerticalAlignment="Center"
+                                                                   TextTrimming="CharacterEllipsis" />
+                                                        <Border x:Name="AccountStatusPill"
+                                                                Grid.Column="1"
+                                                                VerticalAlignment="Center"
+                                                                Margin="6,0,0,0"
+                                                                Background="{StaticResource NavSelectedBrush}"
+                                                                CornerRadius="9"
+                                                                Padding="8,2">
+                                                            <TextBlock Text="{Binding StatusText}"
+                                                                       Foreground="{StaticResource BrandBrush}"
+                                                                       FontWeight="SemiBold"
+                                                                       FontSize="11" />
+                                                        </Border>
+                                                    </Grid>
+                                                    <TextBlock Text="{Binding CapacitySummaryText}"
+                                                               Foreground="{StaticResource MutedBrush}"
+                                                               FontSize="11"
+                                                               Margin="0,9,0,0" />
+                                                    <ProgressBar Height="5"
+                                                                 Margin="0,5,0,0"
+                                                                 Minimum="0" Maximum="100"
+                                                                 Value="{Binding CapacityUsedPercent, Mode=OneWay}"
+                                                                 Background="{StaticResource PageBrush}"
+                                                                 Foreground="{StaticResource AccentBrush}"
+                                                                 BorderThickness="0"
+                                                                 AutomationProperties.Name="容量使用率">
+                                                        <ProgressBar.Visibility>
+                                                            <Binding Path="HasCapacityInfo"
+                                                                     Converter="{StaticResource BooleanToVisibilityConverter}" />
+                                                        </ProgressBar.Visibility>
+                                                    </ProgressBar>
+                                                </StackPanel>
+                                            </Grid>
+                                        </ToggleButton>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </DockPanel>
+                </Expander>
             </Border>
-            <Border x:Name="FeatureRail" Grid.Column="2"
+            <Border x:Name="FeatureRail" Grid.Column="0"
                     Style="{StaticResource BorderedPanelStyle}"
                     Background="{StaticResource SurfaceBrush}"
                     BorderBrush="{StaticResource PanelBorderBrush}"
@@ -328,11 +340,11 @@
                                 </Style>
                             </Button.Style>
                         </Button>
-                        <Button Content="监控反馈" Command="{Binding ShowShareDataCommand}">
+                        <Button Content="批量转存" Command="{Binding ShowBatchTransferCommand}">
                             <Button.Style>
                                 <Style TargetType="Button" BasedOn="{StaticResource NavItemStyle}">
                                     <Style.Triggers>
-                                        <DataTrigger Binding="{Binding CurrentWorkspaceTitle}" Value="监控反馈">
+                                        <DataTrigger Binding="{Binding CurrentWorkspaceTitle}" Value="批量转存">
                                             <Setter Property="Background" Value="{StaticResource NavSelectedBrush}" />
                                             <Setter Property="Foreground" Value="{StaticResource BrandBrush}" />
                                         </DataTrigger>
@@ -340,11 +352,11 @@
                                 </Style>
                             </Button.Style>
                         </Button>
-                        <Button Content="批量转存" Command="{Binding ShowBatchTransferCommand}">
+                        <Button Content="监控反馈" Command="{Binding ShowShareDataCommand}">
                             <Button.Style>
                                 <Style TargetType="Button" BasedOn="{StaticResource NavItemStyle}">
                                     <Style.Triggers>
-                                        <DataTrigger Binding="{Binding CurrentWorkspaceTitle}" Value="批量转存">
+                                        <DataTrigger Binding="{Binding CurrentWorkspaceTitle}" Value="监控反馈">
                                             <Setter Property="Background" Value="{StaticResource NavSelectedBrush}" />
                                             <Setter Property="Foreground" Value="{StaticResource BrandBrush}" />
                                         </DataTrigger>
@@ -403,7 +415,7 @@
                     </StackPanel>
                 </Grid>
             </Border>
-            <Grid x:Name="ContentWorkbench" Grid.Column="4">
+            <Grid x:Name="ContentWorkbench" Grid.Column="2">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
