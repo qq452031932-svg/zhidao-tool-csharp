@@ -1,4 +1,4 @@
-using BaiduBatchTransfer.App.Services;
+﻿using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.Application.Accounts;
@@ -36,7 +36,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private readonly object capacityRefreshGate = new();
     private readonly CancellationTokenSource capacityLifetime = new();
     private object currentContent;
-    private string currentWorkspaceTitle = "分享数据";
+    private string currentWorkspaceTitle = "监控反馈";
     private string statusMessage = "就绪";
     private string accountStatusMessage;
     private bool isAccountOperationBusy;
@@ -107,7 +107,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             statusMessage = "账号查看偏好未能恢复。";
         currentContent = shareDataWorkspace;
         ShowHomeCommand = new RelayCommand(() => ShowWorkspace(this.homeWorkspace, "首页"));
-        ShowShareDataCommand = new RelayCommand(() => ShowWorkspace(this.shareDataWorkspace, "分享数据"));
+        ShowShareDataCommand = new RelayCommand(() => ShowWorkspace(this.shareDataWorkspace, "监控反馈"));
         ShowBatchTransferCommand = new RelayCommand(() => ShowWorkspace(this.batchTransferWorkspace, "批量转存"));
         ShowAdInsertionCommand = new RelayCommand(() => ShowWorkspace(this.adInsertionWorkspace, "广告插入"));
         ShowFileExclusionCommand = new RelayCommand(() => ShowWorkspace(this.fileExclusionWorkspace, "文件排除"));

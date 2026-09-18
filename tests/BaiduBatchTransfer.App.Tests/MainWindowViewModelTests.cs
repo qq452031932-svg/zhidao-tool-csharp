@@ -40,7 +40,7 @@ public sealed class MainWindowViewModelTests
         var featureRail = FindNamedElement(document, "FeatureRail");
         var featureButtons = featureRail.Descendants(PresentationNamespace + "Button").ToArray();
         Assert.Equal(
-            ["首页", "分享数据", "批量转存", "广告插入", "文件排除", "数据统计", "设置中心"],
+            ["首页", "监控反馈", "批量转存", "广告插入", "文件排除", "数据统计", "设置中心"],
             featureButtons.Select(button => AttributeValue(button, "Content")));
         Assert.Equal(
             [
@@ -446,7 +446,7 @@ public sealed class MainWindowViewModelTests
         Assert.Contains("选择一个工作模块", featureCopy);
         var featureButtons = featureRail.Descendants(PresentationNamespace + "Button").ToArray();
         Assert.Equal(
-            ["首页", "分享数据", "批量转存", "广告插入", "文件排除", "数据统计", "设置中心"],
+            ["首页", "监控反馈", "批量转存", "广告插入", "文件排除", "数据统计", "设置中心"],
             featureButtons.Select(button => AttributeValue(button, "Content")));
         Assert.All(featureButtons, button => Assert.Contains(
             button.Descendants(PresentationNamespace + "DataTrigger"),
@@ -552,7 +552,7 @@ public sealed class MainWindowViewModelTests
         var vm = new MainWindowViewModel(
             home, linkMonitor, transfer, adInsertion, fileExclusion, statistics, settings, login);
 
-        Assert.Equal("分享数据", vm.CurrentWorkspaceTitle);
+        Assert.Equal("监控反馈", vm.CurrentWorkspaceTitle);
         Assert.Same(linkMonitor, vm.CurrentContent);
         Assert.Same(transfer, vm.BatchTransferWorkspace);
         Assert.Equal("知道综合工具", vm.ApplicationTitle);
@@ -565,7 +565,7 @@ public sealed class MainWindowViewModelTests
             new (IRelayCommand Command, string Title, object Workspace)[]
             {
                 (vm.ShowHomeCommand, "首页", home),
-                (vm.ShowShareDataCommand, "分享数据", linkMonitor),
+                (vm.ShowShareDataCommand, "监控反馈", linkMonitor),
                 (vm.ShowBatchTransferCommand, "批量转存", transfer),
                 (vm.ShowAdInsertionCommand, "广告插入", adInsertion),
                 (vm.ShowFileExclusionCommand, "文件排除", fileExclusion),
@@ -860,7 +860,7 @@ public sealed class MainWindowViewModelTests
 
         Assert.Contains("Content=\"刷新账号\" Command=\"{Binding RefreshAccountsCommand}\"", xaml);
         Assert.Contains("Content=\"首页\" Command=\"{Binding ShowHomeCommand}\"", xaml);
-        Assert.Contains("Content=\"分享数据\" Command=\"{Binding ShowShareDataCommand}\"", xaml);
+        Assert.Contains("Content=\"监控反馈\" Command=\"{Binding ShowShareDataCommand}\"", xaml);
         Assert.Contains("Content=\"批量转存\" Command=\"{Binding ShowBatchTransferCommand}\"", xaml);
         Assert.Contains("Content=\"广告插入\" Command=\"{Binding ShowAdInsertionCommand}\"", xaml);
         Assert.Contains("Content=\"文件排除\" Command=\"{Binding ShowFileExclusionCommand}\"", xaml);

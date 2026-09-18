@@ -328,11 +328,11 @@
                                 </Style>
                             </Button.Style>
                         </Button>
-                        <Button Content="分享数据" Command="{Binding ShowShareDataCommand}">
+                        <Button Content="监控反馈" Command="{Binding ShowShareDataCommand}">
                             <Button.Style>
                                 <Style TargetType="Button" BasedOn="{StaticResource NavItemStyle}">
                                     <Style.Triggers>
-                                        <DataTrigger Binding="{Binding CurrentWorkspaceTitle}" Value="分享数据">
+                                        <DataTrigger Binding="{Binding CurrentWorkspaceTitle}" Value="监控反馈">
                                             <Setter Property="Background" Value="{StaticResource NavSelectedBrush}" />
                                             <Setter Property="Foreground" Value="{StaticResource BrandBrush}" />
                                         </DataTrigger>
