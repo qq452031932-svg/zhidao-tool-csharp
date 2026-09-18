@@ -2,6 +2,7 @@
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Common;
+using BaiduBatchTransfer.App.Features.Home;
 using BaiduBatchTransfer.App.Features.ShareAnalytics;
 using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Features.Shares;
@@ -1039,9 +1040,14 @@ public sealed class AppShellFactory(
             historyCleanupService,
             historyCleanupInteraction,
             importDraftCleanupService,
-            currentImportCleanupInteraction);
+            currentImportCleanupInteraction,
+            // 未激活时点"开始转存"要当场弹窗并给出激活入口，而不是只写一行日志。
+            licenseActivationPresenter is null
+                ? null
+                : token => licenseActivationPresenter.PresentAsync(token));
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
-        var homeWorkspace = new DeferredWorkspaceView(
+        // 首页在 ReadLicenseSettings 之后才能装配，因为它要显示授权状态。
+        object homeWorkspace = new DeferredWorkspaceView(
             new DeferredWorkspaceViewModel("首页", "功能建设中"));
         var shareAnalyticsViewModel = new ShareAnalyticsViewModel(
             shareAnalyticsService,
@@ -1083,7 +1089,8 @@ public sealed class AppShellFactory(
                 summary?.PackageName,
                 summary?.ExpiresAt,
                 authorized,
-                isMachineBound: authorized);
+                isMachineBound: authorized,
+                verificationDeferred: licenseAuthorizationState.VerificationDeferred);
         }
 
         var settingsViewModel = new SettingsViewModel(
@@ -1112,6 +1119,9 @@ public sealed class AppShellFactory(
             readMachineCode: () => new MachineFingerprintProvider().GetMachineHash(),
             copyToClipboard: text => _ = textClipboard.SetTextAsync(text));
         var settingsWorkspace = new SettingsView(settingsViewModel);
+        // 首页不碰授权状态：页头有常驻徽标，设置中心有完整卡片（含激活按钮与机器
+        // 绑定状态）。同一份信息摆三处，只会在三处不一致时让人更困惑。
+        homeWorkspace = new HomeWorkspaceView(new HomeWorkspaceViewModel());
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),
             remoteResourcePicker,

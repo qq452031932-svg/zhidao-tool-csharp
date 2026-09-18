@@ -177,6 +177,86 @@ public sealed class LicenseAuthorizationGateTests
     }
 
     [Fact]
+    public async Task StartupKeepsWorkingOnAnExpiredLeaseWhileTheServiceIsUnreachable()
+    {
+        // 服务端租约只有 30 分钟。断网超过半小时就把已付费用户判成未授权、弹出
+        // 激活窗，用户看到的是"你没激活"。打开软件本来就不需要联网，不该被这条
+        // 规则卡住。
+        var stale = Lease(leaseUntil: Now.AddDays(-2), expiresAt: Now.AddDays(20));
+        var gate = CreateGate(
+            new FakeService(new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null)),
+            StoreWithLease(stale));
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Startup, CancellationToken.None);
+
+        Assert.True(result.IsAuthorized);
+        Assert.True(result.UsedCachedLease);
+    }
+
+    [Theory]
+    [InlineData(LicenseOperationKind.Transfer)]
+    [InlineData(LicenseOperationKind.Share)]
+    [InlineData(LicenseOperationKind.ShareAnalyticsRefresh)]
+    public async Task NetworkOperationsGetNoOfflineGraceBecauseTheyNeedTheNetworkAnyway(LicenseOperationKind operation)
+    {
+        // 批量转存与分享要访问网盘，能连网盘就能连授权服务。对它们保持严格，
+        // 吊销延迟因此和改动前完全一样。
+        var stale = Lease(leaseUntil: Now.AddDays(-2), expiresAt: Now.AddDays(20));
+        var gate = CreateGate(
+            new FakeService(new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null)),
+            StoreWithLease(stale));
+
+        var result = await gate.AuthorizeAsync(operation, CancellationToken.None);
+
+        Assert.False(result.IsAuthorized);
+        Assert.False(result.UsedCachedLease);
+    }
+
+    [Fact]
+    public async Task StartupGraceStopsAtTheCardOwnExpiryDate()
+    {
+        // 宽限的是"多久回服务器复验一次"，不是卡密买到的服务期。过期的月卡
+        // 不会因为离线而多用一天。
+        var expiredCard = Lease(leaseUntil: Now.AddDays(-2), expiresAt: Now.AddDays(-1));
+        var gate = CreateGate(
+            new FakeService(new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null)),
+            StoreWithLease(expiredCard));
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Startup, CancellationToken.None);
+
+        Assert.False(result.IsAuthorized);
+        Assert.False(result.UsedCachedLease);
+    }
+
+    [Fact]
+    public async Task StartupGraceRunsOutAfterTheConfiguredWindow()
+    {
+        var ancient = Lease(
+            leaseUntil: Now - LicenseAuthorizationGate.StartupOfflineGrace - TimeSpan.FromDays(1),
+            expiresAt: Now.AddDays(60));
+        var gate = CreateGate(
+            new FakeService(new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null)),
+            StoreWithLease(ancient));
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Startup, CancellationToken.None);
+
+        Assert.False(result.IsAuthorized);
+    }
+
+    [Fact]
+    public async Task StartupGraceNeverOverridesAnExplicitServerRejection()
+    {
+        // 服务器能回答时，它说了算。离线宽限只在"问不到"时生效。
+        var stale = Lease(leaseUntil: Now.AddDays(-2), expiresAt: Now.AddDays(20));
+        var gate = CreateGate(new FakeService(Rejected(LicenseCodes.LicenseNotFound)), StoreWithLease(stale));
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Startup, CancellationToken.None);
+
+        Assert.False(result.IsAuthorized);
+        Assert.Equal(LicenseCodes.LicenseNotFound, result.Code);
+    }
+
+    [Fact]
     public async Task AuthorizationGateRejectsDeletedCardEvenWhenItsCachedLeaseWasUnexpired()
     {
         var store = StoreWithLease(Lease());
@@ -588,14 +668,22 @@ public sealed class LicenseAuthorizationGateTests
         public Task<LicenseApiResult> ValidateAsync(string requestId, string card, string machineHash, CancellationToken cancellationToken) =>
             Reply(false, requestId, card, machineHash);
 
-        public LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash)
+        public LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash) =>
+            VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash, TimeSpan.Zero);
+
+        public LicenseClaims VerifyCached(
+            ReadOnlySpan<byte> signedEnvelope,
+            string expectedSoftwareId,
+            string expectedMachineHash,
+            TimeSpan stalenessAllowance)
         {
             var fields = Encoding.UTF8.GetString(signedEnvelope).Split('|');
             if (fields.Length is not (6 or 7) || fields[0] != "test-envelope" || fields[1] != expectedSoftwareId || fields[2] != expectedMachineHash)
                 throw new LicenseEnvelopeVerificationException("Invalid test envelope.");
             var leaseUntil = DateTimeOffset.ParseExact(fields[3], "O", CultureInfo.InvariantCulture);
             var expiresAt = DateTimeOffset.ParseExact(fields[4], "O", CultureInfo.InvariantCulture);
-            if (fields[5] != "allow" || leaseUntil <= Now || expiresAt <= Now)
+            // 与真实验证器一致：expiresAt（卡密服务期）不放宽，只放宽 leaseUntil（复验间隔）。
+            if (fields[5] != "allow" || leaseUntil <= Now - stalenessAllowance || expiresAt <= Now)
                 throw new LicenseEnvelopeVerificationException("Invalid test lease.");
             return new LicenseClaims(LicenseProtocol.Version, "cached-request", Now, LicenseDecisions.Allow, LicenseCodes.Ok,
                 "card-id", fields[1], fields[2], fields.Length == 7 ? fields[6] : "package", expiresAt, leaseUntil);
@@ -666,6 +754,8 @@ public sealed class LicenseAuthorizationGateTests
             Task.FromResult(response);
         public LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash) =>
             verifier.VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash);
+        public LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash, TimeSpan stalenessAllowance) =>
+            verifier.VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash, stalenessAllowance);
         public void Dispose() => verifier.Dispose();
     }
 

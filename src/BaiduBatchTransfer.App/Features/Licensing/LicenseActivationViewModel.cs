@@ -18,18 +18,24 @@ public sealed record LicenseSettingsSnapshot
         string? packageName,
         DateTimeOffset? expiresAt,
         bool isAuthorized,
-        bool isMachineBound)
+        bool isMachineBound,
+        bool verificationDeferred = false)
     {
         PackageName = packageName;
         ExpiresAt = expiresAt;
         IsAuthorized = isAuthorized;
         IsMachineBound = isMachineBound;
+        VerificationDeferred = verificationDeferred;
     }
 
     public string? PackageName { get; }
     public DateTimeOffset? ExpiresAt { get; }
     public bool IsAuthorized { get; }
     public bool IsMachineBound { get; }
+
+    // 连不上授权服务器时授权状态是"未知"，不是"未授权"。二者合并会让网络抖动的
+    // 付费用户在设置页看到"未授权"，以为自己的卡密失效了。
+    public bool VerificationDeferred { get; }
 
     public static LicenseSettingsSnapshot NotActivated { get; } =
         new(null, null, isAuthorized: false, isMachineBound: false);

@@ -251,14 +251,22 @@ public static class LicenseServiceRegistration
             TimeProvider.System));
         services.AddSingleton<ILicenseStateStore>(_ => new DpapiLicenseStore(statePath));
         services.AddSingleton<IMachineFingerprintProvider, MachineFingerprintProvider>();
-        services.AddSingleton(sp => new LicenseAuthorizationGate(
-            options.SoftwareId,
-            sp.GetRequiredService<LicenseApiClient>(),
-            sp.GetRequiredService<ILicenseStateStore>(),
-            sp.GetRequiredService<IMachineFingerprintProvider>(),
-            TimeProvider.System,
-            null,
-            sp.GetRequiredService<LicenseRuntimeAuthorizationState>().PublishSummary));
+        services.AddSingleton(sp =>
+        {
+            var runtimeState = sp.GetRequiredService<LicenseRuntimeAuthorizationState>();
+            var gate = new LicenseAuthorizationGate(
+                options.SoftwareId,
+                sp.GetRequiredService<LicenseApiClient>(),
+                sp.GetRequiredService<ILicenseStateStore>(),
+                sp.GetRequiredService<IMachineFingerprintProvider>(),
+                TimeProvider.System,
+                null,
+                runtimeState.PublishSummary);
+            // 摘要只说"授权成功时是什么套餐"，说不了失败的原因。把结论码也记下来，
+            // 设置页才能把"连不上服务器"和"没有卡密"分开显示。
+            gate.StatusChanged += (_, status) => runtimeState.RecordGateCode(status.Result.Code);
+            return gate;
+        });
         services.AddSingleton<ILicenseAuthorizationGate>(sp =>
             sp.GetRequiredService<LicenseAuthorizationGate>());
     }

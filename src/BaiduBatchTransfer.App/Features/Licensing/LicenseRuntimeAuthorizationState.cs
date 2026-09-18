@@ -11,6 +11,9 @@ public sealed class LicenseRuntimeAuthorizationState
     private int startupValidationCompleted;
     private int isAuthorized;
     private AuthorizedLicenseSummary? currentSummary;
+    // 最近一次授权门给出的结论码。"连不上服务器"与"这台机器没有卡密"必须分开，
+    // 否则设置页只能在"已授权/未授权"里二选一，把网络故障说成用户没买。
+    private string lastGateCode = LicenseCodes.Ok;
 
     public bool StartupValidationCompleted => Volatile.Read(ref startupValidationCompleted) != 0;
     public bool IsAuthorized => Volatile.Read(ref isAuthorized) != 0;
@@ -23,6 +26,44 @@ public sealed class LicenseRuntimeAuthorizationState
     }
 
     public event Action<AuthorizedLicenseSummary?>? SummaryChanged;
+
+    public string LastGateCode
+    {
+        get { lock (summaryGate) return lastGateCode; }
+    }
+
+    // 授权结论未知（服务不可达、被限流），而不是被拒绝。
+    public bool VerificationDeferred
+    {
+        get
+        {
+            lock (summaryGate)
+            {
+                return currentSummary is null && lastGateCode is
+                    LicenseCodes.ServiceUnavailable or LicenseCodes.RateLimited or "authorization_unavailable";
+            }
+        }
+    }
+
+    public void RecordGateCode(string? code)
+    {
+        Action<AuthorizedLicenseSummary?>? changed;
+        AuthorizedLicenseSummary? summary;
+        lock (summaryGate)
+        {
+            var normalized = string.IsNullOrWhiteSpace(code) ? LicenseCodes.Ok : code;
+            if (string.Equals(lastGateCode, normalized, StringComparison.Ordinal)) return;
+            lastGateCode = normalized;
+            summary = currentSummary;
+            changed = SummaryChanged;
+        }
+
+        if (changed is null) return;
+        foreach (Action<AuthorizedLicenseSummary?> handler in changed.GetInvocationList())
+        {
+            try { handler(summary); } catch { }
+        }
+    }
 
     public void PublishSummary(AuthorizedLicenseSummary? summary)
     {

@@ -60,6 +60,51 @@ public sealed class AppStartupControllerTests
         Assert.True(authorization.StartupValidationCompleted);
         Assert.False(authorization.IsAuthorized);
         Assert.Equal("软件尚未激活，联网功能暂不可用。", result.StatusMessage);
+        Assert.True(result.ActivationInputRequired);
+        Assert.False(result.LicenseVerificationDeferred);
+    }
+
+    [Theory]
+    [InlineData(LicenseCodes.ServiceUnavailable)]
+    [InlineData(LicenseCodes.RateLimited)]
+    [InlineData("authorization_unavailable")]
+    public async Task AnUnreachableServiceIsNotTreatedAsAMissingLicence(string code)
+    {
+        // 授权与否只用一个布尔表示时，"这台机器没有卡密"和"暂时连不上授权服务器"
+        // 长得一模一样，于是网络抖动的付费用户也会被弹激活窗、被告知"你没激活"。
+        var order = new List<string>();
+        var controller = new AppStartupController(
+            new FakeRecovery(order, available: true),
+            new AppRuntimeState(),
+            new RecordingLicenseGate(order, isAuthorized: false, code: code),
+            new LicenseRuntimeAuthorizationState());
+
+        var result = await controller.StartAsync(_ => Task.CompletedTask);
+
+        Assert.False(result.LicenseAuthorized);
+        Assert.False(result.ActivationInputRequired);
+        Assert.True(result.LicenseVerificationDeferred);
+        Assert.Equal("暂时无法连接授权服务器，联网功能稍后重试。", result.StatusMessage);
+    }
+
+    [Theory]
+    [InlineData(LicenseCodes.LicenseNotFound)]
+    [InlineData(LicenseCodes.LicenseExpired)]
+    [InlineData(LicenseCodes.MachineMismatch)]
+    [InlineData(LicenseCodes.AppDisabled)]
+    public async Task AnExplicitServerRejectionStillAsksForACard(string code)
+    {
+        var order = new List<string>();
+        var controller = new AppStartupController(
+            new FakeRecovery(order, available: true),
+            new AppRuntimeState(),
+            new RecordingLicenseGate(order, isAuthorized: false, code: code),
+            new LicenseRuntimeAuthorizationState());
+
+        var result = await controller.StartAsync(_ => Task.CompletedTask);
+
+        Assert.True(result.ActivationInputRequired);
+        Assert.False(result.LicenseVerificationDeferred);
     }
 
     [Fact]
@@ -178,7 +223,8 @@ public sealed class AppStartupControllerTests
     private sealed class RecordingLicenseGate(
         List<string> order,
         bool isAuthorized,
-        bool throwOnAuthorize = false) : ILicenseAuthorizationGate
+        bool throwOnAuthorize = false,
+        string? code = null) : ILicenseAuthorizationGate
     {
         public int CallCount { get; private set; }
 
@@ -193,7 +239,7 @@ public sealed class AppStartupControllerTests
                 operation,
                 isAuthorized,
                 UsedCachedLease: false,
-                isAuthorized ? LicenseCodes.Ok : "activation_required"));
+                code ?? (isAuthorized ? LicenseCodes.Ok : "activation_required")));
         }
     }
 }

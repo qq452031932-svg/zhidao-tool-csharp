@@ -6,6 +6,17 @@ namespace SuperPan.Licensing.Client;
 public interface ICachedLicenseEnvelopeVerifier
 {
     LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash);
+
+    // 启动与联网操作对"租约有多新"的要求本来就不同：批量转存、分享这些操作本身就要
+    // 联网访问网盘，能连网盘就能连授权服务，所以它们继续要求租约未过期。而打开软件
+    // 根本不需要联网，却因为同一条规则被一起卡住——服务器抖 30 分钟，所有付费用户
+    // 都会被弹"未激活"。stalenessAllowance 只放宽"多久没去服务器复验"，卡密自身的
+    // 到期时间(expires_at)依旧强制，过期卡拿不到任何宽限。
+    LicenseClaims VerifyCached(
+        ReadOnlySpan<byte> signedEnvelope,
+        string expectedSoftwareId,
+        string expectedMachineHash,
+        TimeSpan stalenessAllowance);
 }
 
 public sealed class LicenseEnvelopeVerificationException : Exception
@@ -27,6 +38,16 @@ public sealed class SignedLicenseEnvelopeVerifier : IDisposable, ICachedLicenseE
         "protocol_version", "request_id", "server_time", "decision", "code", "card_id",
         "software_id", "machine_hash", "package_name", "expires_at", "lease_until",
     };
+
+    // 客户端能接受的最长"服务端签发租约"。原先钉死在 30 分钟，与服务端
+    // validationLease 完全相等，于是服务端一旦想把租约放长，所有旧客户端会把
+    // 合法回复判成非法信封、当场集体锁死——客户端与服务端被硬绑在一起。
+    // 这个上限本身也拦不住什么：能签出更长租约的人已经握有签名私钥。放宽到 7 天
+    // 是为了让将来调整服务端租约时不必先等客户端全量普及。
+    public static readonly TimeSpan MaximumIssuedLease = TimeSpan.FromDays(7);
+
+    // 启动时允许的最大"离线未复验"时长上限，防止调用方传进一个荒谬的值。
+    public static readonly TimeSpan MaximumStalenessAllowance = TimeSpan.FromDays(30);
 
     private readonly LicenseClientOptions options;
     private readonly TimeProvider timeProvider;
@@ -54,10 +75,21 @@ public sealed class SignedLicenseEnvelopeVerifier : IDisposable, ICachedLicenseE
     public LicenseClaims VerifyCached(
         ReadOnlySpan<byte> signedEnvelope,
         string expectedSoftwareId,
-        string expectedMachineHash)
+        string expectedMachineHash) =>
+        VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash, TimeSpan.Zero);
+
+    public LicenseClaims VerifyCached(
+        ReadOnlySpan<byte> signedEnvelope,
+        string expectedSoftwareId,
+        string expectedMachineHash,
+        TimeSpan stalenessAllowance)
     {
+        if (stalenessAllowance < TimeSpan.Zero || stalenessAllowance > MaximumStalenessAllowance)
+        {
+            throw new ArgumentOutOfRangeException(nameof(stalenessAllowance));
+        }
         var claims = VerifySignatureAndParse(signedEnvelope);
-        ValidateCachedBindingsAndTime(claims, expectedSoftwareId, expectedMachineHash);
+        ValidateCachedBindingsAndTime(claims, expectedSoftwareId, expectedMachineHash, stalenessAllowance);
         return claims;
     }
 
@@ -191,7 +223,7 @@ public sealed class SignedLicenseEnvelopeVerifier : IDisposable, ICachedLicenseE
         var expiresAt = claims.ExpiresAt!.Value;
         var leaseUntil = claims.LeaseUntil!.Value;
         if (expiresAt <= now || leaseUntil <= now || expiresAt < claims.ServerTime || leaseUntil <= claims.ServerTime ||
-            leaseUntil > claims.ServerTime.AddMinutes(30) || leaseUntil > expiresAt)
+            leaseUntil > claims.ServerTime.Add(MaximumIssuedLease) || leaseUntil > expiresAt)
         {
             throw Invalid("The response lease is invalid.");
         }
@@ -200,7 +232,8 @@ public sealed class SignedLicenseEnvelopeVerifier : IDisposable, ICachedLicenseE
     private void ValidateCachedBindingsAndTime(
         LicenseClaims claims,
         string expectedSoftwareId,
-        string expectedMachineHash)
+        string expectedMachineHash,
+        TimeSpan stalenessAllowance)
     {
         if (claims.Decision != LicenseDecisions.Allow || claims.Code != LicenseCodes.Ok ||
             !string.Equals(claims.SoftwareId, expectedSoftwareId, StringComparison.Ordinal) ||
@@ -217,8 +250,11 @@ public sealed class SignedLicenseEnvelopeVerifier : IDisposable, ICachedLicenseE
 
         var expiresAt = claims.ExpiresAt!.Value;
         var leaseUntil = claims.LeaseUntil!.Value;
-        if (expiresAt <= now || leaseUntil <= now || expiresAt < claims.ServerTime || leaseUntil <= claims.ServerTime ||
-            leaseUntil > claims.ServerTime.AddMinutes(30) || leaseUntil > expiresAt)
+        // expiresAt 是卡密买到的服务期，任何情况下都不放宽：过期的月卡不会因为离线
+        // 而多用一天。放宽的只有 leaseUntil——"多久该回服务器复验一次"。
+        if (expiresAt <= now || leaseUntil <= now - stalenessAllowance ||
+            expiresAt < claims.ServerTime || leaseUntil <= claims.ServerTime ||
+            leaseUntil > claims.ServerTime.Add(MaximumIssuedLease) || leaseUntil > expiresAt)
         {
             throw Invalid("The cached response lease is invalid.");
         }

@@ -101,14 +101,105 @@ public sealed class SignedLicenseEnvelopeVerifierTests
     }
 
     [Fact]
-    public void EnvelopeRejectsLeaseLongerThanThirtyMinutes()
+    public void EnvelopeRejectsLeaseLongerThanTheAcceptedMaximum()
     {
         using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         var verifier = CreateVerifier(signer);
-        var claims = CreateClaims() with { LeaseUntil = Now.AddMinutes(30).AddTicks(1) };
+        var claims = CreateClaims() with
+        {
+            ExpiresAt = Now.AddDays(30),
+            LeaseUntil = Now.Add(SignedLicenseEnvelopeVerifier.MaximumIssuedLease).AddTicks(1),
+        };
 
         Assert.Throws<LicenseEnvelopeVerificationException>(() =>
             verifier.Verify(Sign(claims, signer), "request-1", "software-1", "machine-1"));
+    }
+
+    [Fact]
+    public void EnvelopeAcceptsALeaseLongerThanTheServerCurrentlyIssues()
+    {
+        // 这个上限原先与服务端的 validationLease 同为 30 分钟，等于把客户端和服务端
+        // 硬绑在一起：服务端一旦想放长租约，所有旧客户端会把合法回复判成非法信封、
+        // 当场集体锁死。上限本身也拦不住什么——能签出更长租约的人已经握有私钥。
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var verifier = CreateVerifier(signer);
+        var claims = CreateClaims() with
+        {
+            ExpiresAt = Now.AddDays(30),
+            LeaseUntil = Now.AddHours(12),
+        };
+
+        var verified = verifier.Verify(Sign(claims, signer), "request-1", "software-1", "machine-1");
+
+        Assert.Equal(Now.AddHours(12), verified.LeaseUntil);
+    }
+
+    [Fact]
+    public void CachedEnvelopeIsAcceptedAfterLeaseExpiryWithinTheAllowance()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var verifier = CreateVerifier(signer);
+        var claims = CreateClaims() with
+        {
+            ServerTime = Now.AddDays(-3),
+            ExpiresAt = Now.AddDays(20),
+            LeaseUntil = Now.AddDays(-3).AddMinutes(30),
+        };
+
+        var verified = verifier.VerifyCached(
+            Sign(claims, signer), "software-1", "machine-1", TimeSpan.FromDays(7));
+
+        Assert.Equal("package-1", verified.PackageName);
+    }
+
+    [Fact]
+    public void CachedEnvelopeIsRejectedOnceTheAllowanceIsExhausted()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var verifier = CreateVerifier(signer);
+        var claims = CreateClaims() with
+        {
+            ServerTime = Now.AddDays(-9),
+            ExpiresAt = Now.AddDays(20),
+            LeaseUntil = Now.AddDays(-9).AddMinutes(30),
+        };
+
+        Assert.Throws<LicenseEnvelopeVerificationException>(() =>
+            verifier.VerifyCached(Sign(claims, signer), "software-1", "machine-1", TimeSpan.FromDays(7)));
+    }
+
+    [Fact]
+    public void CachedEnvelopeWithAnExpiredCardIsRejectedEvenInsideTheAllowance()
+    {
+        // 放宽的只是"多久回服务器复验一次"。卡密买到的服务期到了就是到了，
+        // 不会因为离线而多用一天。
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var verifier = CreateVerifier(signer);
+        var claims = CreateClaims() with
+        {
+            ServerTime = Now.AddDays(-2),
+            ExpiresAt = Now.AddDays(-1),
+            LeaseUntil = Now.AddDays(-2).AddMinutes(30),
+        };
+
+        Assert.Throws<LicenseEnvelopeVerificationException>(() =>
+            verifier.VerifyCached(Sign(claims, signer), "software-1", "machine-1", TimeSpan.FromDays(7)));
+    }
+
+    [Fact]
+    public void CachedEnvelopeWithoutAnAllowanceStillRequiresALiveLease()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var verifier = CreateVerifier(signer);
+        var claims = CreateClaims() with
+        {
+            ServerTime = Now.AddHours(-2),
+            ExpiresAt = Now.AddDays(20),
+            LeaseUntil = Now.AddHours(-2).AddMinutes(30),
+        };
+
+        Assert.Throws<LicenseEnvelopeVerificationException>(() =>
+            verifier.VerifyCached(Sign(claims, signer), "software-1", "machine-1"));
     }
 
     [Fact]

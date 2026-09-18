@@ -77,7 +77,9 @@ public partial class App : System.Windows.Application
                 CompleteApplicationExit);
             MainWindow.Closing += OnMainWindowClosing;
             MainWindow.Show();
-            if (!startup.LicenseAuthorized)
+            // 只有服务器明确说"这台机器需要卡密"时才弹激活窗。连不上服务器时弹窗
+            // 等于告诉付费用户"你没激活"，而他什么都没做错——网络恢复后会自动通过。
+            if (startup.ActivationInputRequired)
             {
                 await host.Services.GetRequiredService<ILicenseActivationPresenter>()
                     .PresentAsync().ConfigureAwait(true);

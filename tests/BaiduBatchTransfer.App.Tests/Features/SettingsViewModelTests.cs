@@ -15,6 +15,60 @@ public sealed class SettingsViewModelTests
         "软件将安全关闭、安装已下载的更新并自动重启，是否继续？";
 
     [Fact]
+    public void AnUnreachableServiceReadsAsUnknownRatherThanUnauthorised()
+    {
+        var license = new LicenseSettingsSnapshot(
+            packageName: null,
+            expiresAt: null,
+            isAuthorized: false,
+            isMachineBound: false,
+            verificationDeferred: true);
+        using var viewModel = Create(
+            new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle)),
+            licenseSettings: license);
+
+        Assert.Contains("暂时无法连接授权服务器", viewModel.LicenseAuthorizationStatus, StringComparison.Ordinal);
+        Assert.DoesNotContain("未授权", viewModel.LicenseAuthorizationStatus, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TheActivationEntryStaysAvailableWhileTheServiceIsUnreachable()
+    {
+        // 卡密恰好到期、同时授权服务器又连不上的用户，如果这时藏掉激活入口，
+        // 他就没有任何地方能输入新卡密了。入口要一直在；连不上是激活窗自己
+        // 该说明的事。
+        var license = new LicenseSettingsSnapshot(
+            packageName: null,
+            expiresAt: null,
+            isAuthorized: false,
+            isMachineBound: false,
+            verificationDeferred: true);
+        using var viewModel = Create(
+            new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle)),
+            licenseSettings: license,
+            presentActivationAsync: _ => Task.FromResult(false));
+
+        Assert.True(viewModel.CanActivateLicense);
+        Assert.True(viewModel.ActivateLicenseCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public void TheActivationEntryDisappearsOnceAuthorised()
+    {
+        var license = new LicenseSettingsSnapshot(
+            "年卡会员",
+            DateTimeOffset.UtcNow.AddDays(30),
+            isAuthorized: true,
+            isMachineBound: true);
+        using var viewModel = Create(
+            new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle)),
+            licenseSettings: license,
+            presentActivationAsync: _ => Task.FromResult(true));
+
+        Assert.False(viewModel.CanActivateLicense);
+    }
+
+    [Fact]
     public void AuthorizationSummaryExposesOnlyReadOnlyDisplayValues()
     {
         var license = new LicenseSettingsSnapshot(
@@ -543,14 +597,16 @@ public sealed class SettingsViewModelTests
         IApplicationCloseRequester? closeRequester = null,
         SynchronizationContext? synchronizationContext = null,
         ApplicationBuildInfo? buildInfo = null,
-        LicenseSettingsSnapshot? licenseSettings = null) =>
+        LicenseSettingsSnapshot? licenseSettings = null,
+        Func<CancellationToken, Task<bool>>? presentActivationAsync = null) =>
         new(
             service,
             dialog ?? new FakeDialog(true),
             closeRequester ?? new FakeCloseRequester(),
             synchronizationContext ?? new ImmediateSynchronizationContext(),
             buildInfo ?? ApplicationBuildInfo.Current,
-            licenseSettings);
+            licenseSettings,
+            presentActivationAsync);
 
     private static string FindRepositoryFile(params string[] segments)
     {

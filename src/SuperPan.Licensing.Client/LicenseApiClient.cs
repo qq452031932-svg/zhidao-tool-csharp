@@ -136,6 +136,13 @@ public sealed class LicenseApiClient : IDisposable, ILicenseServiceClient
         string expectedMachineHash) =>
         verifier.VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash);
 
+    public LicenseClaims VerifyCached(
+        ReadOnlySpan<byte> signedEnvelope,
+        string expectedSoftwareId,
+        string expectedMachineHash,
+        TimeSpan stalenessAllowance) =>
+        verifier.VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash, stalenessAllowance);
+
     public void Dispose()
     {
         if (disposed)

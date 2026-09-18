@@ -46,6 +46,13 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
 {
     private const string ActivationRequired = "activation_required";
     private const string AuthorizationUnavailable = "authorization_unavailable";
+
+    // 服务端签发的租约只有 30 分钟(validationLease)。断网超过半小时，已付费用户
+    // 就会被判未授权并弹出激活窗——用户看到的是"你没激活"，会以为自己被骗。
+    // 而真正拦住盗版的是签名信封、机器绑定与服务端吊销，这三样不受租约时长影响；
+    // 租约时长只决定吊销延迟，且只对诚实用户生效（破解者直接改本地校验）。
+    // 因此给"打开软件"单独留 7 天离线宽限，联网操作维持原样。
+    public static readonly TimeSpan StartupOfflineGrace = TimeSpan.FromDays(7);
     private readonly string softwareId;
     private readonly ILicenseServiceClient service;
     private readonly ILicenseStateStore store;
@@ -142,8 +149,9 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
                 return Publish(new LicenseGateResult(operation, false, false, ActivationRequired));
             }
 
+            var allowance = StalenessAllowanceFor(operation);
             var candidates = snapshot.Credentials
-                .Select(credential => new CredentialCandidate(credential, FindVerifiedCachedClaims(credential, machineHash)))
+                .Select(credential => new CredentialCandidate(credential, FindVerifiedCachedClaims(credential, machineHash, allowance)))
                 .OrderByDescending(candidate => candidate.CachedClaims is not null)
                 .ToArray();
             LicenseGateResult? lastRejection = null;
@@ -218,7 +226,7 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
                 return Publish(new LicenseGateResult(LicenseOperationKind.Startup, false, false, SafeCode(response.Code)));
             }
             if (response.Kind == LicenseApiResultKind.TemporaryFailure &&
-                FindVerifiedCachedClaims(credential, machineHash) is { } cachedClaims)
+                FindVerifiedCachedClaims(credential, machineHash, StartupOfflineGrace) is { } cachedClaims)
             {
                 return Publish(
                     new LicenseGateResult(LicenseOperationKind.Startup, true, true, SafeCode(response.Code)),
@@ -268,13 +276,17 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         }
     }
 
-    private LicenseClaims? FindVerifiedCachedClaims(StoredLicenseCredential credential, string machineHash)
+    private LicenseClaims? FindVerifiedCachedClaims(
+        StoredLicenseCredential credential,
+        string machineHash,
+        TimeSpan stalenessAllowance)
     {
         foreach (var lease in credential.Leases)
         {
             try
             {
-                return service.VerifyCached(Convert.FromBase64String(lease.SignedPayload), softwareId, machineHash);
+                return service.VerifyCached(
+                    Convert.FromBase64String(lease.SignedPayload), softwareId, machineHash, stalenessAllowance);
             }
             catch (Exception exception) when (exception is LicenseEnvelopeVerificationException or FormatException or ArgumentException)
             {
@@ -282,6 +294,11 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
         }
         return null;
     }
+
+    // 只有"打开软件"享受离线宽限。批量转存与分享要访问网盘，本来就得联网，
+    // 继续要求租约未过期，吊销延迟因此不变。
+    private static TimeSpan StalenessAllowanceFor(LicenseOperationKind operation) =>
+        operation == LicenseOperationKind.Startup ? StartupOfflineGrace : TimeSpan.Zero;
 
     private async Task<LicenseApiResult> ValidateCredentialAsync(
         StoredLicenseCredential credential,
@@ -330,6 +347,8 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
             client.ValidateAsync(requestId, card, machineHash, cancellationToken);
         public LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash) =>
             client.VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash);
+        public LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash, TimeSpan stalenessAllowance) =>
+            client.VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash, stalenessAllowance);
     }
 
     private sealed record CredentialCandidate(StoredLicenseCredential Credential, LicenseClaims? CachedClaims);

@@ -431,11 +431,20 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private void ApplyLicense(LicenseSettingsSnapshot license)
     {
         LicensePackageName = string.IsNullOrWhiteSpace(license.PackageName)
-            ? "未激活"
+            ? license.VerificationDeferred ? "暂时无法读取" : "未激活"
             : license.PackageName;
         LicenseExpiresAt = license.ExpiryDisplay;
-        LicenseAuthorizationStatus = license.IsAuthorized ? "已授权" : "未授权";
-        LicenseMachineBindingStatus = license.IsMachineBound ? "已绑定当前电脑" : "未绑定";
+        LicenseAuthorizationStatus = license.IsAuthorized
+            ? "已授权"
+            : license.VerificationDeferred
+                ? "暂时无法连接授权服务器，稍后自动重试"
+                : "未授权";
+        LicenseMachineBindingStatus = license.IsMachineBound
+            ? "已绑定当前电脑"
+            : license.VerificationDeferred ? "暂时无法确认" : "未绑定";
+        // 只要还没授权就给入口，连不上服务器也给。卡密恰好到期、同时服务器又不可达
+        // 的用户，否则就没有任何地方能输入新卡密了——那是把唯一的门锁上。
+        // 连不上时点开激活窗，窗口自己会说"无法连接授权服务器，请检查网络后重试"。
         CanActivateLicense = !license.IsAuthorized && presentActivationAsync is not null;
     }
 
