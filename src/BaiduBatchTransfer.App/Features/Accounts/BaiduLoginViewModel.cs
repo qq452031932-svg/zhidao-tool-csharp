@@ -1,4 +1,4 @@
-using BaiduBatchTransfer.Application.Accounts;
+﻿using BaiduBatchTransfer.Application.Accounts;
 using CommunityToolkit.Mvvm.ComponentModel;
 
 namespace BaiduBatchTransfer.App.Features.Accounts;
@@ -18,7 +18,7 @@ public static class BaiduLoginUiText
     public const string ProfileFailed = "独立账号目录无法安全创建，请关闭窗口后重试。";
     public const string InitializationFailed = "登录页面无法打开，请安装或更新微软官方网页运行组件后重试。";
     public const string CaptureFailed = "登录状态读取失败，窗口会继续等待，请重新扫码确认。";
-    public const string LoginButtonMissing = "未找到百度网盘首页的登录按钮。百度页面可能已经更新，请关闭窗口后重试。";
+    public const string LoginButtonMissing = "等待百度网盘首页加载超时，未能自动打开登录框。请在上方页面中手动点击「去登录」，或关闭窗口后重试。";
     public const string CleanupPending = "账号没有保存，本机登录目录仍待清理；下次启动会继续处理。";
 }
 
