@@ -1074,8 +1074,11 @@ public sealed class AppShellFactory(
 
         LicenseSettingsSnapshot ReadLicenseSettings()
         {
+            // 以“有没有授权摘要”为准，而不是 IsAuthorized：激活成功时先发布摘要、
+            // 再置位 IsAuthorized，而置位不发事件。依赖后者会让设置页停在“未授权”，
+            // 却同时显示出套餐和到期时间——正是用户看到的自相矛盾状态。
             var summary = licenseAuthorizationState.CurrentSummary;
-            var authorized = licenseAuthorizationState.IsAuthorized;
+            var authorized = summary is not null;
             return new LicenseSettingsSnapshot(
                 summary?.PackageName,
                 summary?.ExpiresAt,

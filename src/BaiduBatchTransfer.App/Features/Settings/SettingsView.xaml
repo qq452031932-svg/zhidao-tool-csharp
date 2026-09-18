@@ -31,6 +31,7 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <TextBlock Grid.Row="0" Grid.Column="0" Text="套餐" Foreground="{StaticResource MutedBrush}" />
                 <TextBlock Grid.Row="0" Grid.Column="1" Margin="20,0,0,0" Text="{Binding LicensePackageName}" />
@@ -52,7 +53,7 @@
                 </StackPanel>
                 <!-- 未授权时才出现。激活窗此前只在启动时弹一次，
                      用户点“暂不激活”后没有任何入口可以再次激活。 -->
-                <Button Grid.Row="4" Grid.Column="1"
+                <Button Grid.Row="5" Grid.Column="1"
                         Margin="20,14,0,0"
                         HorizontalAlignment="Left"
                         MinWidth="120"
