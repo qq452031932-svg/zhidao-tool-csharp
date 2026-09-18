@@ -213,7 +213,7 @@
                                         AutomationProperties.Name="取消保存分享结果" />
                                 <Button Content="清空分享历史" Command="{Binding ClearShareHistoryCommand}"
                                         AutomationProperties.Name="清空分享历史" Style="{StaticResource DangerHistoryButton}"
-                                        ToolTip="仅删除本地记录，不影响百度网盘文件和分享链接。任务处理或保存期间不可清空。"
+                                        ToolTip="{Binding ClearShareHistoryHint}"
                                         ToolTipService.ShowOnDisabled="True" Margin="8,0,0,0" />
                             </WrapPanel>
 

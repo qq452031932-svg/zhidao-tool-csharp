@@ -357,6 +357,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public LocalHistoryCleanupPreview? ShareHistoryPreview => historyCleanup.Preview;
     public bool CanClearShareHistory => historyCleanup.CanClear;
     public IAsyncRelayCommand ClearShareHistoryCommand => historyCleanup.ClearCommand;
+    public string ClearShareHistoryHint => historyCleanup.ClearBlockedReason;
     public Task ClearShareHistoryAsync(CancellationToken cancellationToken = default) => historyCleanup.ClearAsync(cancellationToken);
     public Task RefreshHistoryPreviewAsync(CancellationToken cancellationToken = default) => historyCleanup.RefreshPreviewAsync(cancellationToken);
 
@@ -827,6 +828,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     {
         OnPropertyChanged(nameof(CanClearLogs));
         OnPropertyChanged(nameof(CanClearShareHistory));
+        OnPropertyChanged(nameof(ClearShareHistoryHint));
         ClearShareHistoryCommand?.NotifyCanExecuteChanged();
         ClearLogsCommand.NotifyCanExecuteChanged();
     }
@@ -1270,6 +1272,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     private void NotifyCommandState()
     {
         OnPropertyChanged(nameof(CanClearShareHistory));
+        OnPropertyChanged(nameof(ClearShareHistoryHint));
         ClearShareHistoryCommand.NotifyCanExecuteChanged();
         OnPropertyChanged(nameof(CanPickResources));
         OnPropertyChanged(nameof(CanEditSelection));
