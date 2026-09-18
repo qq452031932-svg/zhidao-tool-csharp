@@ -1,4 +1,4 @@
-using BaiduBatchTransfer.BaiduAdapter.Authentication;
+﻿using BaiduBatchTransfer.BaiduAdapter.Authentication;
 using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Features.Accounts;
@@ -148,10 +148,13 @@ public sealed class BaiduLoginDomAutomationCoordinator
     private bool inProgress;
     private bool succeeded;
 
-    public BaiduLoginDomAutomationCoordinator(int maxAttempts = 5)
+    // 轮询间隔 700ms。默认 5 次意味着只等 3.5 秒就判定“找不到登录按钮”，
+    // 而 pan.baidu.com 是单页应用，网络稍慢时首页按钮远不止 3.5 秒才渲染出来，
+    // 用户看到的是页面明明已经显示「去登录」却报错。预算放宽到约 45 秒。
+    public BaiduLoginDomAutomationCoordinator(int maxAttempts = 64)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxAttempts, 1);
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxAttempts, 10);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxAttempts, 256);
         this.maxAttempts = maxAttempts;
     }
 
