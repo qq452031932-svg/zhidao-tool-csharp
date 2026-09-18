@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -460,15 +460,24 @@ public sealed class VelopackExecutableRenameMigrationScriptTests
     }
 
     [Fact]
-    public async Task UnsignedExecutableCannotMasqueradeAsTrustedStateDriver()
+    public async Task ForeignExecutableCannotMasqueradeAsTrustedStateDriver()
     {
+        // 这里喂进去的是测试宿主自己。它到底有没有 Authenticode 签名取决于机器：
+        // 本地 dotnet 由微软签名且有效，CI 上的自建宿主则可能完全没签。两种情况
+        // 走的是脚本里不同的拒绝分支（"没有签名" vs "签名者 SPKI 不是发布者"），
+        // 断言任何一条具体文案都会在另一种机器上误报。真正要守的是：
+        // 只要签名者不是生产发布者，就必须拒绝。
         var executable = Environment.ProcessPath ?? throw new InvalidOperationException("Test process path is unavailable.");
         var result = await RunFunctionAsync("Assert-PublisherExecutable", new Dictionary<string, string>
         {
             ["Executable"] = executable, ["ExpectedSpki"] = ProductionPublisherSpki,
         });
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("Authenticode", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(ProductionPublisherSpki + " matches", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.True(
+            result.Output.Contains("Authenticode", StringComparison.OrdinalIgnoreCase) ||
+            result.Output.Contains("SPKI", StringComparison.OrdinalIgnoreCase),
+            $"拒绝理由既未提签名也未提 SPKI，可能拒绝原因与签名无关：{result.Output}");
     }
 
     [Fact]

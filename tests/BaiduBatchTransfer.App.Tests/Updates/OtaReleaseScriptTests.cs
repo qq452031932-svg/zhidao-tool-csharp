@@ -46,8 +46,31 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("Assert-NonReparseExistingAncestors $outputPath $artifactRoot", script, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task RejectsAnEmptyVersionBeforeCreatingOutput()
+    {
+        // 空串走不到脚本自己的版本校验：PowerShell 的参数绑定先把它拒了。
+        // 那条消息随系统语言本地化（本机是中文），而且控制台换行会把消息里嵌的
+        // 参数名 "Version" 从中间劈成 "Ver"+"sion"，所以按英文字样断言必然误报。
+        // FullyQualifiedErrorId 不随语言变，用它。
+        using var fixture = ScriptFixture.Create();
+
+        var result = await fixture.RunAsync(
+            "-Version", string.Empty,
+            "-AcceptanceFeedPath", fixture.FeedDirectory,
+            "-OutputDirectory", fixture.OutputDirectory,
+            "-OtaAcceptanceBuild",
+            "-AllowUnsignedLocal");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(
+            "ParameterArgumentValidationErrorEmptyStringNotAllowed",
+            result.Output,
+            StringComparison.Ordinal);
+        Assert.False(Directory.Exists(fixture.OutputDirectory));
+    }
+
     [Theory]
-    [InlineData("")]
     [InlineData("1.2")]
     [InlineData("01.2.3")]
     [InlineData("1.02.3")]
