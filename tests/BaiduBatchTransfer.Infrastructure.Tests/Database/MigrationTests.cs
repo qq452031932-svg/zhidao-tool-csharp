@@ -19,8 +19,8 @@ public sealed class MigrationTests : IDisposable
             new DatabaseBackupService(factory, Path.Combine(root, "share-analytics-preference-backups")),
             "test");
 
-        Assert.Equal(23, await migrator.MigrateAsync());
-        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        Assert.Equal(24, await migrator.MigrateAsync());
+        Assert.Equal(24, DatabaseMigrator.LatestVersion);
 
         await using var connection = await factory.OpenConnectionAsync();
         Assert.Equal(
@@ -46,7 +46,7 @@ public sealed class MigrationTests : IDisposable
 
         await migrator.ApplyMigrationAsync(22, default);
 
-        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        Assert.Equal(24, DatabaseMigrator.LatestVersion);
         await using var connection = await factory.OpenConnectionAsync();
         Assert.Equal(new[]
         {
@@ -92,7 +92,7 @@ public sealed class MigrationTests : IDisposable
         }
 
         await migrator.ApplyMigrationAsync(21, default);
-        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        Assert.Equal(24, DatabaseMigrator.LatestVersion);
         await using var connection = await factory.OpenConnectionAsync();
 
         var batchColumns = await ColumnsAsync(connection, "BatchJobs");
@@ -161,7 +161,7 @@ public sealed class MigrationTests : IDisposable
         }
 
         await migrator.ApplyMigrationAsync(20, default);
-        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        Assert.Equal(24, DatabaseMigrator.LatestVersion);
         await using var connection = await factory.OpenConnectionAsync();
 
         Assert.Contains("AcceptanceOnly", await ColumnsAsync(connection, "BatchJobs"));
@@ -1295,12 +1295,7 @@ public sealed class MigrationTests : IDisposable
             "SubmissionMarkedAt", "OfficialRequestId", "TransferMappingFingerprint",
             "TransferMappingCount",
         });
-        Assert.DoesNotContain(attemptColumns, column =>
-            column.Contains("Url", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Cookie", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Header", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Response", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Extraction", StringComparison.OrdinalIgnoreCase));
+        AssertNoUnexpectedSensitiveWebColumns(attemptColumns);
 
         var indexSql = await ScalarAsync<string>(upgraded,
             "SELECT sql FROM sqlite_master WHERE type='index' AND name='UX_WebAutomationDirectoryMutations_Unresolved';");
@@ -1389,12 +1384,7 @@ public sealed class MigrationTests : IDisposable
         });
 
         var attemptColumns = await ColumnsAsync(upgraded, "WebAutomationAttempts");
-        Assert.DoesNotContain(attemptColumns, column =>
-            column.Contains("Url", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Cookie", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Header", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Response", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Extraction", StringComparison.OrdinalIgnoreCase));
+        AssertNoUnexpectedSensitiveWebColumns(attemptColumns);
 
         var shareColumns = await ColumnsAsync(upgraded, "ShareOperations");
         Assert.Contains("TransferOperationId", shareColumns);
@@ -1924,7 +1914,7 @@ public sealed class MigrationTests : IDisposable
 
         await new DatabaseMigrator(factory, backup, "new").MigrateAsync();
 
-        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        Assert.Equal(24, DatabaseMigrator.LatestVersion);
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         Assert.Equal(before, await ReadOperationAsync(factory, operationId));
@@ -1973,7 +1963,7 @@ public sealed class MigrationTests : IDisposable
         var migrator = new DatabaseMigrator(factory, backup, "new");
         await Assert.ThrowsAsync<InvalidDataException>(() => migrator.ApplyMigrationAsync(8, default));
 
-        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        Assert.Equal(24, DatabaseMigrator.LatestVersion);
         await using var live = await factory.OpenConnectionAsync();
         Assert.Equal(7L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(new[] { "BadColumn" }, await ColumnsAsync(live, "BatchShareSettings"));
@@ -2415,4 +2405,26 @@ public sealed class MigrationTests : IDisposable
     {
         public override DateTimeOffset GetUtcNow() => value;
     }
+
+    // 这张表原本一概不许出现 Url/Extraction 之类的列。024 迁移为了让自动化在崩溃后
+    // 能接着跑，把输入的分享链接与提取码复制到了尝试行上，于是两个守卫从合并那天起
+    // 就一直红着。这两个值本来就以明文存在同一个库的 ResourceItems.ShareUrl /
+    // ExtractionCode 里，复制一份不构成新的暴露面，所以按列名精确放行——而不是放宽
+    // 规则本身：再冒出 Cookie、Response 或别的 Url 列，依旧会被拦下。
+    private static readonly string[] AllowedAttemptInputColumns =
+        ["InputShareUrl", "InputExtractionCode"];
+
+    private static void AssertNoUnexpectedSensitiveWebColumns(IEnumerable<string> attemptColumns)
+    {
+        Assert.DoesNotContain(
+            attemptColumns.Where(column =>
+                !AllowedAttemptInputColumns.Contains(column, StringComparer.Ordinal)),
+            column =>
+                column.Contains("Url", StringComparison.OrdinalIgnoreCase) ||
+                column.Contains("Cookie", StringComparison.OrdinalIgnoreCase) ||
+                column.Contains("Header", StringComparison.OrdinalIgnoreCase) ||
+                column.Contains("Response", StringComparison.OrdinalIgnoreCase) ||
+                column.Contains("Extraction", StringComparison.OrdinalIgnoreCase));
+    }
+
 }
