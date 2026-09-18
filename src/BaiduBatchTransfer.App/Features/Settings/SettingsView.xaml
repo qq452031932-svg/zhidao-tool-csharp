@@ -3,6 +3,61 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              MinWidth="320"
              MinHeight="240">
+    <!-- 授权与 OTA 是两件事：授权信息原本嵌在“软件更新”标题之下，读起来像是
+         更新功能的一部分。拆成两张卡片，授权在上，更新在下。 -->
+    <StackPanel>
+    <Border Style="{StaticResource BorderedPanelStyle}" Padding="22" Margin="0,0,0,14">
+        <StackPanel>
+            <TextBlock Text="软件授权"
+                       FontSize="20"
+                       FontWeight="SemiBold"
+                       Foreground="{StaticResource BrandBrush}" />
+            <TextBlock Text="当前卡密套餐与机器绑定状态。"
+                       Margin="0,5,0,0"
+                       Foreground="{StaticResource MutedBrush}" />
+        <Border
+                Margin="0,14,0,0"
+                Padding="14"
+                Style="{StaticResource Card}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="套餐" Foreground="{StaticResource MutedBrush}" />
+                <TextBlock Grid.Row="0" Grid.Column="1" Margin="20,0,0,0" Text="{Binding LicensePackageName}" />
+                <TextBlock Grid.Row="1" Grid.Column="0" Margin="0,8,0,0" Text="到期时间" Foreground="{StaticResource MutedBrush}" />
+                <TextBlock Grid.Row="1" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseExpiresAt}" />
+                <TextBlock Grid.Row="2" Grid.Column="0" Margin="0,8,0,0" Text="授权状态" Foreground="{StaticResource MutedBrush}" />
+                <TextBlock Grid.Row="2" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseAuthorizationStatus}" />
+                <TextBlock Grid.Row="3" Grid.Column="0" Margin="0,8,0,0" Text="机器绑定状态" Foreground="{StaticResource MutedBrush}" />
+                <TextBlock Grid.Row="3" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseMachineBindingStatus}" />
+                <!-- 未授权时才出现。激活窗此前只在启动时弹一次，
+                     用户点“暂不激活”后没有任何入口可以再次激活。 -->
+                <Button Grid.Row="4" Grid.Column="1"
+                        Margin="20,14,0,0"
+                        HorizontalAlignment="Left"
+                        MinWidth="120"
+                        Style="{StaticResource PrimaryButton}"
+                        Content="激活软件"
+                        Command="{Binding ActivateLicenseCommand}"
+                        AutomationProperties.Name="激活软件">
+                    <Button.Visibility>
+                        <Binding Path="CanActivateLicense"
+                                 Converter="{StaticResource BooleanToVisibilityConverter}" />
+                    </Button.Visibility>
+                </Button>
+            </Grid>
+        </Border>
+        </StackPanel>
+    </Border>
     <Border Style="{StaticResource BorderedPanelStyle}" Padding="22">
         <Grid>
             <Grid.RowDefinitions>
@@ -28,47 +83,6 @@
                            Foreground="{StaticResource BrandBrush}" />
             </StackPanel>
 
-            <Border Grid.Row="1"
-                    Margin="0,22,0,0"
-                    Padding="14"
-                    Style="{StaticResource Card}">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <TextBlock Grid.Row="0" Grid.Column="0" Text="套餐" Foreground="{StaticResource MutedBrush}" />
-                    <TextBlock Grid.Row="0" Grid.Column="1" Margin="20,0,0,0" Text="{Binding LicensePackageName}" />
-                    <TextBlock Grid.Row="1" Grid.Column="0" Margin="0,8,0,0" Text="到期时间" Foreground="{StaticResource MutedBrush}" />
-                    <TextBlock Grid.Row="1" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseExpiresAt}" />
-                    <TextBlock Grid.Row="2" Grid.Column="0" Margin="0,8,0,0" Text="授权状态" Foreground="{StaticResource MutedBrush}" />
-                    <TextBlock Grid.Row="2" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseAuthorizationStatus}" />
-                    <TextBlock Grid.Row="3" Grid.Column="0" Margin="0,8,0,0" Text="机器绑定状态" Foreground="{StaticResource MutedBrush}" />
-                    <TextBlock Grid.Row="3" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseMachineBindingStatus}" />
-                    <!-- 未授权时才出现。激活窗此前只在启动时弹一次，
-                         用户点“暂不激活”后没有任何入口可以再次激活。 -->
-                    <Button Grid.Row="4" Grid.Column="1"
-                            Margin="20,14,0,0"
-                            HorizontalAlignment="Left"
-                            MinWidth="120"
-                            Style="{StaticResource PrimaryButton}"
-                            Content="激活软件"
-                            Command="{Binding ActivateLicenseCommand}"
-                            AutomationProperties.Name="激活软件">
-                        <Button.Visibility>
-                            <Binding Path="CanActivateLicense"
-                                     Converter="{StaticResource BooleanToVisibilityConverter}" />
-                        </Button.Visibility>
-                    </Button>
-                </Grid>
-            </Border>
 
             <Grid Grid.Row="2" Margin="0,22,0,0">
                 <Grid.ColumnDefinitions>
@@ -143,4 +157,5 @@
             </StackPanel>
         </Grid>
     </Border>
+    </StackPanel>
 </UserControl>

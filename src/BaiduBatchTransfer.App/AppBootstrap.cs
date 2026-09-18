@@ -1069,6 +1069,9 @@ public sealed class AppShellFactory(
             () => mainWindow?.Close());
         // 授权快照此前从未真实注入，设置中心永远显示“未激活”，即使用户已激活成功。
         // 这里接上运行时授权状态，并把激活窗作为可再次调起的入口交给设置页。
+        var licenseSummaryHandlers =
+            new Dictionary<Action, Action<AuthorizedLicenseSummary?>>();
+
         LicenseSettingsSnapshot ReadLicenseSettings()
         {
             var summary = licenseAuthorizationState.CurrentSummary;
@@ -1090,7 +1093,19 @@ public sealed class AppShellFactory(
             presentActivationAsync: licenseActivationPresenter is null
                 ? null
                 : token => licenseActivationPresenter.PresentAsync(token),
-            readLicenseSettings: ReadLicenseSettings);
+            readLicenseSettings: ReadLicenseSettings,
+            subscribeLicenseChanged: handler =>
+            {
+                // 记住包装后的委托，否则退订时拿不到同一个引用，事件会一直持有设置页。
+                void Wrapper(AuthorizedLicenseSummary? _) => handler();
+                licenseSummaryHandlers[handler] = Wrapper;
+                licenseAuthorizationState.SummaryChanged += Wrapper;
+            },
+            unsubscribeLicenseChanged: handler =>
+            {
+                if (!licenseSummaryHandlers.Remove(handler, out var wrapper)) return;
+                licenseAuthorizationState.SummaryChanged -= wrapper;
+            });
         var settingsWorkspace = new SettingsView(settingsViewModel);
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),

@@ -23,6 +23,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private readonly object snapshotGate = new();
     private readonly Func<CancellationToken, Task<bool>>? presentActivationAsync;
     private readonly Func<LicenseSettingsSnapshot>? readLicenseSettings;
+    private readonly Action<Action>? unsubscribeLicenseChanged;
+    private Action? licenseChangedHandler;
     private string licensePackageName = "未激活";
     private string licenseExpiresAt = "—";
     private string licenseAuthorizationStatus = "未授权";
@@ -63,7 +65,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         ApplicationBuildInfo? buildInfo = null,
         LicenseSettingsSnapshot? licenseSettings = null,
         Func<CancellationToken, Task<bool>>? presentActivationAsync = null,
-        Func<LicenseSettingsSnapshot>? readLicenseSettings = null)
+        Func<LicenseSettingsSnapshot>? readLicenseSettings = null,
+        Action<Action>? subscribeLicenseChanged = null,
+        Action<Action>? unsubscribeLicenseChanged = null)
     {
         this.updateService = updateService ?? throw new ArgumentNullException(nameof(updateService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
@@ -77,6 +81,13 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         this.readLicenseSettings = readLicenseSettings;
         ActivateLicenseCommand = new AsyncRelayCommand(ActivateLicenseAsync, () => CanActivateLicense);
         ApplyLicense(licenseSettings ?? readLicenseSettings?.Invoke() ?? LicenseSettingsSnapshot.NotActivated);
+        this.unsubscribeLicenseChanged = unsubscribeLicenseChanged;
+        if (subscribeLicenseChanged is not null && readLicenseSettings is not null)
+        {
+            // 授权可能在设置页之外完成（启动时的激活窗），必须跟随运行时状态刷新。
+            licenseChangedHandler = () => RunOnUi(() => ApplyLicense(readLicenseSettings()));
+            subscribeLicenseChanged(licenseChangedHandler);
+        }
 
         CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, CanCheckForUpdates);
         UpdateAndRestartCommand = new AsyncRelayCommand(UpdateAndRestartAsync, CanUpdateAndRestart);
@@ -172,6 +183,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
 
             Volatile.Write(ref disposed, 1);
             updateService.SnapshotChanged -= OnSnapshotChanged;
+            if (licenseChangedHandler is not null) unsubscribeLicenseChanged?.Invoke(licenseChangedHandler);
+            licenseChangedHandler = null;
         }
 
         CheckForUpdatesCommand.Cancel();
@@ -412,5 +425,11 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         await presentActivationAsync(cancellationToken).ConfigureAwait(true);
         // 无论激活成功与否都重新读取：失败时状态保持不变，成功时立即反映到界面。
         if (readLicenseSettings is not null) ApplyLicense(readLicenseSettings());
+    }
+
+    private void RunOnUi(Action action)
+    {
+        if (SynchronizationContext.Current == synchronizationContext) action();
+        else synchronizationContext.Post(_ => action(), null);
     }
 }
