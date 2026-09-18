@@ -1105,7 +1105,9 @@ public sealed class AppShellFactory(
             {
                 if (!licenseSummaryHandlers.Remove(handler, out var wrapper)) return;
                 licenseAuthorizationState.SummaryChanged -= wrapper;
-            });
+            },
+            readMachineCode: () => new MachineFingerprintProvider().GetMachineHash(),
+            copyToClipboard: text => _ = textClipboard.SetTextAsync(text));
         var settingsWorkspace = new SettingsView(settingsViewModel);
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),

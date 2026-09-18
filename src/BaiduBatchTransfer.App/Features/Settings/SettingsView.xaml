@@ -30,6 +30,7 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <TextBlock Grid.Row="0" Grid.Column="0" Text="套餐" Foreground="{StaticResource MutedBrush}" />
                 <TextBlock Grid.Row="0" Grid.Column="1" Margin="20,0,0,0" Text="{Binding LicensePackageName}" />
@@ -39,6 +40,16 @@
                 <TextBlock Grid.Row="2" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseAuthorizationStatus}" />
                 <TextBlock Grid.Row="3" Grid.Column="0" Margin="0,8,0,0" Text="机器绑定状态" Foreground="{StaticResource MutedBrush}" />
                 <TextBlock Grid.Row="3" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseMachineBindingStatus}" />
+                <!-- 机器码：用户联系管理员解绑时靠它定位设备。完整哈希过长，
+                     界面只显示首尾各 8 位，复制按钮给出完整值。 -->
+                <TextBlock Grid.Row="4" Grid.Column="0" Margin="0,8,0,0" Text="机器码" Foreground="{StaticResource MutedBrush}" />
+                <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" Margin="20,8,0,0">
+                    <TextBlock Text="{Binding MachineCodeDisplay}" VerticalAlignment="Center"
+                               FontFamily="Consolas, Microsoft YaHei UI" />
+                    <Button Content="复制" Margin="10,0,0,0" Padding="10,2" Height="26"
+                            Command="{Binding CopyMachineCodeCommand}"
+                            AutomationProperties.Name="复制机器码" />
+                </StackPanel>
                 <!-- 未授权时才出现。激活窗此前只在启动时弹一次，
                      用户点“暂不激活”后没有任何入口可以再次激活。 -->
                 <Button Grid.Row="4" Grid.Column="1"

@@ -1,4 +1,4 @@
-using BaiduBatchTransfer.Application.Scheduling;
+﻿using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.App.Features.Licensing;
@@ -105,7 +105,10 @@ public sealed class AppStartupController
         }
         catch (SingleInstanceUnavailableException)
         {
-            runtimeState.StatusMessage = "软件已经在运行，请切换到已打开的窗口。";
+            // 占锁的进程未必有可见窗口（崩溃残留、后台测试宿主等），
+            // 只说“请切换到已打开的窗口”会让用户找不到任何窗口而卡死。
+            runtimeState.StatusMessage =
+                "软件已经在运行。如果找不到窗口，请在任务管理器结束「知道综合工具」进程后重试。";
             return new(false, runtimeState.StatusMessage, LocalUiMayOpen: false, LicenseAuthorized: false);
         }
 

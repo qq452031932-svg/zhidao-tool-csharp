@@ -1,4 +1,4 @@
-using BaiduBatchTransfer.App;
+﻿using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Features.Licensing;
 using SuperPan.Licensing.Client;
 
@@ -145,7 +145,7 @@ public sealed class AppStartupControllerTests
 
         Assert.Empty(order);
         Assert.False(result.CoordinatorMayStart);
-        Assert.Equal("软件已经在运行，请切换到已打开的窗口。", result.StatusMessage);
+        Assert.Equal("软件已经在运行。如果找不到窗口，请在任务管理器结束「知道综合工具」进程后重试。", result.StatusMessage);
     }
 
     private sealed class FakeRecovery(

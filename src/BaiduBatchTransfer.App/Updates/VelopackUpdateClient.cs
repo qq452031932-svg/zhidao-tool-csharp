@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Security.Cryptography;
 using Velopack;
 using Velopack.Exceptions;
@@ -281,6 +281,10 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
         public async Task<VelopackClientAsset?> CheckForUpdatesAsync()
         {
             var update = await manager.CheckForUpdatesAsync().ConfigureAwait(false);
+            // Velopack 在 feed 最高版本低于本机版本时仍会返回一个“更新”（降级）。
+            // 不过滤掉的话，界面会把它当成可用更新去下载，下载后被签名门禁拒绝，
+            // 最终显示“更新文件校验失败”——而真实情况只是服务器上的版本更旧。
+            if (update is not null && update.IsDowngrade) return null;
             return update is null
                 ? null
                 : new VelopackClientAsset(

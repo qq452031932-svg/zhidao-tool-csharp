@@ -25,6 +25,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private readonly Func<LicenseSettingsSnapshot>? readLicenseSettings;
     private readonly Action<Action>? unsubscribeLicenseChanged;
     private Action? licenseChangedHandler;
+    private readonly Action<string>? copyToClipboard;
+    private string machineCode = string.Empty;
     private string licensePackageName = "未激活";
     private string licenseExpiresAt = "—";
     private string licenseAuthorizationStatus = "未授权";
@@ -67,7 +69,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         Func<CancellationToken, Task<bool>>? presentActivationAsync = null,
         Func<LicenseSettingsSnapshot>? readLicenseSettings = null,
         Action<Action>? subscribeLicenseChanged = null,
-        Action<Action>? unsubscribeLicenseChanged = null)
+        Action<Action>? unsubscribeLicenseChanged = null,
+        Func<string>? readMachineCode = null,
+        Action<string>? copyToClipboard = null)
     {
         this.updateService = updateService ?? throw new ArgumentNullException(nameof(updateService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
@@ -82,6 +86,13 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         ActivateLicenseCommand = new AsyncRelayCommand(ActivateLicenseAsync, () => CanActivateLicense);
         ApplyLicense(licenseSettings ?? readLicenseSettings?.Invoke() ?? LicenseSettingsSnapshot.NotActivated);
         this.unsubscribeLicenseChanged = unsubscribeLicenseChanged;
+        this.copyToClipboard = copyToClipboard;
+        // 机器码用于用户联系管理员解绑时定位设备；读取失败不应阻断设置页。
+        try { machineCode = readMachineCode?.Invoke() ?? string.Empty; }
+        catch { machineCode = string.Empty; }
+        CopyMachineCodeCommand = new RelayCommand(
+            () => copyToClipboard?.Invoke(machineCode),
+            () => copyToClipboard is not null && machineCode.Length > 0);
         if (subscribeLicenseChanged is not null && readLicenseSettings is not null)
         {
             // 授权可能在设置页之外完成（启动时的激活窗），必须跟随运行时状态刷新。
@@ -139,6 +150,15 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     }
 
     public IAsyncRelayCommand ActivateLicenseCommand { get; }
+
+    public IRelayCommand CopyMachineCodeCommand { get; }
+
+    public bool HasMachineCode => machineCode.Length > 0;
+
+    // 完整哈希在界面上放不下，显示首尾各 8 位；复制时给完整值。
+    public string MachineCodeDisplay => machineCode.Length == 0
+        ? "不可用"
+        : machineCode.Length <= 20 ? machineCode : $"{machineCode[..8]}……{machineCode[^8..]}";
 
     public string CurrentVersion
     {
