@@ -20,6 +20,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 {
     private readonly IResultSaveDialog resultDirectoryDialog;
     private readonly IDialogService? dialogService;
+    private readonly Func<CancellationToken, Task<bool>>? presentActivationAsync;
     private readonly ITransferResultDestinationSink destinationSink;
     private readonly ILocalResultDirectoryPreparer resultDirectoryPreparer;
     private readonly ITransferTargetDirectoryPicker? targetDirectoryPicker;
@@ -75,7 +76,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         LocalTerminalHistoryService? historyCleanupService = null,
         ILocalHistoryCleanupInteraction? historyCleanupInteraction = null,
         LocalImportDraftCleanupService? importDraftCleanupService = null,
-        ICurrentImportCleanupInteraction? currentImportCleanupInteraction = null)
+        ICurrentImportCleanupInteraction? currentImportCleanupInteraction = null,
+        Func<CancellationToken, Task<bool>>? presentActivationAsync = null)
     {
         Import = import ?? throw new ArgumentNullException(nameof(import));
         Wizard = wizard ?? throw new ArgumentNullException(nameof(wizard));
@@ -91,6 +93,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         this.remoteWriteMode = remoteWriteMode;
         this.acceptanceRunAsync = acceptanceRunAsync;
         this.licenseGate = licenseGate;
+        this.presentActivationAsync = presentActivationAsync;
         this.importDraftCleanupService = importDraftCleanupService;
         this.currentImportCleanupInteraction = currentImportCleanupInteraction ?? RefusingCurrentImportCleanupInteraction.Instance;
         Import.AttachActivityGate(currentImportActivityGate);
@@ -165,7 +168,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             LocalTerminalHistoryService? historyCleanupService = null,
             ILocalHistoryCleanupInteraction? historyCleanupInteraction = null,
             LocalImportDraftCleanupService? importDraftCleanupService = null,
-            ICurrentImportCleanupInteraction? currentImportCleanupInteraction = null)
+            ICurrentImportCleanupInteraction? currentImportCleanupInteraction = null,
+            Func<CancellationToken, Task<bool>>? presentActivationAsync = null)
         : this(
             import,
             wizard,
@@ -188,7 +192,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             historyCleanupService,
             historyCleanupInteraction,
             importDraftCleanupService,
-            currentImportCleanupInteraction)
+            currentImportCleanupInteraction,
+            presentActivationAsync)
     {
     }
 
@@ -315,12 +320,17 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public bool IsClosed => isClosed;
     public bool CanEditConfiguration => !isClosed && !IsStarting && !historyCleanup.IsBusy && !currentImportCleanupBusy;
     public Guid? CreatedBatchJobId => createdBatchJobId;
+    // 与 TransferWorkspaceView.xaml 的 TabItem 顺序一致。
+    public const int PendingLinksTabIndex = 0;
+    public const int ResultsTabIndex = 1;
+    public const int RunLogTabIndex = 2;
+
     public int SelectedDataTabIndex
     {
         get => selectedDataTabIndex;
         set
         {
-            if (value is < 0 or > 2) return;
+            if (value is < PendingLinksTabIndex or > RunLogTabIndex) return;
             SetProperty(ref selectedDataTabIndex, value);
         }
     }
@@ -343,6 +353,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public LocalHistoryCleanupPreview? TransferHistoryPreview => historyCleanup.Preview;
     public bool CanClearTransferHistory => historyCleanup.CanClear;
     public IAsyncRelayCommand ClearTransferHistoryCommand => historyCleanup.ClearCommand;
+    public string ClearTransferHistoryHint => historyCleanup.ClearBlockedReason;
     public Task ClearTransferHistoryAsync(CancellationToken cancellationToken = default) => historyCleanup.ClearAsync(cancellationToken);
     public Task RefreshHistoryPreviewAsync(CancellationToken cancellationToken = default) => historyCleanup.RefreshPreviewAsync(cancellationToken);
     public bool CanClearCurrentImport =>
@@ -490,6 +501,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private void OnHistoryCleanupPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         OnPropertyChanged(nameof(CanClearTransferHistory));
+        OnPropertyChanged(nameof(ClearTransferHistoryHint));
         if (e.PropertyName == nameof(LocalHistoryCleanupViewModel.Preview))
             OnPropertyChanged(nameof(TransferHistoryPreview));
         if (e.PropertyName != nameof(LocalHistoryCleanupViewModel.IsBusy)) return;
@@ -697,6 +709,10 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         if (activity is null) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         IsStarting = true;
+        // 点了"开始转存"就切到运行日志：进展和失败原因都写在那里，而用户此时多半
+        // 停在"待处理链接"上，看不到任何变化，会以为任务正在跑。未激活、目录无法
+        // 创建这类早退尤其如此——它们只写一行日志就返回了。
+        SelectedDataTabIndex = RunLogTabIndex;
         StatusMessage = "正在准备转存任务……";
         try
         {
@@ -843,8 +859,45 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             .AuthorizeAsync(LicenseOperationKind.Transfer, cancellationToken)
             .ConfigureAwait(true);
         if (result.IsAuthorized) return true;
-        StatusMessage = "软件尚未激活，联网功能暂不可用。";
+        // 授权失败是硬性拦截，日志里一行字很容易被当成普通警告划过去，所以同时
+        // 把运行日志顶到前台（StartAsync 已经切过，这里保证从别处调用也一样）。
+        SelectedDataTabIndex = RunLogTabIndex;
+        StatusMessage = "软件尚未激活，操作未开始。请在「设置中心 → 软件授权」中激活后重试。";
+        await PromptForActivationAsync(cancellationToken).ConfigureAwait(true);
         return false;
+    }
+
+    // 未激活是用户必须处理的硬拦截，不是可以稍后再看的日志。弹窗把它挡在眼前，
+    // 并直接给出激活入口——否则用户得自己想到去设置中心找。
+    private async Task PromptForActivationAsync(CancellationToken cancellationToken)
+    {
+        if (dialogService is null || isClosed) return;
+        try
+        {
+            if (presentActivationAsync is null)
+            {
+                await dialogService.ShowMessageAsync(
+                    "软件尚未激活",
+                    "转存未开始。请在「设置中心 → 软件授权」中激活卡密后重试。",
+                    cancellationToken).ConfigureAwait(true);
+                return;
+            }
+
+            var activate = await dialogService.ConfirmAsync(
+                "软件尚未激活",
+                "转存未开始，需要先激活卡密。是否现在激活？",
+                cancellationToken).ConfigureAwait(true);
+            if (!activate || isClosed) return;
+            if (await presentActivationAsync(cancellationToken).ConfigureAwait(true) && !isClosed)
+                StatusMessage = "已激活，请重新点击开始转存。";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch
+        {
+            // 弹窗失败不该把拦截本身变成崩溃：状态栏与运行日志已经说明了原因。
+        }
     }
 
     public void Close()

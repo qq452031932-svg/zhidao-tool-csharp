@@ -280,7 +280,7 @@ public sealed class JobResultsViewModelTests
 
         Assert.Equal([LicenseOperationKind.Share], gate.Operations);
         Assert.Null(workflow.RetriedShareOperationId);
-        Assert.Equal("软件尚未激活，联网功能暂不可用。", vm.StatusMessage);
+        Assert.Equal("软件尚未激活，操作未开始。请在「设置中心 → 软件授权」中激活后重试。", vm.StatusMessage);
     }
 
     [Fact]

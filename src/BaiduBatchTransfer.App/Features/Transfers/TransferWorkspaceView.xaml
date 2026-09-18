@@ -241,11 +241,23 @@
                     </TabItem>
                     <TabItem Header="处理结果">
                         <DockPanel>
-                            <Button DockPanel.Dock="Top" Content="清空转存历史" Command="{Binding ClearTransferHistoryCommand}"
-                                    AutomationProperties.Name="清空转存历史" Style="{StaticResource DangerHistoryButton}"
-                                    HorizontalAlignment="Right" Margin="4,8,4,0"
-                                    ToolTip="仅删除本地记录，不影响百度网盘文件和分享链接。任务处理或保存期间不可清空。"
-                                    ToolTipService.ShowOnDisabled="True" />
+                            <!-- 重试入口此前只有命令没有按钮：功能、安全判定和测试都齐全，
+                                 却没有任何地方能点到，失败项因此既重试不了、又会挡住清空历史。 -->
+                            <StackPanel DockPanel.Dock="Top" Orientation="Horizontal"
+                                        HorizontalAlignment="Right" Margin="4,8,4,0">
+                                <Button x:Name="RetryFailedTransferButton"
+                                        Content="重试所选失败项"
+                                        Command="{Binding RunPanel.RetryFailedTransferCommand}"
+                                        AutomationProperties.Name="重试所选失败项"
+                                        Margin="0,0,10,0" Padding="12,4"
+                                        ToolTip="把选中的失败转存重新排队。仅对可安全重试的记录可用：已提交过或需要先确认远端结果的不会重试。"
+                                        ToolTipService.ShowOnDisabled="True" />
+                                <Button Content="清空转存历史" Command="{Binding ClearTransferHistoryCommand}"
+                                        AutomationProperties.Name="清空转存历史" Style="{StaticResource DangerHistoryButton}"
+                                        Margin="0"
+                                        ToolTip="{Binding ClearTransferHistoryHint}"
+                                        ToolTipService.ShowOnDisabled="True" />
+                            </StackPanel>
                             <ContentControl x:Name="ResultsHost" Margin="4,8,4,4"
                                         HorizontalContentAlignment="Stretch"
                                         VerticalContentAlignment="Stretch" />

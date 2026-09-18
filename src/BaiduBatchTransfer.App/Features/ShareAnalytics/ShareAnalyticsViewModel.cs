@@ -365,7 +365,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             if (!authorization.IsAuthorized)
             {
                 if (CanApply(selected, selection, navigation))
-                    StatusMessage = "软件尚未激活，联网功能暂不可用。";
+                    StatusMessage = "软件尚未激活，操作未开始。请在「设置中心 → 软件授权」中激活后重试。";
                 return;
             }
         }

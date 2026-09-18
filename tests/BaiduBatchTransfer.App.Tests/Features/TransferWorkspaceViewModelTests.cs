@@ -498,7 +498,67 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.Equal(0, fixture.BatchService.ConfirmCalls);
         Assert.DoesNotContain("precheck", fixture.Events);
         Assert.Null(fixture.ViewModel.CreatedBatchJobId);
-        Assert.Equal("软件尚未激活，联网功能暂不可用。", fixture.ViewModel.StatusMessage);
+        Assert.Equal("软件尚未激活，操作未开始。请在「设置中心 → 软件授权」中激活后重试。", fixture.ViewModel.StatusMessage);
+        // 未激活只写一行日志就返回。用户停在"待处理链接"上看不到任何变化，会以为
+        // 任务正在跑，然后一直等下去。必须把运行日志顶到前台。
+        Assert.Equal(TransferWorkspaceViewModel.RunLogTabIndex, fixture.ViewModel.SelectedDataTabIndex);
+    }
+
+    [Fact]
+    public async Task AnUnactivatedStartOffersTheActivationWindowInsteadOfOnlyALogLine()
+    {
+        // 日志里一行字太弱：用户看不到弹窗就会以为任务在跑，一直等下去。
+        // 拦住之后必须当场把激活入口递到他面前。
+        var presented = 0;
+        using var fixture = Fixture.Valid(
+            licenseGate: new RecordingLicenseGate(isAuthorized: false),
+            presentActivationAsync: _ =>
+            {
+                presented++;
+                return Task.FromResult(false);
+            });
+        fixture.Dialog.ConfirmationResult = true;
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Equal(1, presented);
+        Assert.Contains("激活", fixture.Dialog.LastConfirmationMessage, StringComparison.Ordinal);
+        Assert.Null(fixture.ViewModel.CreatedBatchJobId);
+    }
+
+    [Fact]
+    public async Task DecliningTheActivationPromptLeavesTheTransferStopped()
+    {
+        var presented = 0;
+        using var fixture = Fixture.Valid(
+            licenseGate: new RecordingLicenseGate(isAuthorized: false),
+            presentActivationAsync: _ =>
+            {
+                presented++;
+                return Task.FromResult(true);
+            });
+        fixture.Dialog.ConfirmationResult = false;
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Equal(0, presented);
+        Assert.Null(fixture.ViewModel.CreatedBatchJobId);
+        Assert.Equal(TransferWorkspaceViewModel.RunLogTabIndex, fixture.ViewModel.SelectedDataTabIndex);
+    }
+
+    [Fact]
+    public async Task ASuccessfulStartHandsTheRunLogOverToTheResults()
+    {
+        // 点"开始转存"先把运行日志顶到前台，任务真的建起来之后再交给处理结果。
+        // 失败的早退因此停在日志上（见 LicenseFailureStopsBeforeTransferJobCreation…），
+        // 成功的则停在结果上——两种情况用户都不会对着没有变化的"待处理链接"空等。
+        using var fixture = Fixture.Valid();
+        fixture.ViewModel.SelectedDataTabIndex = TransferWorkspaceViewModel.PendingLinksTabIndex;
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
+        Assert.Equal(TransferWorkspaceViewModel.ResultsTabIndex, fixture.ViewModel.SelectedDataTabIndex);
     }
 
     [Fact]
@@ -3397,7 +3457,8 @@ public sealed class TransferWorkspaceViewModelTests
             ILocalTerminalHistoryStore? historyCleanupStore,
             ILocalHistoryCleanupInteraction? cleanupInteraction,
             ILocalImportDraftCleanupStore? importCleanupStore,
-            ICurrentImportCleanupInteraction? importCleanupInteraction)
+            ICurrentImportCleanupInteraction? importCleanupInteraction,
+            Func<CancellationToken, Task<bool>>? presentActivationAsync = null)
         {
             Ready = ready;
             Events = [];
@@ -3440,7 +3501,8 @@ public sealed class TransferWorkspaceViewModelTests
                 resultDirectoryPreparer ?? new RecordingResultDirectoryPreparer(),
                 targetDirectoryPicker, Dialog, licenseGate,
                 historyCleanupStore is null ? null : new LocalTerminalHistoryService(historyCleanupStore), cleanupInteraction,
-                importCleanupStore is null ? null : new LocalImportDraftCleanupService(importCleanupStore), importCleanupInteraction);
+                importCleanupStore is null ? null : new LocalImportDraftCleanupService(importCleanupStore), importCleanupInteraction,
+                presentActivationAsync);
         }
 
         public int Ready { get; }
@@ -3479,11 +3541,13 @@ public sealed class TransferWorkspaceViewModelTests
             ILocalTerminalHistoryStore? historyCleanupStore = null,
             ILocalHistoryCleanupInteraction? cleanupInteraction = null,
             ILocalImportDraftCleanupStore? importCleanupStore = null,
-            ICurrentImportCleanupInteraction? importCleanupInteraction = null) =>
+            ICurrentImportCleanupInteraction? importCleanupInteraction = null,
+            Func<CancellationToken, Task<bool>>? presentActivationAsync = null) =>
             new(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff, adapterAvailability,
                 remoteWriteMode, managedAccount, acceptanceRunAsync, resultDirectoryPreparer, historySource,
                 refreshDelay, resultsWorkflow, resultsSaveDialog, targetDirectoryPicker, licenseGate,
-                historyCleanupStore, cleanupInteraction, importCleanupStore, importCleanupInteraction);
+                historyCleanupStore, cleanupInteraction, importCleanupStore, importCleanupInteraction,
+                presentActivationAsync);
 
         public static Fixture Valid(
             int accountCount = 1,
@@ -3503,7 +3567,8 @@ public sealed class TransferWorkspaceViewModelTests
             ITransferTargetDirectoryPicker? targetDirectoryPicker = null,
             ILicenseAuthorizationGate? licenseGate = null,
             ILocalImportDraftCleanupStore? importCleanupStore = null,
-            ICurrentImportCleanupInteraction? importCleanupInteraction = null)
+            ICurrentImportCleanupInteraction? importCleanupInteraction = null,
+            Func<CancellationToken, Task<bool>>? presentActivationAsync = null)
         {
             var fixture = Create(
                 accountCount,
@@ -3523,7 +3588,8 @@ public sealed class TransferWorkspaceViewModelTests
                 targetDirectoryPicker: targetDirectoryPicker,
                 licenseGate: licenseGate,
                 importCleanupStore: importCleanupStore,
-                importCleanupInteraction: importCleanupInteraction);
+                importCleanupInteraction: importCleanupInteraction,
+                presentActivationAsync: presentActivationAsync);
             fixture.ApplyReadyDraft();
             if (accountCount == 1)
             {

@@ -24,7 +24,7 @@ public sealed class ShareAnalyticsViewModelTests
 
         Assert.Equal([LicenseOperationKind.ShareAnalyticsRefresh], gate.Operations);
         Assert.Equal(0, service.SyncCalls);
-        Assert.Equal("软件尚未激活，联网功能暂不可用。", viewModel.StatusMessage);
+        Assert.Equal("软件尚未激活，操作未开始。请在「设置中心 → 软件授权」中激活后重试。", viewModel.StatusMessage);
     }
 
     [Fact]
