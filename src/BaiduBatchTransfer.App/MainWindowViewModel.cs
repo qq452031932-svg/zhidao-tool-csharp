@@ -1,6 +1,7 @@
 ﻿using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Licensing;
+using BaiduBatchTransfer.App.Updates;
 using BaiduBatchTransfer.Application.Accounts;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -36,7 +37,9 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private readonly object capacityRefreshGate = new();
     private readonly CancellationTokenSource capacityLifetime = new();
     private object currentContent;
-    private string currentWorkspaceTitle = "监控反馈";
+    // 打开软件先看到首页：软件信息、授权状态、更新日志都在那里，新用户不必先猜
+    // 自己落在了哪个模块。此前直接进"监控反馈"，等于跳过了所有说明。
+    private string currentWorkspaceTitle = "首页";
     private string statusMessage = "就绪";
     private string accountStatusMessage;
     private bool isAccountOperationBusy;
@@ -105,7 +108,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         accountStatusMessage = FormatAccountStatus(initialActiveAccountCount);
         if (shareAnalyticsPreferenceLoadFailed)
             statusMessage = "账号查看偏好未能恢复。";
-        currentContent = shareDataWorkspace;
+        currentContent = homeWorkspace;
         ShowHomeCommand = new RelayCommand(() => ShowWorkspace(this.homeWorkspace, "首页"));
         ShowShareDataCommand = new RelayCommand(() => ShowWorkspace(this.shareDataWorkspace, "监控反馈"));
         ShowBatchTransferCommand = new RelayCommand(() => ShowWorkspace(this.batchTransferWorkspace, "批量转存"));
@@ -125,9 +128,18 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     }
 
     public string ApplicationTitle => FormatApplicationTitle(isOtaAcceptanceBuild);
+
+    // 版本号此前只有进设置中心才看得到。用户报问题时说不清自己在用哪一版，
+    // 客服也无从判断是不是已修过的老问题，所以放到标题栏常驻。
+    public string ApplicationVersionDisplay => $"v{ApplicationBuildInfo.Current.ProductVersion}";
+
+    public string ApplicationTitleWithVersion =>
+        $"{ApplicationTitle}  {ApplicationVersionDisplay}";
     public string LicensePackageDisplay => licenseSummary?.PackageName ?? "未激活";
+    // 页头是"到期：{0}"，填"未激活"就成了"到期：未激活"，读不通。没有日期就留破折号，
+    // 授权状态由旁边那格负责表达。
     public string LicenseExpiryDisplay => licenseSummary is null
-        ? "未激活"
+        ? "—"
         : licenseSummary.ExpiresAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
     public object BatchTransferWorkspace => batchTransferWorkspace;
     public object CurrentContent { get => currentContent; private set => SetProperty(ref currentContent, value); }
@@ -312,6 +324,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
         isOtaAcceptanceBuild = enabled;
         OnPropertyChanged(nameof(ApplicationTitle));
+        OnPropertyChanged(nameof(ApplicationTitleWithVersion));
     }
 
     internal void ReportUpdateAvailable(string version)

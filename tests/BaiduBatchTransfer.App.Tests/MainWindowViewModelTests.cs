@@ -539,7 +539,7 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("账号身份已核验，账号列表已刷新。", vm.StatusMessage);
     }
     [Fact]
-    public void ShellDefaultsToLinkMonitorAndRoutesAllSevenWorkspaces()
+    public void ShellDefaultsToHomeAndRoutesAllSevenWorkspaces()
     {
         var login = new FakeLoginLauncher();
         var home = new object();
@@ -552,10 +552,16 @@ public sealed class MainWindowViewModelTests
         var vm = new MainWindowViewModel(
             home, linkMonitor, transfer, adInsertion, fileExclusion, statistics, settings, login);
 
-        Assert.Equal("监控反馈", vm.CurrentWorkspaceTitle);
-        Assert.Same(linkMonitor, vm.CurrentContent);
+        // 打开软件先看到首页：软件信息、授权状态与更新日志都在那里。此前直接落在
+        // "监控反馈"，新用户看到的是一个空列表，既不知道自己在哪也不知道该做什么。
+        Assert.Equal("首页", vm.CurrentWorkspaceTitle);
+        Assert.Same(home, vm.CurrentContent);
         Assert.Same(transfer, vm.BatchTransferWorkspace);
         Assert.Equal("知道综合工具", vm.ApplicationTitle);
+        // 版本号常驻标题栏：用户报问题时能直接说清自己在用哪一版。
+        Assert.StartsWith("v", vm.ApplicationVersionDisplay);
+        Assert.StartsWith("知道综合工具", vm.ApplicationTitleWithVersion);
+        Assert.Contains(vm.ApplicationVersionDisplay, vm.ApplicationTitleWithVersion);
         Assert.False(vm.OpenAccountLoginCommand.CanExecute(null));
         Assert.Contains("尚不可用", vm.AdapterStatusMessage);
         Assert.False(vm.OpenAccountManagementCommand.CanExecute(null));
@@ -621,7 +627,9 @@ public sealed class MainWindowViewModelTests
 
         state.PublishSummary(null);
         Assert.Equal("未激活", vm.LicensePackageDisplay);
-        Assert.Equal("未激活", vm.LicenseExpiryDisplay);
+        // 页头模板是"到期：{0}"，填"未激活"就成了"到期：未激活"，读不通。
+        // 没有日期就留破折号，授权状态由旁边那格负责表达。
+        Assert.Equal("—", vm.LicenseExpiryDisplay);
 
         vm.Close();
         state.PublishSummary(new AuthorizedLicenseSummary("关闭后套餐", refreshedExpiry));

@@ -34,7 +34,7 @@
                            Foreground="White"
                            FontSize="13"
                            FontWeight="SemiBold"
-                           Text="{Binding ApplicationTitle}" />
+                           Text="{Binding ApplicationTitleWithVersion}" />
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
                     <Button x:Name="MinimizeButton"
                             Width="46" Height="36" MinHeight="0" Margin="0" Padding="0"
@@ -74,7 +74,20 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <StackPanel VerticalAlignment="Center">
-                        <TextBlock Text="{Binding ApplicationTitle}" FontSize="20" FontWeight="SemiBold" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding ApplicationTitle}" FontSize="20" FontWeight="SemiBold"
+                                       VerticalAlignment="Center" />
+                            <!-- 版本号常驻：用户报问题时能直接说清自己在用哪一版。 -->
+                            <Border x:Name="ApplicationVersionBadge"
+                                    Margin="9,0,0,0" Padding="7,2"
+                                    VerticalAlignment="Center"
+                                    Background="{StaticResource NavSelectedBrush}"
+                                    CornerRadius="9">
+                                <TextBlock Text="{Binding ApplicationVersionDisplay}"
+                                           Foreground="{StaticResource BrandBrush}"
+                                           FontSize="11" FontWeight="SemiBold" />
+                            </Border>
+                        </StackPanel>
                         <TextBlock Text="百度网盘批量管理工作台" Foreground="{StaticResource MutedBrush}" FontSize="12" />
                     </StackPanel>
                     <Border x:Name="LicenseSummaryPanel"

@@ -1190,7 +1190,7 @@ public sealed class AppBootstrapTests : IDisposable
 
         Assert.Contains("var transferWorkspace = new TransferWorkspaceView(transferViewModel)", bootstrap);
         Assert.Contains("var shareWorkspace = new ShareWorkspaceView(shareViewModel)", bootstrap);
-        Assert.Contains("var homeWorkspace = new DeferredWorkspaceView(", bootstrap);
+        Assert.Contains("homeWorkspace = new HomeWorkspaceView(new HomeWorkspaceViewModel())", bootstrap);
         Assert.Contains("var shareAnalyticsViewModel = new ShareAnalyticsViewModel(", bootstrap);
         Assert.Contains("var shareDataWorkspace = new ShareAnalyticsView(shareAnalyticsViewModel)", bootstrap);
         Assert.Contains("var adInsertionWorkspace = new DeferredWorkspaceView(", bootstrap);
@@ -1198,6 +1198,10 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.Contains("var statisticsWorkspace = new DeferredWorkspaceView(", bootstrap);
         Assert.Contains("var settingsViewModel = new SettingsViewModel(", bootstrap);
         Assert.Contains("var settingsWorkspace = new SettingsView(settingsViewModel);", bootstrap);
+        // 关掉激活窗之后还能再激活，靠的是设置中心这个入口；它的接线没有任何
+        // 测试守着，所以能被悄无声息地改掉。这两条就是那道闸。
+        Assert.Contains("presentActivationAsync: licenseActivationPresenter is null", bootstrap);
+        Assert.Contains("token => licenseActivationPresenter.PresentAsync(token)", bootstrap);
         Assert.DoesNotContain("new DeferredWorkspaceViewModel(\"设置中心\"", bootstrap);
         Assert.Contains("new System.Windows.Threading.DispatcherSynchronizationContext(", bootstrap);
         Assert.DoesNotContain("new DeferredWorkspaceViewModel(\"分享数据\"", bootstrap);
