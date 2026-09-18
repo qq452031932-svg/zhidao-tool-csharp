@@ -49,9 +49,33 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
         preview is { TerminalBatchCount: > 0, HasConflicts: false };
     public IAsyncRelayCommand ClearCommand { get; }
 
+    // 按钮变灰时必须说出原因。此前提示语一律是"任务处理或保存期间不可清空"，
+    // 而真实原因往往不是这个——比如残留的自动化记录会把清理永久挡住，用户
+    // 看到的却是一个没有解释、也没有出路的灰按钮，只会以为软件坏了。
+    public string ClearBlockedReason
+    {
+        get
+        {
+            if (interaction is null || service is null) return "当前环境不支持清空本地历史。";
+            if (closed) return "工作区已关闭。";
+            if (busy) return "正在清理，请稍候。";
+            if (preview is null) return "正在检查可清理的历史……";
+            if (!ownerAvailable()) return "任务处理或保存期间不可清空，请等待当前操作结束。";
+            if (preview.HasConflicts)
+                return "有未收尾的任务记录，暂时不能清空。请等待进行中的操作结束；" +
+                       "若软件此前异常退出，重启后会自动收尾，仍无法清空请联系技术支持。";
+            if (preview.TerminalBatchCount == 0) return "没有可清空的已完成记录。";
+            return preview.RetryableFailureCount > 0
+                ? $"可清空 {preview.TerminalBatchCount} 个已结束批次；其中 {preview.RetryableFailureCount} 条失败项仍可重试，" +
+                  "清空后将无法再重试。仅删除本地记录，不影响百度网盘文件和分享链接。"
+                : "仅删除本地记录，不影响百度网盘文件和分享链接。";
+        }
+    }
+
     public void NotifyAvailabilityChanged()
     {
         OnPropertyChanged(nameof(CanClear));
+        OnPropertyChanged(nameof(ClearBlockedReason));
         ClearCommand.NotifyCanExecuteChanged();
     }
 
@@ -78,6 +102,7 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
         var generation = ++previewGeneration;
         preview = null;
         OnPropertyChanged(nameof(Preview));
+        OnPropertyChanged(nameof(ClearBlockedReason));
         NotifyAvailabilityChanged();
         _ = RunPreviewAsync(completion, generation, reportFailure);
         return JoinPreviewAsync(completion.Task, cancellationToken);
@@ -117,6 +142,7 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
             if (!closed && generation == previewGeneration)
             {
                 OnPropertyChanged(nameof(Preview));
+        OnPropertyChanged(nameof(ClearBlockedReason));
                 NotifyAvailabilityChanged();
             }
             completion.TrySetResult();
@@ -172,7 +198,11 @@ public sealed class LocalHistoryCleanupViewModel : ObservableObject, IDisposable
                 deletedCount = result.DeletedBatchCount;
                 await reload(operation.Token).ConfigureAwait(true);
                 if (closed || operation.IsCancellationRequested) return;
-                report($"已清空 {result.DeletedBatchCount} 个已结束的{(kind == LocalHistoryKind.Transfer ? "转存" : "分享")}批次历史。仅删除本地记录，不影响百度网盘文件和分享链接。");
+                // 按钮写着"清空历史"，清完却还剩记录，不说明就像是没清干净。
+                // 未结束的批次（进行中/已暂停/排队中）是有意保留的——删了就没法再恢复。
+                report($"已清空 {result.DeletedBatchCount} 个已结束的{(kind == LocalHistoryKind.Transfer ? "转存" : "分享")}批次历史。" +
+                    "未结束的批次（进行中、已暂停、排队中）予以保留，结束后可再清空。" +
+                    "仅删除本地记录，不影响百度网盘文件和分享链接。");
             }
         }
         catch (OperationCanceledException) when (operation.IsCancellationRequested) { }

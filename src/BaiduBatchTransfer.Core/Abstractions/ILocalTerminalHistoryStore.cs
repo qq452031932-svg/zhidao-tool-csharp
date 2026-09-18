@@ -23,12 +23,15 @@ public sealed record LocalHistoryCleanupPreview
         LocalHistoryKind Kind,
         int TerminalBatchCount,
         bool HasConflicts,
-        string? SnapshotToken)
+        string? SnapshotToken,
+        int RetryableFailureCount = 0)
     {
         if (!Enum.IsDefined(Kind) || Kind == LocalHistoryKind.Unspecified)
             throw new ArgumentOutOfRangeException(nameof(Kind));
         if (TerminalBatchCount < 0)
             throw new ArgumentOutOfRangeException(nameof(TerminalBatchCount));
+        if (RetryableFailureCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(RetryableFailureCount));
         if (SnapshotToken is not null &&
             (string.IsNullOrWhiteSpace(SnapshotToken) || SnapshotToken.Length > MaximumSnapshotTokenLength))
             throw new ArgumentException("A bounded opaque snapshot token is required.", nameof(SnapshotToken));
@@ -39,12 +42,20 @@ public sealed record LocalHistoryCleanupPreview
         this.TerminalBatchCount = TerminalBatchCount;
         this.HasConflicts = HasConflicts;
         this.SnapshotToken = SnapshotToken;
+        this.RetryableFailureCount = RetryableFailureCount;
     }
 
     public LocalHistoryKind Kind { get; }
     public int TerminalBatchCount { get; }
     public bool HasConflicts { get; }
     public string? SnapshotToken { get; }
+
+    // 仍可重试的失败项数量。它不再算作冲突把清理硬挡住——删除的只是本地记录，
+    // 不碰网盘文件；用户明确要清空，就该让他清。但必须在确认框里说清楚代价：
+    // 清空之后这些失败项无法再重试。
+    // 之前把它当硬冲突，结果是：软件崩溃一次留下几条"准备提交"状态的失败项，
+    // 用户既无法重试（状态推进不了）也无法清空，历史就永远卡在那里。
+    public int RetryableFailureCount { get; }
 }
 
 public sealed record LocalHistoryCleanupResult

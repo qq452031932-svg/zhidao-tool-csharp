@@ -91,7 +91,8 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
         yield return [LocalHistoryKind.Transfer, "UPDATE ShareOperations SET Status='WaitingTransfer',ExactItemSetFingerprint=NULL,LeaseGeneration=0 WHERE Id='target-share'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE ShareOperations SET Status='Failed',SubmissionAcceptance='DefinitelyNotAccepted',NextReconcileAt='2099-01-01' WHERE Id='target-share'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE ShareOperations SET Status='Failed',RequestDescriptorJson='{}' WHERE Id='target-share'"];
-        yield return [LocalHistoryKind.Transfer, RetryableTransferFailureSql];
+        // 可重试的失败转存不再算冲突——它现在通过 RetryableFailureCount 如实上报，
+        // 由确认框告知代价后放行（见 GenuinelyRetryableTransferFailureIsReportedButDoesNotBlockCleanup）。
         yield return [LocalHistoryKind.Transfer, "UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',SubmitState='NotPrepared',TargetSlotState='Released',AdapterRequestId='unresolved-request' WHERE Id='target-transfer'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE TransferOperations SET SubmitState='PendingConfirmation',ConfirmationDescriptorJson='{}' WHERE Id='target-transfer'"];
         yield return [LocalHistoryKind.Transfer, "UPDATE TransferOperations SET TargetSlotState='Reserved' WHERE Id='target-transfer'"];
@@ -109,10 +110,44 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
         {
             yield return [kind, "UPDATE LocalResultExports SET Status='InProgress',LeaseOwnerId='owner',LeaseExpiresAt='2000-01-01' WHERE OwnerId='target'"];
             yield return [kind, "UPDATE LocalResultExports SET Status='Failed',LeaseOwnerId='owner',LeaseExpiresAt='2099-01-01' WHERE OwnerId='target'"];
-            foreach (var state in new[] { "Preparing", "BaselinePersisted", "Submitting", "ResultPending", "NeedsDecision" })
+            foreach (var state in new[] { "BaselinePersisted", "Submitting", "ResultPending", "NeedsDecision" })
                 yield return [kind, $"UPDATE WebAutomationAttempts SET State='{state}' WHERE OperationId LIKE 'target-%'"];
+            // 'Preparing' 本身不再算冲突（见 AbandonedPreparingAttemptDoesNotBlockCleanup），
+            // 但带着基线的 'Preparing' 是自相矛盾的状态——基线只会在 BaselinePersisted
+            // 之后出现——仍然拦截，免得放过真正异常的数据。
+            // 带基线的 'Preparing' 由 schema 允许存储，但语义上自相矛盾——基线只会在
+            // BaselinePersisted 之后出现。仍然拦截，免得放过真正异常的数据。
+            yield return [kind, "UPDATE WebAutomationAttempts SET State='Preparing',BaselineItemCount=1 WHERE OperationId LIKE 'target-%'"];
+            yield return [kind, "UPDATE WebAutomationAttempts SET State='Preparing',IsWaitingForUser=1 WHERE OperationId LIKE 'target-%'"];
+            // 注：'Preparing' 不可能带 ResumeStage——schema 的 CHECK 约束规定
+            // ResumeStage 只在 State='UserHandoff' 时非空，所以那种组合根本存不进去。
             yield return [kind, "UPDATE WebAutomationAttempts SET State='UserHandoff',ResumeStage='Preparing',IsWaitingForUser=1 WHERE OperationId LIKE 'target-%'"];
         }
+    }
+
+    [Theory]
+    [InlineData(LocalHistoryKind.Transfer)]
+    [InlineData(LocalHistoryKind.StandaloneShare)]
+    public async Task AbandonedPreparingAttemptDoesNotBlockCleanup(LocalHistoryKind kind)
+    {
+        // 进程被杀或崩溃会留下停在 'Preparing' 的自动化记录。提交是预写式的：
+        // 适配器先把 BaselinePersisted->Submitting 落盘再真正调用提交，而进入
+        // Submitting 又必须先处于 BaselinePersisted。所以停在 Preparing 且没有基线的
+        // 尝试可证明从未向网盘提交过任何东西，没有证据需要保留。
+        // 以前它会把那一批历史永久挡住，用户既看不到原因也没有出路。
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, kind, "target", kind == LocalHistoryKind.Transfer ? "CompletedWithShortfall" : "CompletedWithFailures");
+        await AddEvidenceAsync(f, kind, "target");
+        await ExecuteAsync(f,
+            "UPDATE WebAutomationAttempts SET State='Preparing',BaselineItemCount=0,ResumeStage=NULL,IsWaitingForUser=0 WHERE OperationId LIKE 'target-%'");
+
+        var preview = await store.PreviewAsync(kind);
+
+        Assert.False(preview.HasConflicts);
+        Assert.Equal(1, preview.TerminalBatchCount);
+        var result = await store.DeleteAsync(preview);
+        Assert.Equal(LocalHistoryCleanupDisposition.Deleted, result.Disposition);
+        Assert.Equal(0, await CountAsync(f, $"SELECT count(*) FROM {BatchTable(kind)}"));
     }
 
     [Theory]
@@ -332,18 +367,43 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
     [Theory]
     [InlineData("NotPrepared")]
     [InlineData("PreparingToSubmit")]
-    public async Task GenuinelyRetryableTransferFailureBlocksCleanup(string submitState)
+    public async Task GenuinelyRetryableTransferFailureIsReportedButDoesNotBlockCleanup(string submitState)
     {
+        // 以前这会把清理硬挡住。后果是：软件崩溃一次就留下"准备提交"状态的失败项，
+        // 用户既推进不了状态（重试要靠这条记录本身），也清不掉历史，那批记录就
+        // 永远卡在那儿，界面上只剩一个没有解释的灰按钮。
+        // 删除的只是本地记录，不碰网盘文件，所以改为如实报数、由用户确认后放行。
         var (f, store) = await CreateAsync();
         await SeedAsync(f, LocalHistoryKind.Transfer, "target", "CompletedWithShortfall");
         await ExecuteAsync(f, RetryableTransferFailureSql);
         await ExecuteAsync(f, "UPDATE TransferOperations SET SubmitState=$submit WHERE Id='target-transfer';", ("$submit", submitState));
+
         var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
-        Assert.True(preview.HasConflicts);
+
+        Assert.False(preview.HasConflicts);
+        Assert.Equal(1, preview.RetryableFailureCount);
         var result = await store.DeleteAsync(preview);
+        Assert.Equal(LocalHistoryCleanupDisposition.Deleted, result.Disposition);
+        Assert.Equal(1, result.DeletedBatchCount);
+        Assert.Equal(0, await CountAsync(f, "SELECT count(*) FROM TransferOperations"));
+        await AssertNoForeignKeyIssuesAsync(f);
+    }
+
+    [Fact]
+    public async Task ARetryableFailureAppearingAfterConfirmationForcesAFreshConfirmation()
+    {
+        // 计数进了快照令牌：用户确认的是"0 条可重试失败项"，如果确认之后冒出一条，
+        // 必须重新确认——否则他删掉的和他看到的不是同一批东西。
+        var (f, store) = await CreateAsync();
+        await SeedAsync(f, LocalHistoryKind.Transfer, "target", "CompletedWithShortfall");
+        var confirmed = await store.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.Equal(0, confirmed.RetryableFailureCount);
+
+        await ExecuteAsync(f, RetryableTransferFailureSql);
+
+        var result = await store.DeleteAsync(confirmed);
         Assert.Equal(LocalHistoryCleanupDisposition.Conflict, result.Disposition);
-        Assert.Equal(0, result.DeletedBatchCount);
-        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM TransferOperations WHERE OutcomeKind='Failed'"));
+        Assert.Equal(1, (await store.PreviewAsync(LocalHistoryKind.Transfer)).RetryableFailureCount);
     }
 
     [Theory]
