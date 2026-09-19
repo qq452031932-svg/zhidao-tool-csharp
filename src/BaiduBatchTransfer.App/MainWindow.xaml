@@ -12,6 +12,9 @@
                             CornerRadius="0"
                             UseAeroCaptionButtons="False" />
     </shell:WindowChrome.WindowChrome>
+    <!-- WindowStyle=None 连系统边框也一并去掉了，浅色窗口落在浅色桌面上
+         看不出边界。自己补一层 1px 外框。 -->
+    <Border BorderBrush="{StaticResource WindowBorderBrush}" BorderThickness="1">
     <Grid Background="{StaticResource PageBrush}">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -23,7 +26,7 @@
                 Grid.Row="0"
                 Height="36"
                 Background="{StaticResource TitleBarBrush}"
-                BorderBrush="{StaticResource PanelBorderBrush}"
+                BorderBrush="{StaticResource WindowBorderBrush}"
                 BorderThickness="0,0,0,1"
                 MouseLeftButtonDown="OnTitleBarMouseLeftButtonDown">
             <Grid>
@@ -455,4 +458,5 @@
             </Grid>
         </Grid>
     </Grid>
+    </Border>
 </Window>
