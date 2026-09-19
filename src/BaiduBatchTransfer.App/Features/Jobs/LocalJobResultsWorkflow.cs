@@ -112,13 +112,15 @@ public sealed class LocalJobResultsWorkflow(
         IProgress<long> progress,
         CancellationToken cancellationToken = default)
     {
-        var receipt = await exportService.ExportToDirectoryAsync(
+        // 一个网盘账号一个文件，文件名是账号名+时间戳，每个文件固定五列。
+        // 之前是把所有账号写进同一个文件，列随账号数翻倍，文件名还跟着原始导入表格走。
+        var receipts = await exportService.ExportPerAccountToDirectoryAsync(
             new ReplacementWorkbookExportRequest(batchJobId),
             destinationDirectory,
             workbookPublisher,
             progress,
             cancellationToken).ConfigureAwait(false);
-        return receipt.ExportedRows;
+        return receipts.Sum(receipt => receipt.Receipt.ExportedRows);
     }
 
     private static JobResultActionOutcome Map(JobResultActionResult result) =>

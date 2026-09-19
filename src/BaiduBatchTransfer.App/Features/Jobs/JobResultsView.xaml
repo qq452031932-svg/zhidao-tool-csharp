@@ -8,7 +8,9 @@
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource PanelBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,8" Margin="0,0,0,8">
+        <!-- 四个计数字不值得包一张带边框的卡片：那层边框加内边距把一行字
+             撑成了近 50 像素，而这些垂直空间本该给下面的结果表格。 -->
+        <Border Padding="2,0" Margin="0,0,0,6">
             <StackPanel>
                 <WrapPanel>
                     <TextBlock Text="资源：" Foreground="{StaticResource MutedBrush}" />

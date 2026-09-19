@@ -6,6 +6,8 @@ public sealed record ReplacementWorkbookExportRequest(Guid BatchJobId, int PageS
 
 public sealed record SplitReplacementWorkbookReceipt(string AccountDisplayName, string ResultKind, ReplacementWorkbookFilePublishReceipt Receipt);
 
+public sealed record PerAccountResultWorkbookReceipt(string AccountDisplayName, ReplacementWorkbookFilePublishReceipt Receipt);
+
 public sealed record ReplacementWorkbookExportResult(long ExportedRows, string SuggestedFileName)
 {
     public override string ToString() =>

@@ -47,6 +47,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private Guid? simplifiedSelectedAccountId;
     private readonly HashSet<Guid> simplifiedSelectedAccountIds = [];
     private int selectedDataTabIndex;
+    private bool isConfigurationExpanded = true;
     private readonly HashSet<Guid> batchPendingRowIds = [];
     private int expectedOperationsPerResource;
     private bool createdBatchIsTerminal;
@@ -324,6 +325,16 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public const int PendingLinksTabIndex = 0;
     public const int ResultsTabIndex = 1;
     public const int RunLogTabIndex = 2;
+
+    /// <summary>
+    /// 导入与配置区是否展开。开始转存后自动收起：展开时它占掉大半屏，
+    /// 下方表格只剩三四行，而任务一旦跑起来配置就不能再改了，留着没意义。
+    /// </summary>
+    public bool IsConfigurationExpanded
+    {
+        get => isConfigurationExpanded;
+        set => SetProperty(ref isConfigurationExpanded, value);
+    }
 
     public int SelectedDataTabIndex
     {
@@ -713,6 +724,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         // 停在"待处理链接"上，看不到任何变化，会以为任务正在跑。未激活、目录无法
         // 创建这类早退尤其如此——它们只写一行日志就返回了。
         SelectedDataTabIndex = RunLogTabIndex;
+        IsConfigurationExpanded = false;
         StatusMessage = "正在准备转存任务……";
         try
         {

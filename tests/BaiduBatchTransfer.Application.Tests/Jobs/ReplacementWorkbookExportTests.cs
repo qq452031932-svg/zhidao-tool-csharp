@@ -1,3 +1,4 @@
+using System.Globalization;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
@@ -443,6 +444,89 @@ public sealed class ReplacementWorkbookExportTests
         Assert.EndsWith("_转存分享结果_20260823091011.xlsx", first, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task PerAccountExportWritesOneFivColumnFilePerNetdiskAccount()
+    {
+        // 一个账号一个文件，文件名是账号名+时间戳，不再跟着原始导入表格的名字走。
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var resource = Guid.NewGuid();
+        var definition = new BatchResultProjectionDefinition(
+            "源文件.xlsx",
+            [new(0, "原标题")],
+            [new(accountA, 1, "美美哒152564", true), new(accountB, 2, "小码哥928", true)]);
+        var page = new BatchResultProjectionPage(
+            [new(resource, 1, [new(0, "标题")], "云菲菲-琉璃泪.lrc", "原链接")],
+            [
+                new(resource, accountA, 1, "Succeeded", ShareOperationStatus.Succeeded,
+                    "https://pan.baidu.com/s/aaa", "a1b2", null,
+                    new DateTimeOffset(2026, 9, 19, 2, 3, 4, TimeSpan.Zero)),
+                new(resource, accountB, 2, "Failed", null, null, null, "quota_exceeded"),
+            ],
+            NextCandidateSequence: null);
+
+        var publisher = new SplitCapturingPublisher();
+        var receipts = await new ReplacementWorkbookExportService(
+                new StubProjectionRepository(definition, page),
+                new ReplacementWorkbookFileNameBuilder(),
+                new FixedTimeProvider(new DateTimeOffset(2026, 8, 23, 9, 10, 11, TimeSpan.Zero)))
+            .ExportPerAccountToDirectoryAsync(
+                new ReplacementWorkbookExportRequest(Guid.NewGuid()), "C:/out", publisher);
+
+        Assert.Equal(2, publisher.Files.Count);
+        Assert.Equal("美美哒152564_20260823091011.xlsx", publisher.Files[0].Name);
+        Assert.Equal("小码哥928_20260823091011.xlsx", publisher.Files[1].Name);
+        Assert.DoesNotContain(publisher.Files, file => file.Name.Contains("源文件", StringComparison.Ordinal));
+        // ImmutableArray 的 Equals 比的是底层数组引用，必须先 ToArray 才会按内容比。
+        Assert.All(publisher.Layouts, layout => Assert.Equal(
+            ["资源名称", "资源链接", "提取码", "创建时间", "状态"], layout.Headers.ToArray()));
+
+        var success = Assert.Single(publisher.Files[0].Rows);
+        Assert.Equal("云菲菲-琉璃泪.lrc", success.TextCells[0]);
+        Assert.Equal("https://pan.baidu.com/s/aaa", success.TextCells[1]);
+        Assert.Equal("a1b2", success.TextCells[2]);
+        Assert.Equal(
+            new DateTimeOffset(2026, 9, 19, 2, 3, 4, TimeSpan.Zero).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+            success.TextCells[3]);
+        Assert.Equal("成功", success.TextCells[4]);
+
+        // 失败行仍然要出现，否则用户无从知道哪些资源没成功。
+        var failed = Assert.Single(publisher.Files[1].Rows);
+        Assert.Equal("云菲菲-琉璃泪.lrc", failed.TextCells[0]);
+        Assert.Equal(["", "", ""], failed.TextCells.Skip(1).Take(3));
+        Assert.Equal("失败", failed.TextCells[4]);
+
+        Assert.Equal(2, receipts.Count);
+        Assert.Equal(["美美哒152564", "小码哥928"], receipts.Select(receipt => receipt.AccountDisplayName));
+    }
+
+    [Fact]
+    public async Task PerAccountExportRefusesToLetTwoAccountsShareOneFileName()
+    {
+        // 重名会让后一个账号静静覆盖前一个的结果。
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var resource = Guid.NewGuid();
+        var definition = new BatchResultProjectionDefinition(
+            "源文件.xlsx",
+            [new(0, "原标题")],
+            [new(accountA, 1, "同名", true), new(accountB, 2, "同名", true)]);
+        var page = new BatchResultProjectionPage(
+            [new(resource, 1, [new(0, "标题")], "标题", "原链接")],
+            [
+                new(resource, accountA, 1, "Failed", null, null, null, "x"),
+                new(resource, accountB, 2, "Failed", null, null, null, "x"),
+            ],
+            NextCandidateSequence: null);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new ReplacementWorkbookExportService(
+                new StubProjectionRepository(definition, page),
+                new ReplacementWorkbookFileNameBuilder(),
+                new FixedTimeProvider(new DateTimeOffset(2026, 8, 23, 9, 10, 11, TimeSpan.Zero)))
+            .ExportPerAccountToDirectoryAsync(
+                new ReplacementWorkbookExportRequest(Guid.NewGuid()), "C:/out", new SplitCapturingPublisher()));
+    }
+
     private static BatchResultProjectionDefinition OriginalDefinition(
         Guid? accountId = null,
         bool shareEnabled = true) =>
@@ -546,9 +630,11 @@ public sealed class ReplacementWorkbookExportTests
     private sealed class SplitCapturingPublisher : IReplacementWorkbookFilePublisher
     {
         public List<(string Name, List<ReplacementWorkbookRow> Rows)> Files { get; } = [];
+        public List<ReplacementWorkbookLayout> Layouts { get; } = [];
         public async Task<ReplacementWorkbookFilePublishReceipt> PublishAsync(string destinationDirectory, string finalFileName, ReplacementWorkbookLayout layout, IAsyncEnumerable<ReplacementWorkbookRow> rows, CancellationToken cancellationToken = default)
         {
             var list = new List<ReplacementWorkbookRow>(); await foreach (var row in rows.WithCancellation(cancellationToken)) list.Add(row);
+            Layouts.Add(layout);
             Files.Add((finalFileName, list)); return new(Path.Combine(destinationDirectory, finalFileName), list.Count, 1);
         }
     }

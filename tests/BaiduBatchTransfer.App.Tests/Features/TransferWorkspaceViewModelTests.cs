@@ -505,6 +505,43 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task StartingATransferCollapsesTheConfigurationPanel()
+    {
+        // 展开时配置区占掉大半屏，下方表格只剩三四行。任务一旦开始，
+        // 配置就不能再改了（CanEditConfiguration 会把整个面板禁用），留着只是挡着结果。
+        using var fixture = Fixture.Valid();
+        Assert.True(fixture.ViewModel.IsConfigurationExpanded);
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.False(fixture.ViewModel.IsConfigurationExpanded);
+    }
+
+    [Fact]
+    public async Task ABlockedStartStillCollapsesTheConfigurationPanel()
+    {
+        // 未激活这类早退也要收起：同一次点击已经把界面切到了运行日志，
+        // 配置区还撑在上面的话，用户恰恰看不到那行告诉他为什么没跑的日志。
+        using var fixture = Fixture.Valid(licenseGate: new RecordingLicenseGate(isAuthorized: false));
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.False(fixture.ViewModel.IsConfigurationExpanded);
+        Assert.Equal(TransferWorkspaceViewModel.RunLogTabIndex, fixture.ViewModel.SelectedDataTabIndex);
+    }
+
+    [Fact]
+    public void TheConfigurationPanelBindsItsExpandedStateToTheViewModel()
+    {
+        // 写死 IsExpanded="True" 的话，ViewModel 里的自动收起根本传不到界面上。
+        var path = Path.Combine(FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Transfers", "TransferWorkspaceView.xaml");
+        var document = XDocument.Load(path);
+        var expander = document.Descendants().Single(element => element.Name.LocalName == "Expander" &&
+            (string?)element.Attribute(XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml") + "Name") == "ConfigurationExpander");
+        Assert.Equal("{Binding IsConfigurationExpanded, Mode=TwoWay}", (string?)expander.Attribute("IsExpanded"));
+    }
+
+    [Fact]
     public async Task AnUnactivatedStartOffersTheActivationWindowInsteadOfOnlyALogLine()
     {
         // 日志里一行字太弱：用户看不到弹窗就会以为任务在跑，一直等下去。

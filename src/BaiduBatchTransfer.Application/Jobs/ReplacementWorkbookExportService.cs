@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
@@ -10,6 +11,8 @@ public sealed class ReplacementWorkbookExportService(
     TimeProvider? timeProvider = null)
 {
     private const int MaximumProjectedCellsPerPage = 10_000;
+    private static readonly ReplacementWorkbookLayout PerAccountLayout = new(
+        ["资源名称", "资源链接", "提取码", "创建时间", "状态"]);
     private readonly IBatchResultProjectionRepository repository =
         repository ?? throw new ArgumentNullException(nameof(repository));
     private readonly ReplacementWorkbookFileNameBuilder fileNameBuilder =
@@ -83,6 +86,98 @@ public sealed class ReplacementWorkbookExportService(
         var definition = await repository.GetDefinitionAsync(batchJobId, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException("The batch result projection is unavailable.");
         return fileNameBuilder.Build(definition.SourceFileName, timeProvider.GetUtcNow());
+    }
+
+    /// <summary>
+    /// 结果表的导出：每个网盘账号一个文件，每个文件固定五列。
+    ///
+    /// 原来的合并导出（ExportToDirectoryAsync）把原始表格的所有列原样带出来，再给
+    /// 每个账号接一组「转存结果_XX_新分享链接」之类的列：两个账号就是两组，
+    /// 表很宽，而且文件名跟着原始导入文件走，跟导出的内容没关系。
+    ///
+    /// 这里改成一个账号一个文件，因为固定五列里没有位置放第二个账号的结果；
+    /// 合并导出本身保留，验收与清单校验还在用它。
+    /// </summary>
+    public async Task<IReadOnlyList<PerAccountResultWorkbookReceipt>> ExportPerAccountToDirectoryAsync(
+        ReplacementWorkbookExportRequest request,
+        string destinationDirectory,
+        IReplacementWorkbookFilePublisher publisher,
+        IProgress<long>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationDirectory);
+        ArgumentNullException.ThrowIfNull(publisher);
+        if (request.BatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(request));
+        if (request.PageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(request.PageSize));
+
+        var definition = await repository.GetDefinitionAsync(request.BatchJobId, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The batch result projection is unavailable.");
+        var accounts = definition.Accounts.OrderBy(account => account.OutputOrdinal).ToArray();
+        if (accounts.Length == 0) throw new InvalidOperationException("The batch result projection has no accounts.");
+
+        var timestamp = timeProvider.GetUtcNow();
+        var receipts = new List<PerAccountResultWorkbookReceipt>(accounts.Length);
+        long exported = 0;
+        // 一个账号名只能占一个文件名。重名会让后一个账号静静覆盖前一个的结果，
+        // 而发布器的 DestinationExists 不一定拦得住（同一次导出内的竞争）。
+        var usedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var account in accounts)
+        {
+            var rows = new List<ReplacementWorkbookRow>();
+            await foreach (var row in StreamPerAccountRowsAsync(request, account, cancellationToken)
+                .WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                rows.Add(row);
+                exported = checked(exported + 1);
+                progress?.Report(exported);
+            }
+            if (rows.Count == 0) continue;
+            var fileName = fileNameBuilder.BuildForAccount(account.DisplayName, timestamp);
+            if (!usedFileNames.Add(fileName))
+                throw new InvalidOperationException("Two accounts produce the same result workbook file name.");
+            var receipt = await publisher.PublishAsync(
+                destinationDirectory, fileName, PerAccountLayout, ToAsync(rows), cancellationToken).ConfigureAwait(false);
+            receipts.Add(new(account.DisplayName, receipt));
+        }
+        return receipts;
+    }
+
+    private async IAsyncEnumerable<ReplacementWorkbookRow> StreamPerAccountRowsAsync(
+        ReplacementWorkbookExportRequest request,
+        BatchResultProjectionAccount account,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        long cursor = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var page = await repository.GetProjectionPageAsync(
+                request.BatchJobId, cursor, request.PageSize, cancellationToken).ConfigureAwait(false);
+            if (page.Resources.Count == 0) yield break;
+            var map = page.AccountResults
+                .Where(result => result.AccountId == account.AccountId)
+                .ToDictionary(result => result.ResourceItemId);
+            foreach (var resource in page.Resources)
+            {
+                if (!map.TryGetValue(resource.ResourceItemId, out var outcome)) continue;
+                var success = outcome.TransferStatus == "Succeeded" &&
+                    outcome.ShareStatus is ShareOperationStatus.Succeeded or ShareOperationStatus.ReusedExisting;
+                yield return new ReplacementWorkbookRow(resource.CandidateSequence,
+                [
+                    resource.ResolvedTitle,
+                    success ? outcome.ShareUrl ?? string.Empty : string.Empty,
+                    success ? outcome.ExtractionCode ?? string.Empty : string.Empty,
+                    // 分享创建时间按本机时区写：表是给人看的，UTC 会让人对不上号。
+                    success && outcome.SharedAt is { } sharedAt
+                        ? sharedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                        : string.Empty,
+                    success ? "成功" : "失败",
+                ]);
+            }
+            if (page.NextCandidateSequence is not { } next) yield break;
+            cursor = next;
+        }
     }
 
     public async Task<IReadOnlyList<SplitReplacementWorkbookReceipt>> ExportSplitToDirectoryAsync(

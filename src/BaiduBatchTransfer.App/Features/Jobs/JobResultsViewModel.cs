@@ -493,7 +493,8 @@ public sealed class JobResultsViewModel : ObservableObject
             if (generation != capturedGeneration || batchJobId != capturedBatch ||
                 !ReferenceEquals(saveCancellation, currentSave)) return;
             ExportedRows = written;
-            StatusMessage = $"结果表格已保存，共 {written:N0} 行。";
+            // 现在是一个网盘账号一个文件，不说清楚的话用户会只去找一个文件。
+            StatusMessage = $"结果表格已保存，共 {written:N0} 行；每个网盘账号一个文件。";
         }
         catch (OperationCanceledException) when (currentSave.IsCancellationRequested)
         {

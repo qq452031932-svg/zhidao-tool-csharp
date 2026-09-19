@@ -15,7 +15,9 @@ public sealed class SettingsViewStructureTests
             "SettingsView.xaml");
         var xaml = File.ReadAllText(xamlPath);
 
-        Assert.Contains("软件更新（OTA 在线更新）", xaml, StringComparison.Ordinal);
+        // 标题里不再写 OTA：那是内部词，副标题已经说清楚这块是干什么的。
+        Assert.Contains("Text=\"软件更新\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("OTA 在线更新", xaml, StringComparison.Ordinal);
         Assert.Contains("当前版本", xaml, StringComparison.Ordinal);
         Assert.Contains("更新状态", xaml, StringComparison.Ordinal);
         Assert.Contains("最新版本", xaml, StringComparison.Ordinal);

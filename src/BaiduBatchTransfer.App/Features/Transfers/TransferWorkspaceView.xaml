@@ -47,19 +47,24 @@
         </Grid.RowDefinitions>
 
         <Border x:Name="TransferToolbar" Grid.Row="0"
-                Style="{StaticResource BorderedPanelStyle}" Padding="10,12" Margin="0,0,0,10"
+                Style="{StaticResource BorderedPanelStyle}" Padding="10,8" Margin="0,0,0,8"
                 IsEnabled="{Binding CanEditConfiguration}">
-            <!-- 配置区可折叠：配好之后收起，把垂直空间让给下方的结果表格。
-                 展开状态下表格只能显示三四行，这正是界面显得拥挤的主因。 -->
-            <Expander x:Name="ConfigurationExpander" IsExpanded="True" Style="{StaticResource FlatExpanderStyle}">
+            <!-- 配置区可折叠，并且开始转存后自动收起（见 IsConfigurationExpanded）。
+                 展开时它占掉大半屏，下方表格只剩三四行；而任务跑起来之后
+                 配置已经不能再改（整个 Border 被 CanEditConfiguration 禁用），留着只是挡着结果。 -->
+            <Expander x:Name="ConfigurationExpander" Style="{StaticResource FlatExpanderStyle}"
+                      IsExpanded="{Binding IsConfigurationExpanded, Mode=TwoWay}">
                 <Expander.Header>
-                    <StackPanel Margin="0,0,0,2">
-                        <TextBlock Text="导入与配置" FontSize="15" FontWeight="SemiBold" />
+                    <!-- 标题与说明排成一行：两行版头白吃掉0 多像素的垂直空间。 -->
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="导入与配置" FontSize="14" FontWeight="SemiBold"
+                                   VerticalAlignment="Center" />
                         <TextBlock Text="选择来源、目标目录与并发，然后开始转存"
-                                   Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0" />
+                                   Margin="10,0,0,0" VerticalAlignment="Center"
+                                   Foreground="{StaticResource MutedBrush}" FontSize="12" />
                     </StackPanel>
                 </Expander.Header>
-            <Grid Margin="0,12,0,0">
+            <Grid Margin="0,8,0,0">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />

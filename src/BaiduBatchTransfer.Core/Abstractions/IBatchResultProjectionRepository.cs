@@ -52,10 +52,11 @@ public sealed record BatchResultAccountProjection(
     ShareOperationStatus? ShareStatus,
     string? ShareUrl,
     string? ExtractionCode,
-    string? StableErrorCode)
+    string? StableErrorCode,
+    DateTimeOffset? SharedAt = null)
 {
     public override string ToString() =>
-        $"BatchResultAccountProjection {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, TransferStatus = {TransferStatus}, ShareStatus = {ShareStatus}, UserContent = [REDACTED] }}";
+        $"BatchResultAccountProjection {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, TransferStatus = {TransferStatus}, ShareStatus = {ShareStatus}, SharedAt = {SharedAt:O}, UserContent = [REDACTED] }}";
 }
 
 public sealed record BatchResultProjectionPage(

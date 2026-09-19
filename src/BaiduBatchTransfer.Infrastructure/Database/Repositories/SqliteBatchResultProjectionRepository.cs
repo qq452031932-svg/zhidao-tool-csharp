@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
@@ -153,7 +154,8 @@ public sealed class SqliteBatchResultProjectionRepository(SqliteConnectionFactor
                     WHERE duplicate_result.AccountId=s.AccountId
                       AND duplicate_result.ExactItemSetFingerprint=s.ExactItemSetFingerprint
                       AND duplicate_result.SettingsFingerprint=s.SettingsFingerprint
-                      AND duplicate_result.IsAccepted=1 AND duplicate_result.IsCurrent=1) AS CurrentResultCount
+                      AND duplicate_result.IsAccepted=1 AND duplicate_result.IsCurrent=1) AS CurrentResultCount,
+                   current_result.SharedAt
             FROM ranked_transfers t
             JOIN BatchOutputAccounts a
               ON a.BatchJobId=$batch AND a.AccountId=t.AssignedAccountId
@@ -196,7 +198,10 @@ public sealed class SqliteBatchResultProjectionRepository(SqliteConnectionFactor
                 shareStatus,
                 reader.IsDBNull(5) ? null : reader.GetString(5),
                 reader.IsDBNull(6) ? null : reader.GetString(6),
-                reader.IsDBNull(7) ? null : reader.GetString(7)));
+                reader.IsDBNull(7) ? null : reader.GetString(7),
+                reader.IsDBNull(10)
+                    ? null
+                    : DateTimeOffset.Parse(reader.GetString(10), CultureInfo.InvariantCulture).ToUniversalTime()));
         }
         return results;
     }
