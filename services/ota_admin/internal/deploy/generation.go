@@ -23,6 +23,10 @@ type openedDirectoryValidator interface {
 	ValidateOpenedDirectory(context.Context, *upload.Envelope, *os.File, string) (release.Report, error)
 }
 
+type openedPublishedGenerationValidator interface {
+	ValidateOpenedPublishedGeneration(context.Context, *upload.Envelope, *os.File) (release.Report, error)
+}
+
 type Generation struct {
 	Name, Path string
 	Report     release.Report
@@ -119,7 +123,7 @@ func (disk *Disk) ValidateGeneration(ctx context.Context, name string, validator
 	if err != nil {
 		return Generation{}, err
 	}
-	report, err := validateOpenedGeneration(ctx, validator, envelope, rootDescriptor)
+	report, err := validateOpenedPublishedGeneration(ctx, validator, envelope, rootDescriptor)
 	if identityErr := disk.verifyOpenedGeneration(name, rootDescriptor); identityErr != nil {
 		err = errors.Join(err, identityErr)
 	}
@@ -146,6 +150,16 @@ func validateOpenedGeneration(ctx context.Context, validator Validator, envelope
 		return release.Report{}, errors.New("Linux generation validator must accept an opened directory")
 	}
 	return descriptorValidator.ValidateOpenedDirectory(ctx, envelope, rootDescriptor, "")
+}
+
+func validateOpenedPublishedGeneration(ctx context.Context, validator Validator, envelope *upload.Envelope, rootDescriptor *os.File) (release.Report, error) {
+	if rootDescriptor == nil {
+		return release.Report{}, errors.New("published generation requires an opened directory")
+	}
+	if publishedValidator, ok := validator.(openedPublishedGenerationValidator); ok {
+		return publishedValidator.ValidateOpenedPublishedGeneration(ctx, envelope, rootDescriptor)
+	}
+	return validateOpenedGeneration(ctx, validator, envelope, rootDescriptor)
 }
 
 func generationEnvelope(root string) (*upload.Envelope, error) {

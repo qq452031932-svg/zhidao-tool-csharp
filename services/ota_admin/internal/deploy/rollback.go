@@ -22,7 +22,7 @@ func (disk *Disk) RollbackGenerationAuthorized(ctx context.Context, operationID,
 	if err != nil {
 		return Generation{}, false, err
 	}
-	report, validateErr := validateOpenedGeneration(ctx, validator, envelope, rootDescriptor)
+	report, validateErr := validateOpenedPublishedGeneration(ctx, validator, envelope, rootDescriptor)
 	if identityErr := disk.verifyOpenedGeneration(name, rootDescriptor); identityErr != nil {
 		validateErr = errors.Join(validateErr, identityErr)
 	}

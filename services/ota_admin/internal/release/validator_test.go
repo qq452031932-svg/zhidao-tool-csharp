@@ -185,7 +185,10 @@ func makeNupkg(t *testing.T, version, kind, packageChannel, layout, baseLayout s
 			entries["setup.ico"] = canonicalProductIcon(t)
 		}
 	} else {
-		if baseLayout == fixtureLayoutLegacy {
+		if layout == fixtureLayoutLegacy {
+			entries["lib/app/"+productLegacyExecutableName+".diff"] = []byte("historical patch bytes")
+			entries["lib/app/"+productLegacyExecutableName+".shasum"] = []byte(strings.Repeat("0", 64))
+		} else if baseLayout == fixtureLayoutLegacy {
 			entries["lib/app/"+productLegacyExecutableName+".diff"] = []byte("real patch bytes")
 			entries["lib/app/"+productLegacyExecutableName+".shasum"] = []byte(strings.Repeat("0", 64))
 			entries["lib/app/"+productMainAssemblyName+"_ExecutionStub.exe"] = makeSetupImage()
@@ -203,17 +206,91 @@ func makeNupkg(t *testing.T, version, kind, packageChannel, layout, baseLayout s
 
 func makePortable(t *testing.T, version, packageChannel string) []byte {
 	t.Helper()
-	return zipBytes(t, map[string][]byte{
-		".portable":                     {},
-		"current/sq.version":            []byte(packageMetadata(version, packageChannel, productMainExecutableName)),
-		"current/" + productMainDLLName: []byte("managed assembly"),
-		"current/" + productMainAssemblyName + ".deps.json":          []byte(`{}`),
-		"current/" + productMainAssemblyName + ".runtimeconfig.json": []byte(`{}`),
-		productMainExecutableName:                                    makeSetupImage(),
-		"Update.exe":                                                 makeSetupImage(),
-		"current/" + productMainExecutableName:                       makeSetupImage(),
-		"current/" + productLegacyExecutableName:                     makeSetupImage(),
+	return makePortableForLayout(t, version, packageChannel, fixtureLayoutRenamed)
+}
+
+func makePortableForLayout(t *testing.T, version, packageChannel, layout string) []byte {
+	t.Helper()
+	mainExecutable := productMainExecutableName
+	rootExecutable := mainExecutable
+	assemblyName := productMainAssemblyName
+	dllName := productMainDLLName
+	if layout == fixtureLayoutLegacy {
+		mainExecutable = productLegacyExecutableName
+		rootExecutable = packageID + ".exe"
+		assemblyName = productLegacyAssemblyName
+		dllName = assemblyName + ".dll"
+	}
+	entries := map[string][]byte{
+		".portable":                                       {},
+		"current/sq.version":                              []byte(packageMetadata(version, packageChannel, mainExecutable)),
+		"current/" + dllName:                              []byte("managed assembly"),
+		"current/" + assemblyName + ".deps.json":          []byte(`{}`),
+		"current/" + assemblyName + ".runtimeconfig.json": []byte(`{}`),
+		rootExecutable:                                    makeSetupImage(),
+		"Update.exe":                                      makeSetupImage(),
+		"current/" + mainExecutable:                       makeSetupImage(),
+	}
+	if layout == fixtureLayoutRenamed {
+		entries["current/"+productLegacyExecutableName] = makeSetupImage()
+	}
+	return zipBytes(t, entries)
+}
+
+func TestPublishedGenerationAcceptsOnlyHistoricalLegacyCurrentLayout(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		version       string
+		layout        string
+		wantPublished bool
+	}{
+		{"published 1.1.0", "1.1.0", fixtureLayoutLegacy, true},
+		{"renamed 1.1.7", "1.1.7", fixtureLayoutRenamed, true},
+		{"new legacy upload", "1.1.7", fixtureLayoutLegacy, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newBundleFixtureWithAssets(t, []fixtureAsset{{version: test.version, kind: "Full", layout: test.layout}})
+			fixture.files[portableName] = makePortableForLayout(t, test.version, channel, test.layout)
+			fixture.reseal()
+			root, err := os.Open(fixture.root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			_, publishedErr := fixture.validator.ValidateOpenedPublishedGeneration(context.Background(), fixture.envelope, root)
+			if (publishedErr == nil) != test.wantPublished {
+				t.Fatalf("published generation validation error = %v, want success = %v", publishedErr, test.wantPublished)
+			}
+			_, uploadErr := fixture.validator.Validate(context.Background(), fixture.envelope, "")
+			if test.layout == fixtureLayoutLegacy && !errorsIs(uploadErr, ErrMetadata) {
+				t.Fatalf("legacy upload error = %v, want ErrMetadata", uploadErr)
+			}
+			if test.layout == fixtureLayoutRenamed && uploadErr != nil {
+				t.Fatalf("renamed upload error = %v", uploadErr)
+			}
+		})
+	}
+}
+
+func TestPublishedGenerationAcceptsHistoricalLegacyDeltaButUploadRejectsIt(t *testing.T) {
+	fixture := newBundleFixtureWithAssets(t, []fixtureAsset{
+		{version: "1.0.6", kind: "Full", layout: fixtureLayoutLegacy},
+		{version: "1.1.0", kind: "Full", layout: fixtureLayoutLegacy},
+		{version: "1.1.0", kind: "Delta", layout: fixtureLayoutLegacy, baseLayout: fixtureLayoutLegacy},
 	})
+	fixture.files[portableName] = makePortableForLayout(t, "1.1.0", channel, fixtureLayoutLegacy)
+	fixture.reseal()
+	root, err := os.Open(fixture.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if _, err := fixture.validator.ValidateOpenedPublishedGeneration(context.Background(), fixture.envelope, root); err != nil {
+		t.Fatalf("published legacy Delta rejected: %v", err)
+	}
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+		t.Fatalf("historical upload error = %v, want ErrMetadata", err)
+	}
 }
 
 func packageMetadata(version, packageChannel, mainExecutable string) string {

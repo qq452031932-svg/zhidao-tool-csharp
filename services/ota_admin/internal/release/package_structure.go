@@ -166,15 +166,22 @@ func validatePackageEnvelope(inner *innerArchive, expectedVersion, mainExecutabl
 	return validateNuspec(inner.entries[packageID+".nuspec"], expectedVersion, mainExecutable, expectedTitle, expectedDescription)
 }
 
-func validateDeltaPackageStructure(file *verifiedFile, expectedVersion string, baseFull, currentFull *verifiedFile, baseLayout, targetLayout packageLayout) error {
+func validateDeltaPackageStructure(file *verifiedFile, expectedVersion string, baseFull, currentFull *verifiedFile, baseLayout, targetLayout packageLayout, publishedGeneration bool) error {
 	inner, err := openInnerArchive(file)
 	if err != nil {
 		return err
 	}
-	if targetLayout != packageLayoutRenamed || (baseLayout != packageLayoutLegacy && baseLayout != packageLayoutRenamed) {
+	legacyToLegacy := publishedGeneration && baseLayout == packageLayoutLegacy && targetLayout == packageLayoutLegacy
+	if !legacyToLegacy && (targetLayout != packageLayoutRenamed || baseLayout != packageLayoutLegacy && baseLayout != packageLayoutRenamed) {
 		return errors.New("Delta package layout transition is unsupported")
 	}
-	if err := validatePackageEnvelope(inner, expectedVersion, productMainExecutableName, productDisplayName, productDescription); err != nil {
+	mainExecutable := productMainExecutableName
+	expectedTitle, expectedDescription := productDisplayName, productDescription
+	if legacyToLegacy {
+		mainExecutable = productLegacyExecutableName
+		expectedTitle, expectedDescription = packageID, packageID
+	}
+	if err := validatePackageEnvelope(inner, expectedVersion, mainExecutable, expectedTitle, expectedDescription); err != nil {
 		return err
 	}
 	if baseFull == nil || currentFull == nil {
@@ -196,14 +203,38 @@ func validateDeltaPackageStructure(file *verifiedFile, expectedVersion string, b
 		"lib/app/managed-browser-helper/python.exe":                 {},
 		"lib/app/managed-browser-helper/pythonw.exe":                {},
 	}
+	if legacyToLegacy {
+		allowedPatchExecutables["lib/app/"+productLegacyAssemblyName+"_ExecutionStub.exe"] = struct{}{}
+	}
 	patches, err := validateDeltaPatches(inner, allowedPatchExecutables, baseInner, currentInner)
 	if err != nil {
 		return err
+	}
+	if legacyToLegacy {
+		return validateLegacyToLegacyDelta(inner, patches)
 	}
 	if baseLayout == packageLayoutLegacy {
 		return validateLegacyToRenamedDelta(inner, patches)
 	}
 	return validateRenamedToRenamedDelta(inner, patches)
+}
+
+func validateLegacyToLegacyDelta(inner *innerArchive, patches map[string]struct{}) error {
+	mainBase := "lib/app/" + productLegacyExecutableName
+	_, mainReplacement := inner.entries[mainBase]
+	_, mainPatch := patches[mainBase]
+	if mainReplacement == mainPatch {
+		return errors.New("historical Delta must replace or uniquely patch its main executable")
+	}
+	requiredExecutables := []string(nil)
+	if mainReplacement {
+		requiredExecutables = append(requiredExecutables, mainBase)
+	}
+	requiredExecutables = appendPresentExecutables(inner, requiredExecutables,
+		"lib/app/"+productLegacyAssemblyName+"_ExecutionStub.exe",
+		"lib/app/Squirrel.exe",
+	)
+	return validateExecutableSet(inner, requiredExecutables, nil)
 }
 
 func validateLegacyToRenamedDelta(inner *innerArchive, patches map[string]struct{}) error {
@@ -360,31 +391,48 @@ func zipEntrySHA1(entry *zip.File) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func validatePortableStructure(file *verifiedFile, expectedVersion string) error {
+func validatePortableStructure(file *verifiedFile, expectedVersion string, layout packageLayout) error {
 	inner, err := openInnerArchive(file)
 	if err != nil {
 		return err
 	}
+	mainExecutable := productMainExecutableName
+	rootExecutable := mainExecutable
+	assemblyName := productMainAssemblyName
+	dllName := productMainDLLName
+	expectedTitle, expectedDescription := productDisplayName, productDescription
+	if layout == packageLayoutLegacy {
+		mainExecutable = productLegacyExecutableName
+		rootExecutable = packageID + ".exe"
+		assemblyName = productLegacyAssemblyName
+		dllName = assemblyName + ".dll"
+		expectedTitle, expectedDescription = packageID, packageID
+	} else if layout != packageLayoutRenamed {
+		return errors.New("Portable archive application layout is unsupported")
+	}
 	for _, required := range []string{
 		".portable",
 		"current/sq.version",
-		"current/" + productMainDLLName,
-		"current/" + productMainAssemblyName + ".deps.json",
-		"current/" + productMainAssemblyName + ".runtimeconfig.json",
+		"current/" + dllName,
+		"current/" + assemblyName + ".deps.json",
+		"current/" + assemblyName + ".runtimeconfig.json",
 	} {
 		if _, ok := inner.entries[required]; !ok {
 			return fmt.Errorf("Portable archive is missing %s", required)
 		}
 	}
-	if err := validateNuspec(inner.entries["current/sq.version"], expectedVersion, productMainExecutableName, productDisplayName, productDescription); err != nil {
+	if err := validateNuspec(inner.entries["current/sq.version"], expectedVersion, mainExecutable, expectedTitle, expectedDescription); err != nil {
 		return err
 	}
-	return validateExecutableSet(inner, []string{
-		productMainExecutableName,
+	requiredExecutables := []string{
+		rootExecutable,
 		"Update.exe",
-		"current/" + productMainExecutableName,
-		"current/" + productLegacyExecutableName,
-	}, []string{
+		"current/" + mainExecutable,
+	}
+	if layout == packageLayoutRenamed {
+		requiredExecutables = append(requiredExecutables, "current/"+productLegacyExecutableName)
+	}
+	return validateExecutableSet(inner, requiredExecutables, []string{
 		"current/managed-browser-helper/python.exe",
 		"current/managed-browser-helper/pythonw.exe",
 	})

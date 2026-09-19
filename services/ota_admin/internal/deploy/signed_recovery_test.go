@@ -42,6 +42,66 @@ func TestStableRecoveryRunsTheFullSignedGenerationValidator(t *testing.T) {
 	}
 }
 
+type publishedBoundaryValidator struct {
+	uploadCalls    int
+	publishedCalls int
+	report         release.Report
+}
+
+func TestPublishedValidationDispatcherDoesNotUseUploadPath(t *testing.T) {
+	validator := &publishedBoundaryValidator{report: release.Report{Verified: true, Version: "1.1.0"}}
+	envelope := sourceEnvelope(t)
+	root, err := os.Open(envelope.ExtractionRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if _, err := validateOpenedPublishedGeneration(context.Background(), validator, envelope, root); err != nil {
+		t.Fatal(err)
+	}
+	if validator.uploadCalls != 0 || validator.publishedCalls != 1 {
+		t.Fatalf("validation calls: upload=%d published=%d", validator.uploadCalls, validator.publishedCalls)
+	}
+}
+
+func (validator *publishedBoundaryValidator) Validate(context.Context, *upload.Envelope, string) (release.Report, error) {
+	return validator.report, nil
+}
+
+func (validator *publishedBoundaryValidator) ValidateOpenedDirectory(context.Context, *upload.Envelope, *os.File, string) (release.Report, error) {
+	validator.uploadCalls++
+	return validator.report, nil
+}
+
+func (validator *publishedBoundaryValidator) ValidateOpenedPublishedGeneration(context.Context, *upload.Envelope, *os.File) (release.Report, error) {
+	validator.publishedCalls++
+	return validator.report, nil
+}
+
+func TestOnlyRetainedGenerationRecoveryUsesPublishedValidation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real generation symlink path is Linux-only")
+	}
+	validator := &publishedBoundaryValidator{report: release.Report{Verified: true, Version: "1.1.0"}}
+	disk, err := NewDisk(publicationRoot(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, switched, err := disk.PublishGeneration(context.Background(), sourceEnvelope(t), testReleaseID, validator.report, validator)
+	if err != nil || !switched {
+		t.Fatalf("publish switched=%v err=%v", switched, err)
+	}
+	if validator.uploadCalls != 1 || validator.publishedCalls != 0 {
+		t.Fatalf("publish validator calls: upload=%d published=%d", validator.uploadCalls, validator.publishedCalls)
+	}
+	if _, err := disk.RecoverGeneration(context.Background(), validator); err != nil {
+		t.Fatal(err)
+	}
+	if validator.uploadCalls != 1 || validator.publishedCalls != 1 {
+		t.Fatalf("recovery validator calls: upload=%d published=%d", validator.uploadCalls, validator.publishedCalls)
+	}
+}
+
 func signedGenerationFixture(t *testing.T) (*upload.Envelope, *release.Validator) {
 	t.Helper()
 	_, source, _, ok := runtime.Caller(0)

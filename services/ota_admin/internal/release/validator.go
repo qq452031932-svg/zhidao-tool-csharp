@@ -33,6 +33,13 @@ const MaximumNotesBytes = 65_536
 
 type Validator struct{ trust *publisher.Trust }
 
+type validationPurpose uint8
+
+const (
+	validationUpload validationPurpose = iota
+	validationPublishedGeneration
+)
+
 type ReportFile struct {
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
@@ -73,7 +80,7 @@ type loadedEnvelope struct {
 func NewValidator(trust *publisher.Trust) *Validator { return &Validator{trust: trust} }
 
 func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envelope, highestCommittedVersion string) (Report, error) {
-	return validator.validate(ctx, envelope, nil, highestCommittedVersion)
+	return validator.validate(ctx, envelope, nil, highestCommittedVersion, validationUpload)
 }
 
 // ValidateOpenedDirectory validates an envelope against a caller-owned,
@@ -84,10 +91,20 @@ func (validator *Validator) ValidateOpenedDirectory(ctx context.Context, envelop
 	if directory == nil {
 		return Report{}, fmt.Errorf("%w: opened directory is required", ErrManifest)
 	}
-	return validator.validate(ctx, envelope, directory, highestCommittedVersion)
+	return validator.validate(ctx, envelope, directory, highestCommittedVersion, validationUpload)
 }
 
-func (validator *Validator) validate(ctx context.Context, envelope *upload.Envelope, directory *os.File, highestCommittedVersion string) (Report, error) {
+// ValidateOpenedPublishedGeneration rechecks an immutable, previously published
+// generation. Only this path accepts a historical pre-rename current layout;
+// candidate uploads and new generation commits retain the renamed-only gate.
+func (validator *Validator) ValidateOpenedPublishedGeneration(ctx context.Context, envelope *upload.Envelope, directory *os.File) (Report, error) {
+	if directory == nil {
+		return Report{}, fmt.Errorf("%w: opened directory is required", ErrManifest)
+	}
+	return validator.validate(ctx, envelope, directory, "", validationPublishedGeneration)
+}
+
+func (validator *Validator) validate(ctx context.Context, envelope *upload.Envelope, directory *os.File, highestCommittedVersion string, purpose validationPurpose) (Report, error) {
 	if validator == nil || validator.trust == nil || envelope == nil || envelope.Verified {
 		return Report{}, fmt.Errorf("%w: validator input", ErrManifest)
 	}
@@ -172,9 +189,13 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 	}
 	currentLayout := fullLayouts[currentVersion]
 	if currentLayout != packageLayoutRenamed {
-		return Report{}, fmt.Errorf("%w: current Full package does not use the renamed layout", ErrMetadata)
+		currentParsed, currentErr := parseVersion(currentVersion)
+		lastLegacyVersion, lastLegacyErr := parseVersion("1.1.0")
+		if purpose != validationPublishedGeneration || currentLayout != packageLayoutLegacy || currentErr != nil || lastLegacyErr != nil || currentParsed.compare(lastLegacyVersion) > 0 {
+			return Report{}, fmt.Errorf("%w: current Full package does not use the renamed layout", ErrMetadata)
+		}
 	}
-	if err := validatePortableStructure(files[portableName], currentVersion); err != nil {
+	if err := validatePortableStructure(files[portableName], currentVersion, currentLayout); err != nil {
 		return Report{}, fmt.Errorf("%w: %v", ErrMetadata, err)
 	}
 	currentParsed, _ := parseVersion(currentVersion)
@@ -197,7 +218,7 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 			return Report{}, fmt.Errorf("%w: historical Delta packages are not allowed", ErrMetadata)
 		}
 		currentFullName := fmt.Sprintf("%s-%s-full.nupkg", packageID, currentVersion)
-		if err := validateDeltaPackageStructure(files[*asset.FileName], *asset.Version, files[baseFullName], files[currentFullName], baseLayout, currentLayout); err != nil {
+		if err := validateDeltaPackageStructure(files[*asset.FileName], *asset.Version, files[baseFullName], files[currentFullName], baseLayout, currentLayout, purpose == validationPublishedGeneration); err != nil {
 			return Report{}, fmt.Errorf("%w: %s: %v", ErrMetadata, *asset.FileName, err)
 		}
 	}
