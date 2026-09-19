@@ -55,8 +55,22 @@ dotnet test tests/<项目>/<项目>.csproj -c Debug --nologo
 **pwsh 必须在 PATH 上**，否则所有调 PowerShell 脚本的门禁测试会以"系统找不到指定的文件"
 整片失败——那不是产品问题。
 
-已知长期失败：`LicenseLocalStackScriptTests` 14 个（缺 Go）、
-`ShareSchedulingStoreTests.NewerActiveLogin…` 1 个（合并遗留，未修）。详见 OPEN-ISSUES。
+已知长期失败：`ShareSchedulingStoreTests.NewerActiveLogin…` 1 个（合并遗留，未修）。
+详见 OPEN-ISSUES。
+
+## 授权栈验收
+
+```
+pwsh scripts/test_local_license_stack.ps1
+```
+
+会在本机起一个只监听 `127.0.0.1` 的临时授权服务，用真实客户端跑完激活、多软件授权、
+续期、解绑重绑、**后台删卡后拒绝**、离线边界，跑完自动清理。**不碰生产服务器。**
+
+用的是仓库内固定版 Go（`.tools/go-1.27.1`，符号链接到另一个工作树），不是系统 PATH 上的 Go。
+
+中途失败过一次的话，启动与停止脚本会互相锁死，需要手工删 `.tmp/` 下的残留——
+见 OPEN-ISSUES 第 1 条。
 
 ## 发布
 

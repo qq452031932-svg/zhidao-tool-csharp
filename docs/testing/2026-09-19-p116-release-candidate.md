@@ -108,7 +108,14 @@ Expected: Accepted    Actual: ResultPending
 | `MigrationTests` | 44 / 44 |
 | `SqliteLocalTerminalHistoryStoreTests` | 111 / 111 |
 
-那 15 个红项：**14 个是 `LicenseLocalStackScriptTests`（缺 Go，见结构性隐患）**，1 个 `VisibleWebAutomationQueueTests` 单独跑立即通过，属时序抖动。
+那 15 个红项：14 个 `LicenseLocalStackScriptTests`，1 个 `VisibleWebAutomationQueueTests`
+（单独跑立即通过，属时序抖动）。
+
+**后续更正**：那 14 个当时被记为"缺 Go"，是错的——固定版 Go 一直在
+`.tools/go-1.27.1`（符号链接）。真因是启动/停止脚本互相锁死加上验收冒烟的存储隔离失效，
+均已修复（提交 `5310b6cd`），授权栈端到端验收现已首次完整通过：
+`software=2 package=1 cards=2 user_stores=4 wpf_smoke=1 policy_transitions=4
+renewal_checks=1 unbind_checks=1 delete_checks=1 offline_checks=2`。
 
 **并行跑全解决方案会产生 30 个失败，其中 15 个是负载抖动。** OTA 脚本测试要反复起 PowerShell 子进程，而 `Infrastructure.Tests` 单项就占 55 分钟 CPU。同一批 OTA 测试单独跑时全绿。**结论：验收时必须逐项目串行跑，并行结果不可信。**
 

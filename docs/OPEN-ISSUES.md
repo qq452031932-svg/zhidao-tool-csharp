@@ -2,24 +2,31 @@
 
 按严重程度排。每条都写清楚"不做会怎样"，而不是只写"应该做"。
 
-最后更新：2026-09-19（1.1.6 候选出包时）
+最后更新：2026-09-19（授权栈验收首次通过后）
+
+**已解决**：授权栈端到端验收此前一次都没在本机跑通过，曾被误记为"没装 Go"。真实原因是
+上面第 1 条的脚本死锁，加上验收冒烟的存储隔离失效（已修，见提交 `5310b6cd`）。
+现在 `pwsh scripts/test_local_license_stack.ps1` 可以完整通过。
 
 ---
 
-## 1. 没装 Go —— 授权栈整套验收做不了
+## 1. 启动/停止脚本互相锁死（本地授权栈）
 
-`scripts/test_local_license_stack.ps1` 需要 Go 编译授权服务与本地后台。出包这台机器上
-全盘搜不到 `go.exe`，脚本在启动阶段即失败；`LicenseLocalStackScriptTests` 的 14 个用例
-也因此全红。
+任何一次中途失败的 `run_local_license_stack.ps1` 都会留下编译产物，之后：
 
-**覆盖不到的范围**：激活、多软件授权、移出/重加授权包、停用/启用软件、续期、管理员解绑
-后重绑、**后台删卡后在线校验拒绝**、离线边界。
+- **启动**拒绝：`Local acceptance artifacts already exist; no data was overwritten.`
+- **停止**拒绝：`Validated local PID manifest not found; no process was stopped.`（清单只有
+  正常启动才会生成）
 
-**不做会怎样**：这是整个收费模式的核心逻辑，目前**一次都没在本机验证过**。交接文档里
-记的"1.1.2 轮全量通过"是在别的环境跑的，无法复现。卡密相关的任何回归都只能靠线上暴露。
+只能手工删 `.tmp/license-service-local.exe` 之类的残留才能解开。
 
-**怎么做**：装一个 Go（`winget install GoLang.Go` 或官网安装包），然后
-`pwsh scripts/test_local_license_stack.ps1`。全程只走 127.0.0.1，不碰生产服务器。
+**不做会怎样**：授权验收在第一次意外中断后就跑不起来了，而错误消息还会误导人——
+启动失败的真因被 `finally` 里的清理异常覆盖掉，显示的是
+"private runtime ownership was not established"，与真实原因毫无关系。**今天就因为这条
+误导排查了很久，还据此写错了交接文档。**
+
+**怎么做**：停止脚本应支持"没有清单也能清理已知残留"的恢复模式；启动脚本的 `finally`
+不应让清理异常吞掉原始异常。
 
 ---
 
@@ -92,6 +99,8 @@ Expected: Accepted    Actual: ResultPending
 - **换行符**：源码覆盖清单存的是工作树磁盘字节，而 `.gitattributes` 未给 `.xaml` / `.cs`
   钉 `eol=lf`，本机 `core.autocrlf=true`。**换台机器克隆出来，158 条哈希对不上，包出不了。**
 - **`.artifacts` 依赖**：Release 构建硬依赖 gitignored 的 helper 包目录，新克隆没有。
+- **固定版 Go 是符号链接**：`.tools/go-1.27.1` 指向 `.worktrees/license-production-deploy`
+  下的目录。删掉那个工作树，授权栈验收即刻失效，而报错不会提到这一点。
 - **pwsh 位置**：生产出包要求 PowerShell 7，本机的 pwsh 7.6.5 不在 PATH，位于 Codex 运行时
   缓存目录，该目录随时可能被清理。
 
