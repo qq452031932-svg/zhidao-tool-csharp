@@ -180,13 +180,28 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $acceptanceAssembly -PathType Leaf)) {
         throw 'The WPF acceptance build failed.'
     }
-    $previousLocalAppData = $env:LOCALAPPDATA
-    try {
-        $env:LOCALAPPDATA = Join-Path $runtimeRoot 'acceptance-wpf-profile'
-        & dotnet $acceptanceAssembly '--license-acceptance-smoke' ("--license-acceptance-config=" + $clientConfig) | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "The WPF acceptance smoke failed with exit code $LASTEXITCODE." }
+    # 重定向 LOCALAPPDATA 并不能隔离客户端的授权存储：Windows 上
+    # Environment.GetFolderPath 读的是系统已知文件夹，不看环境变量。冒烟因此一直
+    # 在读写用户真实的 licenses.dat，被本地验收服务拒绝时还会删掉真实租约。
+    # 改为显式把存储路径交给客户端，该参数只有验收构建会解析。
+    $acceptanceStatePath = Join-Path $runtimeRoot 'acceptance-wpf-profile\licenses.dat'
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $acceptanceStatePath)) | Out-Null
+    # 直接守住这个缺陷本身：验收跑完，用户真实的授权文件必须原封不动。断言"隔离文件
+    # 被创建"是不够的——空存储上的只读授权根本不写盘，那种断言只会误报。
+    $realStorePath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'SuperPan\Licensing1\licenses.dat'
+    $realStoreBefore = if (Test-Path -LiteralPath $realStorePath -PathType Leaf) {
+        (Get-Item -LiteralPath $realStorePath).LastWriteTimeUtc.Ticks
+    } else { -1 }
+    & dotnet $acceptanceAssembly '--license-acceptance-smoke' `
+        ("--license-acceptance-config=" + $clientConfig) `
+        ("--license-acceptance-state=" + $acceptanceStatePath) | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "The WPF acceptance smoke failed with exit code $LASTEXITCODE." }
+    $realStoreAfter = if (Test-Path -LiteralPath $realStorePath -PathType Leaf) {
+        (Get-Item -LiteralPath $realStorePath).LastWriteTimeUtc.Ticks
+    } else { -1 }
+    if ($realStoreBefore -ne $realStoreAfter) {
+        throw 'The WPF acceptance smoke touched the real license store instead of its isolated one.'
     }
-    finally { $env:LOCALAPPDATA = $previousLocalAppData }
 
     Invoke-AdminMutation -Session $adminSession -Csrf $csrf -Method Put -Path ("/admin/api/license/packages/{0}/members" -f [string]$package.id) -Body @{ software_ids = @([string]$softwareA.id) } | Out-Null
     $notAllowed = Invoke-Harness -Command authorize -ProductId ([string]$softwareB.id) -StoreRoot $userAStore

@@ -102,6 +102,13 @@ public static class LicenseAcceptanceSmokeRunner
     private const string SmokeSwitch = "--license-acceptance-smoke";
     private const string ConfigPrefix = "--license-acceptance-config=";
 
+    // 验收要在隔离的状态存储里跑，否则会读写用户真实的授权文件——被拒绝时授权门
+    // 还会顺手删掉真实租约。脚本原先靠重定向 LOCALAPPDATA 做隔离，但 Windows 上
+    // Environment.GetFolderPath 读的是系统已知文件夹而不是环境变量，隔离从未生效。
+    // 这个参数只在验收构建里被解析（RunAsync 已要求 Mode == Acceptance），
+    // 生产构建拿到它也不会有任何作用。
+    private const string StatePrefix = "--license-acceptance-state=";
+
     public static bool IsRequested(IReadOnlyList<string> arguments) =>
         arguments.Any(argument => string.Equals(argument, SmokeSwitch, StringComparison.Ordinal));
 
@@ -121,8 +128,9 @@ public static class LicenseAcceptanceSmokeRunner
         try
         {
             var configPath = GetAcceptanceConfigPath(arguments);
+            var statePath = GetAcceptanceStatePath(arguments);
             var options = LoadAcceptanceOptions(configPath);
-            var gate = (gateFactory ?? (value => LicenseAuthorizationGateFactory.Create(value)))(options);
+            var gate = (gateFactory ?? (value => LicenseAuthorizationGateFactory.Create(value, statePath)))(options);
             var result = await gate.AuthorizeAsync(LicenseOperationKind.Startup, cancellationToken)
                 .ConfigureAwait(false);
             return result.IsAuthorized || string.Equals(result.Code, "activation_required", StringComparison.Ordinal)
@@ -188,6 +196,22 @@ public static class LicenseAcceptanceSmokeRunner
         if (configArguments.Length != 1)
             throw new InvalidOperationException("许可证验收配置参数无效。");
         return configArguments[0][ConfigPrefix.Length..];
+    }
+
+    // 可选：不传就沿用默认路径（保持既有调用方式可用）。传了就必须是绝对路径，
+    // 且只能出现一次——重复传入意味着调用方自己都不确定要用哪个存储。
+    internal static string? GetAcceptanceStatePath(IReadOnlyList<string> arguments)
+    {
+        var stateArguments = arguments
+            .Where(argument => argument.StartsWith(StatePrefix, StringComparison.Ordinal))
+            .ToArray();
+        if (stateArguments.Length == 0) return null;
+        if (stateArguments.Length > 1)
+            throw new InvalidOperationException("许可证验收状态路径参数无效。");
+        var value = stateArguments[0][StatePrefix.Length..];
+        if (string.IsNullOrWhiteSpace(value) || !Path.IsPathFullyQualified(value))
+            throw new InvalidOperationException("许可证验收状态路径必须是绝对路径。");
+        return Path.GetFullPath(value);
     }
 
     private sealed record AcceptanceClientConfiguration(

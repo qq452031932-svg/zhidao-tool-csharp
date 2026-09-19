@@ -11,6 +11,48 @@ public sealed class LicenseAcceptanceSmokeRunnerTests : IDisposable
     private readonly string root = Path.Combine(
         Path.GetTempPath(), "BaiduBatchTransfer-LicenseSmoke", Guid.NewGuid().ToString("N"));
 
+    [Fact]
+    public void AnAbsoluteAcceptanceStatePathIsAccepted()
+    {
+        // 验收必须在隔离的存储里跑。脚本原先靠重定向 LOCALAPPDATA，但 Windows 上
+        // Environment.GetFolderPath 不看环境变量，冒烟因此一直在读写用户真实的
+        // 授权文件——被拒绝时授权门还会删掉真实租约。
+        var path = Path.Combine(root, "isolated", "licenses.dat");
+
+        var resolved = LicenseAcceptanceSmokeRunner.GetAcceptanceStatePath(
+            ["--license-acceptance-smoke", "--license-acceptance-state=" + path]);
+
+        Assert.Equal(Path.GetFullPath(path), resolved);
+    }
+
+    [Fact]
+    public void OmittingTheAcceptanceStatePathKeepsTheDefaultStore()
+    {
+        Assert.Null(LicenseAcceptanceSmokeRunner.GetAcceptanceStatePath(["--license-acceptance-smoke"]));
+    }
+
+    [Theory]
+    [InlineData("--license-acceptance-state=")]
+    [InlineData("--license-acceptance-state=   ")]
+    [InlineData("--license-acceptance-state=relative/licenses.dat")]
+    public void AnUnusableAcceptanceStatePathIsRejected(string argument)
+    {
+        // 相对路径会跟着当前工作目录跑，隔离也就无从谈起——宁可直接拒绝。
+        Assert.Throws<InvalidOperationException>(() =>
+            LicenseAcceptanceSmokeRunner.GetAcceptanceStatePath(["--license-acceptance-smoke", argument]));
+    }
+
+    [Fact]
+    public void TwoAcceptanceStatePathsAreRejected()
+    {
+        var a = Path.Combine(root, "a", "licenses.dat");
+        var b = Path.Combine(root, "b", "licenses.dat");
+
+        Assert.Throws<InvalidOperationException>(() =>
+            LicenseAcceptanceSmokeRunner.GetAcceptanceStatePath(
+                ["--license-acceptance-state=" + a, "--license-acceptance-state=" + b]));
+    }
+
     [Theory]
     [InlineData(LicenseRuntimeMode.Disabled)]
     [InlineData(LicenseRuntimeMode.Production)]
