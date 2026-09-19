@@ -2,7 +2,7 @@
 
 按严重程度排。每条都写清楚"不做会怎样"，而不是只写"应该做"。
 
-最后更新：2026-09-19（发现发布通道死锁后）
+最后更新：2026-09-19（1.1.10 出包后）
 
 **已解决**：授权栈端到端验收此前一次都没在本机跑通过，曾被误记为"没装 Go"。真实原因是
 上面第 1 条的脚本死锁，加上验收冒烟的存储隔离失效（已修，见提交 `5310b6cd`）。
@@ -190,6 +190,44 @@ Expected: Accepted    Actual: ResultPending
 
 ---
 
+## 6b. 改这几个文件必须顺手重新固定源码清单
+
+`eng/ota/production-source-overrides.sha256` 里的 158 条哈希是**逐字节**校验的。
+`MainWindow.xaml`、`SuperPanTheme.xaml`、`TransferWorkspaceView.xaml`、`JobResultsView.xaml`、
+`TransferWorkspaceViewModel.cs`、`JobResultsViewModel.cs`、`LocalJobResultsWorkflow.cs`、
+`SqliteBatchResultProjectionRepository.cs` 都在这份清单里。
+
+**不做会怎样**：代码能编译、测试能跑、提交能进去，但 HEAD 处于**出不了生产包**的
+状态，而且只会在出包跑到一半时才报错。2026-09-19 这一天内撞了两次（`0da9e06f`、
+`54a9d8e2`），两次都是靠出包前的全量比对才发现的。
+
+**怎么做**：改完 `src/` 下的 `.cs`/`.xaml` 后，重算清单里对应条目的 SHA-256（文件本身保持
+LF 结尾）。**不要只比这次改过的文件，要全量比 158 条**。
+
+## 6c. 两个大批量写入测试的墙钟预算在本机必红
+
+`RepositoryTests.PreparedStreamingWritesHandleTwoHundredThousand…` 预算 20 秒，本机 54.7 秒；
+`RepositoryTests.ShareWritesStreamSixHundredThousand…` 预算 120 秒，本机 155 秒。
+
+**两个测试名字里写的内存不变量都轻松通过**（预算 384 MB，实际 12.8 MB 与 13.1 MB，
+用了 3%）。挂的只是顺手加的吞吐预算。
+
+**不做会怎样**：全量跑永远至少三红（这两条 + 第 2 条的 `NewerActiveLogin…`），真正的回归
+会被埋在噪声里。2026-09-19 就差点发生：同一轮里的 4 个失败有 3 个是噪声。
+
+**怎么做**：去掉墙钟断言，或放宽到 3 倍，只保留内存断言。
+
+## 6d. 「按账号拆分导出」没有入口
+
+`ReplacementWorkbookExportService.ExportSplitToDirectoryAsync`（成功与失败分文件）在整个
+`src/` 里**没有任何调用者**，只有测试在用。而 1.1.1 的更新日志写着“结果可按账号拆分
+导出，成功与失败分开成文件”。
+
+**不做会怎样**：更新日志向用户承诺了一个点不到的功能。这是第二个“有代码有测试
+但没有按钮”的功能（第一个是重试失败项，已于 1.1.7 补上按钮）。
+
+**怎么做**：要么给它一个入口，要么把它和对应的更新日志一起删。注意 1.1.10 起
+「另存结果表格」已经是每个账号一个文件了，两者功能已大量重叠。
 ## 7. 全量测试不能并行跑
 
 并行运行整个解决方案会产生约 15 个**虚假失败**——OTA 脚本测试要反复起 PowerShell 子进程，
