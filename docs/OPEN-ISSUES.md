@@ -2,11 +2,87 @@
 
 按严重程度排。每条都写清楚"不做会怎样"，而不是只写"应该做"。
 
-最后更新：2026-09-19（授权栈验收首次通过后）
+最后更新：2026-09-19（发现发布通道死锁后）
 
 **已解决**：授权栈端到端验收此前一次都没在本机跑通过，曾被误记为"没装 Go"。真实原因是
 上面第 1 条的脚本死锁，加上验收冒烟的存储隔离失效（已修，见提交 `5310b6cd`）。
 现在 `pwsh scripts/test_local_license_stack.ps1` 可以完整通过。
+
+---
+
+## 0. 发布通道已死锁 —— 任何新版本都发不出去
+
+**这是当前最高优先级，且没有绕过办法。**
+
+线上发布的 1.1.0 使用旧的可执行文件名（`BaiduBatchTransfer.App.exe`）。1.1.1 之后的
+所有包改用新名（`知道综合工具.exe`）。服务端在 2026-09-15 才加入对新布局的支持
+（提交 `92e8d09a`），而生产服务器上的二进制是 2026-09-13 构建、09-14 部署的。
+
+于是两边都发不出去：
+
+| | 服务器当前的旧二进制 | 当前源码构建的新二进制 |
+| --- | --- | --- |
+| 接受 1.1.1+ 的新布局包 | **拒绝** `release_validation_failed` | 接受 |
+| 启动时复验线上 1.1.0 | 通过 | **拒绝**，发布器进入只读保护 |
+
+命令行 `publish-bundle` 同样被挡：它开头也调用 `publication.Recover()`。
+
+### 已验证的事实（不是推测）
+
+用服务端自己的校验器在本地跑：
+
+```
+1.1.7 包 -> PASS
+1.1.0 包 -> FAIL: current Full package does not use the renamed layout
+```
+
+2026-09-19 曾把新二进制部署到服务器验证，日志出现
+`publisher recovery requires read-only protection`，随即回滚，服务恢复正常。
+
+### 阻塞点在哪
+
+`internal/release/validator.go` 里这段是无条件的：
+
+```go
+currentLayout := fullLayouts[currentVersion]
+if currentLayout != packageLayoutRenamed {
+    return Report{}, fmt.Errorf("%w: current Full package does not use the renamed layout", ErrMetadata)
+}
+```
+
+另外 `validatePortableStructure` 把改名后的文件名写死了，即使放宽上面那条，复验
+1.1.0 代次仍会在这里失败。
+
+`validateSetupStructure` 与命名无关，两种布局都能过。
+
+### 建议的修复方向（未实施）
+
+给"复验已发布代次"单独一条路径（`ValidateGeneration` / `RecoverGeneration` 使用），
+在该路径下：
+
+1. 不强制当前版本必须是改名布局，改为接受它实际所用的布局
+2. Portable 按该代次实际使用的布局校验
+
+**上传新包的路径保持严格不变**，仍要求改名布局。签名、哈希、清单闭包等核心校验一律不动。
+
+原则：已发布的代次是历史，改不了。复验它的目的是确认**没被篡改**，而不是要求它符合
+今天的命名规范。
+
+### 实施时必须做的验证
+
+上次部署的教训是"只验证了期望发生的，没验证会实际发生的"。改完至少要：
+
+- 用**真实的 1.1.0 归档**验证复验通过（本地路径见
+  `.worktrees/license-production-deploy/.artifacts/ota-production-20260913-v1.1.0-license/`）
+- 用**真实的 1.1.7 包**验证上传校验仍通过
+- 新增测试钉死"上传旧布局的新包仍被拒绝"
+- 跑完整 `services/ota_admin` 测试套
+
+### 服务器当前状态（2026-09-19）
+
+已回滚到部署前的二进制 `bb917d27e74e86c582393c6cbe0d744565252f5772a5682787708f01f3e67351`，
+服务 active，发布器无只读保护。`/root/` 下留有 `ota-admin`（新二进制，未使用）与
+`ota-admin.bak-20260919`（旧二进制备份）。
 
 ---
 
