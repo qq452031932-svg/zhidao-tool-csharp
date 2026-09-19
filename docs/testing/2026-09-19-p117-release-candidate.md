@@ -2,7 +2,18 @@
 
 ## 候选资产
 
-目录与哈希在构建完成后补录。源码提交：`2c00578b`。
+目录：`.artifacts/ota-production-p117-20260919-081850`
+源码提交：`2c00578b`
+
+| 资产 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `SuperPan.BaiduBatchTransfer-1.1.7-win-x64-stable-upload.zip` | 504345526 | `fc1de97218f07b867e2a63b4335153823d907c9a8cd6ad6816577553ec9304f2` |
+
+- 独立重验 `verified=true`，版本 1.1.7，报告 `.artifacts/p117-independent-verification.json`
+- 我方签名产物 17 条：SPKI 全相符、平台校验全 Valid、1.1.7 自身产物时间戳齐备
+- 版本链 `1.0.6 / 1.1.0 / 1.1.7`，delta 基准 **1.1.0**（生产当前版本）
+- 上传清单 9 条哈希全一致
+- 包内更新说明与 `docs/release-notes/1.1.7.md` 逐字符一致，无占位文案
 
 1.1.6 曾完整构建并通过独立重验，随后被验收存储隔离的修复作废。那处修复只动
 `Mode == Acceptance` 才会走的代码路径，生产行为一字未变——但**一个指不到具体提交的包，
