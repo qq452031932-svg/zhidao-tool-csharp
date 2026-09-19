@@ -14,6 +14,12 @@ public static class ApplicationChangelog
 {
     public static IReadOnlyList<ChangelogEntry> Entries { get; } =
     [
+        new("1.1.9", "2026-09-19",
+        [
+            "修复标题栏的最小化、最大化、关闭按钮看不见：换浅色主题后变成了白字白底",
+            "标题栏与窗口外框加深，窗口边界和可拖动区域更容易辨认",
+            "关闭按钮悬停变红，误点前有提醒",
+        ]),
         new("1.1.8", "2026-09-19",
         [
             "修复设置中心看不到「检查更新」按钮：页面过长时被裁在窗口外，且无法滚动",
