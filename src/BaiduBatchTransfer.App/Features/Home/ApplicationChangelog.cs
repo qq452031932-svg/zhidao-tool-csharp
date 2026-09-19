@@ -14,6 +14,11 @@ public static class ApplicationChangelog
 {
     public static IReadOnlyList<ChangelogEntry> Entries { get; } =
     [
+        new("1.1.8", "2026-09-19",
+        [
+            "修复设置中心看不到「检查更新」按钮：页面过长时被裁在窗口外，且无法滚动",
+            "设置中心改为左右分栏，授权与更新一屏看全，小屏幕上可滚动",
+        ]),
         new("1.1.7", "2026-09-19",
         [
             "断网时不再误报未激活：打开软件有 7 天离线宽限，联网操作仍照常校验",
