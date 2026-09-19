@@ -8,8 +8,9 @@
     <!-- 两张卡片加起来比窗口高，ContentControl 不会自己滚动，
          结果“检查更新”按钮被裁在窗口外。这里只包一层滚动容器，
          不改 MainWindow，以免其他需要填满高度的工作区被撞坏。 -->
-    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-    <StackPanel Margin="0,0,6,0">
+    <ScrollViewer VerticalScrollBarVisibility="Visible" HorizontalScrollBarVisibility="Disabled"
+                  AutomationProperties.Name="设置中心内容">
+    <StackPanel Margin="0,0,10,0">
     <Border Style="{StaticResource BorderedPanelStyle}" Padding="22" Margin="0,0,0,14">
         <StackPanel>
             <TextBlock Text="软件授权"
