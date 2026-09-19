@@ -23,6 +23,8 @@
                 Grid.Row="0"
                 Height="36"
                 Background="{StaticResource TitleBarBrush}"
+                BorderBrush="{StaticResource PanelBorderBrush}"
+                BorderThickness="0,0,0,1"
                 MouseLeftButtonDown="OnTitleBarMouseLeftButtonDown">
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -31,29 +33,26 @@
                 </Grid.ColumnDefinitions>
                 <TextBlock Margin="14,0,0,0"
                            VerticalAlignment="Center"
-                           Foreground="White"
+                           Foreground="{StaticResource TextBrush}"
                            FontSize="13"
                            FontWeight="SemiBold"
                            Text="{Binding ApplicationTitleWithVersion}" />
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
                     <Button x:Name="MinimizeButton"
-                            Width="46" Height="36" MinHeight="0" Margin="0" Padding="0"
-                            Background="Transparent" BorderThickness="0" Foreground="White"
+                            Style="{StaticResource CaptionButtonStyle}"
                             Content="—"
                             AutomationProperties.Name="最小化"
                             shell:WindowChrome.IsHitTestVisibleInChrome="True"
                             Click="OnMinimizeClick" />
                     <Button x:Name="MaximizeRestoreButton"
-                            Width="46" Height="36" MinHeight="0" Margin="0" Padding="0"
-                            Background="Transparent" BorderThickness="0" Foreground="White"
+                            Style="{StaticResource CaptionButtonStyle}"
                             Content="□"
                             AutomationProperties.Name="最大化或还原"
                             shell:WindowChrome.IsHitTestVisibleInChrome="True"
                             Click="OnMaximizeRestoreClick" />
                     <Button x:Name="CloseButton"
-                            Width="46" Height="36" MinHeight="0" Margin="0" Padding="0"
-                            Background="Transparent" BorderThickness="0" Foreground="White"
-                            Content="×" FontSize="18"
+                            Style="{StaticResource CaptionCloseButtonStyle}"
+                            Content="×"
                             AutomationProperties.Name="关闭"
                             shell:WindowChrome.IsHitTestVisibleInChrome="True"
                             Click="OnCloseClick" />
