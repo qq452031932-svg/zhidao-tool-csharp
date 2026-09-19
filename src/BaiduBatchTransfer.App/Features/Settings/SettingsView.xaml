@@ -3,15 +3,21 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              MinWidth="320"
              MinHeight="240">
-    <!-- 授权与 OTA 是两件事：授权信息原本嵌在“软件更新”标题之下，读起来像是
-         更新功能的一部分。拆成两张卡片，授权在上，更新在下。 -->
-    <!-- 两张卡片加起来比窗口高，ContentControl 不会自己滚动，
-         结果“检查更新”按钮被裁在窗口外。这里只包一层滚动容器，
-         不改 MainWindow，以免其他需要填满高度的工作区被撞坏。 -->
+    <!-- 授权与 OTA 是两件事，各占一张卡片。上下排时两张加起来比窗口高，
+         “检查更新”按钮被裁在窗口外；横排后一屏就能看全，不用滚一屏去找按钮。
+         列宽照抄首页的写法给 MinWidth，窗口拉窄时文字自己换行。
+         外面仍然包一层滚动容器：矮屏幕上单列也可能超高。不改 MainWindow，
+         以免其他需要填满高度的工作区被撞坏。 -->
     <ScrollViewer VerticalScrollBarVisibility="Visible" HorizontalScrollBarVisibility="Disabled"
                   AutomationProperties.Name="设置中心内容">
-    <StackPanel Margin="0,0,10,0">
-    <Border Style="{StaticResource BorderedPanelStyle}" Padding="22" Margin="0,0,0,14">
+    <Grid Margin="0,0,10,0">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" MinWidth="330" />
+            <ColumnDefinition Width="14" />
+            <ColumnDefinition Width="*" MinWidth="320" />
+        </Grid.ColumnDefinitions>
+    <Border Grid.Column="0" VerticalAlignment="Top"
+            Style="{StaticResource BorderedPanelStyle}" Padding="22">
         <StackPanel>
             <TextBlock Text="软件授权"
                        FontSize="20"
@@ -49,13 +55,13 @@
                 <!-- 机器码：用户联系管理员解绑时靠它定位设备。完整哈希过长，
                      界面只显示首尾各 8 位，复制按钮给出完整值。 -->
                 <TextBlock Grid.Row="4" Grid.Column="0" Margin="0,8,0,0" Text="机器码" Foreground="{StaticResource MutedBrush}" />
-                <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" Margin="20,8,0,0">
+                <WrapPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" Margin="20,8,0,0">
                     <TextBlock Text="{Binding MachineCodeDisplay}" VerticalAlignment="Center"
                                FontFamily="Consolas, Microsoft YaHei UI" />
                     <Button Content="复制" Margin="10,0,0,0" Padding="10,2" Height="26"
                             Command="{Binding CopyMachineCodeCommand}"
                             AutomationProperties.Name="复制机器码" />
-                </StackPanel>
+                </WrapPanel>
                 <!-- 未授权时才出现。激活窗此前只在启动时弹一次，
                      用户点“暂不激活”后没有任何入口可以再次激活。 -->
                 <Button Grid.Row="5" Grid.Column="1"
@@ -75,7 +81,8 @@
         </Border>
         </StackPanel>
     </Border>
-    <Border Style="{StaticResource BorderedPanelStyle}" Padding="22">
+    <Border Grid.Column="2" VerticalAlignment="Top"
+            Style="{StaticResource BorderedPanelStyle}" Padding="22">
         <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
@@ -174,6 +181,6 @@
             </StackPanel>
         </Grid>
     </Border>
-    </StackPanel>
+    </Grid>
     </ScrollViewer>
 </UserControl>
