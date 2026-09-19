@@ -14,7 +14,7 @@ public static class ApplicationChangelog
 {
     public static IReadOnlyList<ChangelogEntry> Entries { get; } =
     [
-        new("1.1.6", "2026-09-19",
+        new("1.1.7", "2026-09-19",
         [
             "断网时不再误报未激活：打开软件有 7 天离线宽限，联网操作仍照常校验",
             "连不上授权服务器时如实提示，不再弹激活窗让人以为卡密失效",
