@@ -73,7 +73,7 @@ def observe_bound_target(
     """Observe one immutable binding with a cooperative soft deadline.
 
     A synchronous driver call cannot be preempted here. We check before and after every call,
-    pass the remaining budget where DrissionPage accepts one, and discard any result returned
+    pass the remaining budget where the driver accepts one, and discard any result returned
     after expiry. Task 9's owning C# client supplies the hard bound by killing the helper process
     and synthesizing the typed timeout/cancellation result.
     """
@@ -200,7 +200,7 @@ def observe_bound_target(
         return {"kind": "BrowserUnavailable"}
 
 
-class _DrissionTarget:
+class _CdpTarget:
     def __init__(self, tab):
         self._tab = tab
 
@@ -399,7 +399,7 @@ class _DrissionTarget:
         return share_submission.observe_outcome(self._tab, payload, remaining_seconds)
 
 
-class _DrissionConnector:
+class _CdpConnector:
     def __init__(self, browser):
         self._browser = browser
         self._targets = {}
@@ -417,7 +417,7 @@ class _DrissionConnector:
             return None
         target = self._targets.get(target_id)
         if target is None:
-            target = _DrissionTarget(self._browser.get_tab(target_id))
+            target = _CdpTarget(self._browser.get_tab(target_id))
             self._targets[target_id] = target
         return target
 
@@ -425,15 +425,15 @@ class _DrissionConnector:
 def observe_account_identity(payload, is_cancelled=lambda: False):
     """Attach to one pre-verified endpoint and one exact target; perform no mutation."""
     try:
-        from DrissionPage import Chromium, ChromiumOptions
+        from cdp_client import CdpBrowser, CdpOptions
 
         endpoint = urlsplit(payload["devToolsEndpoint"])
         address = f"{endpoint.hostname}:{endpoint.port}"
-        options = ChromiumOptions().set_address(address).existing_only(True)
-        browser = Chromium(options)
+        options = CdpOptions().set_address(address).existing_only(True)
+        browser = CdpBrowser(options)
         return observe_bound_target(
             payload,
-            _DrissionConnector(browser),
+            _CdpConnector(browser),
             is_cancelled=is_cancelled,
         )
     except Exception:
@@ -444,8 +444,8 @@ def open_transfer_source(payload, is_cancelled=lambda: False):
     """Attach existing-only, then open a validated source in the one exact target."""
     def attach(budget):
         def load_driver(_remaining):
-            from DrissionPage import Chromium, ChromiumOptions
-            return Chromium, ChromiumOptions
+            from cdp_client import CdpBrowser, CdpOptions
+            return CdpBrowser, CdpOptions
         chromium, chromium_options = budget.call(load_driver)
         endpoint = urlsplit(payload["devToolsEndpoint"])
         address = f"{endpoint.hostname}:{endpoint.port}"
@@ -453,7 +453,7 @@ def open_transfer_source(payload, is_cancelled=lambda: False):
         options = budget.call(lambda _: options.set_address(address))
         options = budget.call(lambda _: options.existing_only(True))
         browser = budget.call(lambda _: chromium(options))
-        return _DrissionConnector(browser)
+        return _CdpConnector(browser)
     return transfer_source.open_with_connector(
         payload, attach, classify_route=classify_route, is_cancelled=is_cancelled)
 
@@ -469,8 +469,8 @@ def read_transfer_source(payload, is_cancelled=lambda: False):
     """Attach existing-only and read a bounded candidate listing; never navigate."""
     def attach(budget):
         def load_driver(_remaining):
-            from DrissionPage import Chromium, ChromiumOptions
-            return Chromium, ChromiumOptions
+            from cdp_client import CdpBrowser, CdpOptions
+            return CdpBrowser, CdpOptions
         chromium, chromium_options = budget.call(load_driver)
         endpoint = urlsplit(payload["devToolsEndpoint"])
         address = f"{endpoint.hostname}:{endpoint.port}"
@@ -478,7 +478,7 @@ def read_transfer_source(payload, is_cancelled=lambda: False):
         options = budget.call(lambda _: options.set_address(address))
         options = budget.call(lambda _: options.existing_only(True))
         browser = budget.call(lambda _: chromium(options))
-        return _DrissionConnector(browser)
+        return _CdpConnector(browser)
     return transfer_source_listing.read_with_connector(
         payload, attach, classify_route=classify_route, is_cancelled=is_cancelled)
 
@@ -487,8 +487,8 @@ def read_transfer_directory(payload, is_cancelled=lambda: False):
     """Read folder candidates in an already-open picker; never open or navigate it."""
     def attach(budget):
         def load_driver(_remaining):
-            from DrissionPage import Chromium, ChromiumOptions
-            return Chromium, ChromiumOptions
+            from cdp_client import CdpBrowser, CdpOptions
+            return CdpBrowser, CdpOptions
         chromium, chromium_options = budget.call(load_driver)
         endpoint = urlsplit(payload["devToolsEndpoint"])
         address = f"{endpoint.hostname}:{endpoint.port}"
@@ -496,7 +496,7 @@ def read_transfer_directory(payload, is_cancelled=lambda: False):
         options = budget.call(lambda _: options.set_address(address))
         options = budget.call(lambda _: options.existing_only(True))
         browser = budget.call(lambda _: chromium(options))
-        return _DrissionConnector(browser)
+        return _CdpConnector(browser)
     return transfer_directory_listing.read_with_connector(
         payload, attach, classify_route=classify_route, is_cancelled=is_cancelled)
 
@@ -505,8 +505,8 @@ def open_transfer_picker(payload, is_cancelled=lambda: False):
     """Attach existing-only and dispatch one source-validated picker click; never retry."""
     def attach(budget):
         def load_driver(_remaining):
-            from DrissionPage import Chromium, ChromiumOptions
-            return Chromium, ChromiumOptions
+            from cdp_client import CdpBrowser, CdpOptions
+            return CdpBrowser, CdpOptions
         chromium, chromium_options = budget.call(load_driver)
         endpoint = urlsplit(payload["devToolsEndpoint"])
         address = f"{endpoint.hostname}:{endpoint.port}"
@@ -514,19 +514,19 @@ def open_transfer_picker(payload, is_cancelled=lambda: False):
         options = budget.call(lambda _: options.set_address(address))
         options = budget.call(lambda _: options.existing_only(True))
         browser = budget.call(lambda _: chromium(options))
-        return _DrissionConnector(browser)
+        return _CdpConnector(browser)
     return transfer_picker.open_with_connector(
         payload, attach, classify_route=classify_route, is_cancelled=is_cancelled)
 
 
 def _attach_existing(payload, budget):
     def load_driver(_remaining):
-        from DrissionPage import Chromium, ChromiumOptions
-        return Chromium, ChromiumOptions
+        from cdp_client import CdpBrowser, CdpOptions
+        return CdpBrowser, CdpOptions
     chromium, chromium_options = budget.call(load_driver)
     endpoint = urlsplit(payload["devToolsEndpoint"]); address = f"{endpoint.hostname}:{endpoint.port}"
     options = budget.call(lambda _: chromium_options()); options = budget.call(lambda _: options.set_address(address))
-    options = budget.call(lambda _: options.existing_only(True)); return _DrissionConnector(budget.call(lambda _: chromium(options)))
+    options = budget.call(lambda _: options.existing_only(True)); return _CdpConnector(budget.call(lambda _: chromium(options)))
 
 
 def mutate_transfer_directory(action, payload, is_cancelled=lambda: False):

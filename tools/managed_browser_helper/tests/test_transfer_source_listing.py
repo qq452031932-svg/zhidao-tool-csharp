@@ -419,13 +419,13 @@ class ListingRuntimeTests(unittest.TestCase):
             SimpleNamespace(run_js=raises), payload()["expectedBaiduUserId"], payload()["sourceUri"], 1))
 
     def test_fixed_script_adapter_numeric_budget_only_and_existing_only_attach(self):
-        self.assertTrue(hasattr(main._DrissionTarget, "observe_source_listing"))
+        self.assertTrue(hasattr(main._CdpTarget, "observe_source_listing"))
         self.assertTrue(hasattr(main, "read_transfer_source"))
         calls = []
         def run_js(script, uid, milliseconds, expected_source_url, **kwargs):
             calls.append((script, uid, milliseconds, expected_source_url, kwargs))
             return raw()
-        target = main._DrissionTarget(SimpleNamespace(run_js=run_js))
+        target = main._CdpTarget(SimpleNamespace(run_js=run_js))
         self.assertEqual(raw(), target.observe_source_listing(payload()["expectedBaiduUserId"], payload()["sourceUri"], 0.25))
         self.assertEqual([(self.source.SOURCE_LISTING_SCRIPT, payload()["expectedBaiduUserId"], 250,
                            payload()["sourceUri"], {"timeout": 0.25})], calls)
@@ -441,8 +441,8 @@ class ListingRuntimeTests(unittest.TestCase):
         def chromium(options):
             driver_calls.append(("attach", type(options).__name__))
             return b
-        with patch.dict(sys.modules, {"DrissionPage": SimpleNamespace(Chromium=chromium, ChromiumOptions=Options)}), \
-                patch.object(main, "_DrissionConnector", side_effect=lambda browser: browser):
+        with patch.dict(sys.modules, {"cdp_client": SimpleNamespace(CdpBrowser=chromium, CdpOptions=Options)}), \
+                patch.object(main, "_CdpConnector", side_effect=lambda browser: browser):
             self.assertEqual(observed(), main.read_transfer_source(payload()))
         self.assertEqual([("address", "127.0.0.1:9222"), ("existing", True), ("attach", "Options")], driver_calls)
 
@@ -480,7 +480,7 @@ class ListingRuntimeTests(unittest.TestCase):
                 self.assertEqual(payload()["targetId"], target_id)
                 calls.append(("target", target_id))
                 return tab
-        with patch.dict(sys.modules, {"DrissionPage": SimpleNamespace(Chromium=Browser, ChromiumOptions=Options)}):
+        with patch.dict(sys.modules, {"cdp_client": SimpleNamespace(CdpBrowser=Browser, CdpOptions=Options)}):
             self.assertEqual(observed(), main.read_transfer_source(payload()))
         self.assertEqual(1, sum(c[0] == "target" for c in calls))
         self.assertEqual(2, sum(c[0] == "script" for c in calls))
@@ -513,7 +513,7 @@ class ListingRuntimeTests(unittest.TestCase):
                         return b
                     def budget(timeout, _monotonic, is_cancelled):
                         return real_budget(timeout, lambda: b.now, is_cancelled)
-                    with patch.dict(sys.modules, {"DrissionPage": SimpleNamespace(Chromium=browser, ChromiumOptions=Options)}), \
+                    with patch.dict(sys.modules, {"cdp_client": SimpleNamespace(CdpBrowser=browser, CdpOptions=Options)}), \
                             patch.object(self.source, "OperationBudget", side_effect=budget):
                         self.assertEqual({"kind": stop}, main.read_transfer_source(payload(), is_cancelled=lambda: b.cancelled))
                     self.assertEqual(trigger, calls[-1])
@@ -540,7 +540,7 @@ class ListingRuntimeTests(unittest.TestCase):
                 capture_output=True, text=True, encoding="utf-8", timeout=20)
             self.assertEqual(0, result.returncode, result.stderr)
             return json.loads(result.stdout)
-        target = main._DrissionTarget(SimpleNamespace(run_js=run_js))
+        target = main._CdpTarget(SimpleNamespace(run_js=run_js))
         b.observe_source_listing = target.observe_source_listing
         self.assertEqual({"kind": "PageNotValidated"}, self.read())
         self.assertEqual(payload()["sourceUri"], b.url)

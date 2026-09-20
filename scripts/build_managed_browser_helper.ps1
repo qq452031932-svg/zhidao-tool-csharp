@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('PersonalNonCommercial')]
+    [ValidateSet('Distributable')]
     [string]$DistributionMode,
 
     [Parameter(Mandatory = $true)]
@@ -38,8 +38,17 @@ if ([string]::IsNullOrWhiteSpace($PackageCacheDirectory)) {
 }
 $cachePath = [IO.Path]::GetFullPath($PackageCacheDirectory)
 
-if ($DistributionMode -ne 'PersonalNonCommercial') {
-    throw 'DrissionPage commercial/distributable packaging is blocked until written authorization is recorded or the dependency is replaced.'
+if ($DistributionMode -ne 'Distributable') {
+    throw 'Unsupported distribution mode.'
+}
+# Every pinned wheel must permit commercial redistribution. Drivers with a custom
+# personal/non-profit license previously blocked this build; keep them out for good.
+$restrictedDependencies = @('drissionpage', 'drissionget', 'drissionrecord')
+foreach ($requirementLine in [IO.File]::ReadAllLines($requirementsPath)) {
+    $requirementName = (($requirementLine -split '==')[0]).Trim().ToLowerInvariant()
+    if ($restrictedDependencies -contains $requirementName) {
+        throw "A dependency that withholds commercial redistribution is pinned: $requirementName. Remove it, or record written authorization and update this gate."
+    }
 }
 if (Test-Path -LiteralPath $outputPath) {
     throw "OutputDirectory must not already exist: $outputPath"
@@ -47,6 +56,7 @@ if (Test-Path -LiteralPath $outputPath) {
 foreach ($requiredSource in @($requirementsPath, $noticeSourcePath,
         $mplLicenseSourcePath, (Join-Path $helperSource 'main.py'),
         (Join-Path $helperSource 'protocol.py'), (Join-Path $helperSource 'identity_query.py'),
+        (Join-Path $helperSource 'cdp_client.py'),
         (Join-Path $helperSource 'transfer_source.py'), (Join-Path $helperSource 'transfer_source_listing.py'),
         (Join-Path $helperSource 'transfer_picker.py'),
         (Join-Path $helperSource 'transfer_directory_listing.py'),

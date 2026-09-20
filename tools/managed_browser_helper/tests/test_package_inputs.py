@@ -73,7 +73,7 @@ class PackageInputTests(unittest.TestCase):
             f"protocolVersion={protocol_version}\n"
             f"executionEngineVersion={engine_version}\n"
             "pythonVersion=3.14.0\n"
-            "distributionMode=PersonalNonCommercial\n"
+            "distributionMode=Distributable\n"
         )
         for entry in entries:
             identity += (
@@ -84,7 +84,7 @@ class PackageInputTests(unittest.TestCase):
             "protocolVersion": protocol_version,
             "executionEngineVersion": engine_version,
             "pythonVersion": "3.14.0",
-            "distributionMode": "PersonalNonCommercial",
+            "distributionMode": "Distributable",
             "buildIdentity": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
             "files": entries,
         }

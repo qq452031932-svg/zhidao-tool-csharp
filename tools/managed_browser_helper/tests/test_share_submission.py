@@ -243,7 +243,7 @@ class ShareSubmissionBoundaryTests(unittest.TestCase):
                     return {"executionContextId": 1}
                 raise RuntimeError("private")
 
-        result = main._DrissionTarget(RuntimeFails()).submit_share_once(payload, 1)
+        result = main._CdpTarget(RuntimeFails()).submit_share_once(payload, 1)
         self.assertEqual(
             {"kind": "BrowserUnavailable", "dispatchState": "DispatchOutcomeUnknown"}, result)
 

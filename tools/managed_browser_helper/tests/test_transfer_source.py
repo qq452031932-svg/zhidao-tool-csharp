@@ -399,7 +399,7 @@ class TransferSourceScriptTests(unittest.TestCase):
             def run_js(self, script, *args, **kwargs):
                 calls.append((script, args, kwargs))
                 return {"kind": "ExtractionRequired"}
-        self.assertEqual({"kind": "ExtractionRequired"}, main._DrissionTarget(Tab()).observe_source_stage(0.25))
+        self.assertEqual({"kind": "ExtractionRequired"}, main._CdpTarget(Tab()).observe_source_stage(0.25))
         script, args, kwargs = calls[0]
         self.assertEqual(self.source.SOURCE_STAGE_SCRIPT, script)
         self.assertEqual(1, len(args))
@@ -495,7 +495,7 @@ class TransferSourceAttachTests(unittest.TestCase):
             def get_tab(inner, target_id):
                 calls.append(("get-tab", target_id))
                 return tab
-        with patch.dict(sys.modules, {"DrissionPage": SimpleNamespace(Chromium=Browser, ChromiumOptions=Options)}):
+        with patch.dict(sys.modules, {"cdp_client": SimpleNamespace(CdpBrowser=Browser, CdpOptions=Options)}):
             self.assertEqual({"kind": "SourceOpened"}, main.open_transfer_source(payload(expectedBaiduUserId="42")))
         self.assertEqual(("address", "127.0.0.1:43127"), calls[0])
         self.assertEqual(("existing-only", True), calls[1])

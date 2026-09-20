@@ -449,7 +449,7 @@ class ProtocolTests(unittest.TestCase):
                 calls.append((script, args, kwargs))
                 return {"kind": "QueryResponse", "status": 200, "body": "{}"}
 
-        self.assertEqual({"kind": "BrowserUnavailable"}, main._DrissionTarget(Tab()).observe_identity(1.0))
+        self.assertEqual({"kind": "BrowserUnavailable"}, main._CdpTarget(Tab()).observe_identity(1.0))
         self.assertEqual(1, len(calls))
         self.assertFalse(hasattr(main, "map_identity_fixture"))
         self.assertFalse(hasattr(main, "_IdentityFixtureParser"))
@@ -522,11 +522,11 @@ class ProtocolTests(unittest.TestCase):
 
     def test_drission_binding_properties_reflect_current_driver_ids(self):
         browser = FakeChromium("44444444-4444-4444-4444-444444444444")
-        connector = main._DrissionConnector(browser)
+        connector = main._CdpConnector(browser)
         browser.id = "55555555-5555-5555-5555-555555555555"
         self.assertEqual(browser.id, connector.browser_id)
         tab = FakeDrissionTab()
-        target = main._DrissionTarget(tab)
+        target = main._CdpTarget(tab)
         tab.tab_id = "target-2"
         self.assertEqual("target-2", target.target_id)
 
@@ -571,7 +571,7 @@ class ProtocolTests(unittest.TestCase):
         output, events = io.BytesIO(), io.StringIO()
         result = main.run(io.BytesIO(protocol.encode_message(request()) + protocol.encode_message(observe)),
             output, events, helper_pid=9876, parent_pid=1234,
-            observer=lambda _payload: main._DrissionTarget(Tab()).observe_identity(1.0))
+            observer=lambda _payload: main._CdpTarget(Tab()).observe_identity(1.0))
         self.assertEqual(0, result)
         self.assertEqual("", events.getvalue())
         self.assertNotIn(b"private-name-marker", output.getvalue())
@@ -739,7 +739,7 @@ class ProtocolTests(unittest.TestCase):
     def test_drission_connector_uses_actual_browser_id_not_payload_value(self):
         actual = "44444444-4444-4444-4444-444444444444"
         supplied = "55555555-5555-5555-5555-555555555555"
-        connector = main._DrissionConnector(FakeChromium(actual))
+        connector = main._CdpConnector(FakeChromium(actual))
 
         self.assertEqual(actual, connector.browser_id)
         payload = request("ObserveAccountIdentity", {
@@ -756,7 +756,7 @@ class ProtocolTests(unittest.TestCase):
     def test_drission_navigation_disables_driver_retries_and_intervals(self):
         tab = FakeDrissionTab()
 
-        main._DrissionTarget(tab).navigate(main.PAN_ROOT, 0.125)
+        main._CdpTarget(tab).navigate(main.PAN_ROOT, 0.125)
 
         self.assertEqual(
             [(main.PAN_ROOT, {"timeout": 0.125, "retry": 0, "interval": 0})],

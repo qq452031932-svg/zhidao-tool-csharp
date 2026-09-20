@@ -94,7 +94,7 @@ class TargetBaselineProtocolTests(unittest.TestCase):
         class Budget:
             def call(self, operation): return operation(30.0)
 
-        target = main._DrissionTarget(Tab())
+        target = main._CdpTarget(Tab())
         self.assertEqual({"kind": "RootOpened", "navigationState": "RouteOpened"},
                          target_baseline.dispatch_bound("OpenTransferTargetRoot", binding(),
                                                         Connector(target), budget=Budget()))
@@ -123,7 +123,7 @@ class TargetBaselineProtocolTests(unittest.TestCase):
         class Budget:
             def call(self, operation): return operation(30.0)
 
-        target = main._DrissionTarget(Tab())
+        target = main._CdpTarget(Tab())
         payload = {**binding(), "expectedParent": header(), "childExactId": "child-1",
                    "childServerName": "child", "childCanonicalPath": "/parent/child"}
         self.assertEqual({"kind": "DirectoryEntered", "navigationState": "RouteOpened"},
@@ -140,7 +140,7 @@ class TargetBaselineProtocolTests(unittest.TestCase):
 
         payload = {**binding(), "expectedParent": header(), "childExactId": "child-1",
                    "childServerName": "child", "childCanonicalPath": "/parent/child"}
-        value = main._DrissionTarget(Tab()).enter_target_child(payload, raw_inventory(), 30.0)
+        value = main._CdpTarget(Tab()).enter_target_child(payload, raw_inventory(), 30.0)
         self.assertEqual({"kind": "PageNotValidated", "navigationAttempted": False}, value)
         self.assertEqual(payload["expectedParent"]["parentObservationFingerprint"], captured[0][1][9])
 
@@ -560,7 +560,7 @@ class TargetBaselineProtocolTests(unittest.TestCase):
                 captured.append((script, args))
                 return copy.deepcopy(root)
 
-        value = main._DrissionTarget(Tab()).read_target_inventory(binding(), None, None, None, 30.0)
+        value = main._CdpTarget(Tab()).read_target_inventory(binding(), None, None, None, 30.0)
         self.assertEqual(root, value)
         self.assertEqual((None, None, None), captured[0][1][5:8])
 

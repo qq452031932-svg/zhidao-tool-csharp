@@ -258,7 +258,7 @@ class PickerRuntimeTests(unittest.TestCase):
             self.assertEqual({"kind": kind}, self.open())
 
     def test_fixed_adapter_prevalidation_and_transport_uncertainty(self):
-        self.assertTrue(hasattr(main._DrissionTarget, "open_transfer_picker"))
+        self.assertTrue(hasattr(main._CdpTarget, "open_transfer_picker"))
         uid, url, source = payload()["expectedBaiduUserId"], payload()["sourceUri"], observed()
         tab = SimpleNamespace(run_js=lambda *_args, **_kw: self.fail("invalid dispatch"))
         for remaining in (0, -1, True, float("nan"), float("inf"), "1"):
@@ -268,7 +268,7 @@ class PickerRuntimeTests(unittest.TestCase):
             self.assertEqual({"kind": "PageNotValidated"}, self.picker.open_picker(tab, bad_uid, bad_url, bad_source, 1))
         calls = []
         tab.run_js = lambda *args, **kw: calls.append((args, kw)) or {"kind": "PickerOpened"}
-        self.assertEqual({"kind": "PickerOpened"}, main._DrissionTarget(tab).open_transfer_picker(uid, url, source, .25))
+        self.assertEqual({"kind": "PickerOpened"}, main._CdpTarget(tab).open_transfer_picker(uid, url, source, .25))
         self.assertEqual([((self.picker.OPEN_TRANSFER_PICKER_SCRIPT, uid, 250, url, source), {"timeout": .25})], calls)
         def raises(*_args, **_kwargs):
             raise RuntimeError("private transport")
@@ -304,7 +304,7 @@ class PickerRuntimeTests(unittest.TestCase):
             def get_tab(inner, target_id):
                 self.assertEqual(payload()["targetId"], target_id)
                 return Tab()
-        with patch.dict(sys.modules, {"DrissionPage": SimpleNamespace(Chromium=Browser, ChromiumOptions=Options)}):
+        with patch.dict(sys.modules, {"cdp_client": SimpleNamespace(CdpBrowser=Browser, CdpOptions=Options)}):
             self.assertEqual({"kind": "PickerOpened"}, main.open_transfer_picker(payload()))
         self.assertEqual([("address", "127.0.0.1:9222"), ("existing", True)], calls[:2])
         self.assertEqual(2, sum(c[0] == "script" for c in calls))
@@ -337,7 +337,7 @@ class PickerRuntimeTests(unittest.TestCase):
                             return b
                         def budget(timeout, _monotonic, is_cancelled):
                             return real_budget(timeout, lambda: b.now, is_cancelled)
-                        with patch.dict(sys.modules, {"DrissionPage": SimpleNamespace(Chromium=browser, ChromiumOptions=Options)}), \
+                        with patch.dict(sys.modules, {"cdp_client": SimpleNamespace(CdpBrowser=browser, CdpOptions=Options)}), \
                                 patch.object(self.picker, "OperationBudget", side_effect=budget):
                             self.assertEqual({"kind": stop}, main.open_transfer_picker(payload(), is_cancelled=lambda: b.cancelled))
                         self.assertEqual(trigger, calls[-1])

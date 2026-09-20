@@ -331,7 +331,7 @@ class TransferSubmissionRuntimeTests(unittest.TestCase):
                     return {"executionContextId": 71}
                 return {"result": {"type": "object", "value": {
                     "kind": "ClickAttempted", "dispatchState": "ClickDispatched"}}}
-        result = main._DrissionTarget(Tab()).submit_transfer_once(body("SubmitTransferOnce"), 1)
+        result = main._CdpTarget(Tab()).submit_transfer_once(body("SubmitTransferOnce"), 1)
         self.assertEqual({"kind": "ClickAttempted", "dispatchState": "ClickDispatched"}, result)
         self.assertEqual(["Page.getFrameTree", "Page.createIsolatedWorld", "Runtime.callFunctionOn"],
                          [item[0] for item in calls])
@@ -354,14 +354,14 @@ class TransferSubmissionRuntimeTests(unittest.TestCase):
             def run_cdp(self, *_args, **_kwargs):
                 wrong_calls.append(True); raise RuntimeError("must not create a world")
         self.assertEqual({"kind": "PageNotValidated", "dispatchState": "KnownNotDispatched"},
-                         main._DrissionTarget(WrongTarget()).submit_transfer_once(
+                         main._CdpTarget(WrongTarget()).submit_transfer_once(
                              body("SubmitTransferOnce"), 1))
         self.assertEqual([], wrong_calls)
         class SetupFails:
             tab_id = context()["targetId"]
             def run_cdp(self, *_args, **_kwargs): raise RuntimeError("private")
         self.assertEqual({"kind": "PageNotValidated", "dispatchState": "KnownNotDispatched"},
-                         main._DrissionTarget(SetupFails()).submit_transfer_once(
+                         main._CdpTarget(SetupFails()).submit_transfer_once(
                              body("SubmitTransferOnce"), 1))
         class RuntimeFails:
             tab_id = context()["targetId"]
@@ -371,7 +371,7 @@ class TransferSubmissionRuntimeTests(unittest.TestCase):
                 if command == "Page.createIsolatedWorld": return {"executionContextId": 1}
                 raise RuntimeError("private")
         self.assertEqual({"kind": "BrowserUnavailable", "dispatchState": "DispatchOutcomeUnknown"},
-                         main._DrissionTarget(RuntimeFails()).submit_transfer_once(
+                         main._CdpTarget(RuntimeFails()).submit_transfer_once(
                              body("SubmitTransferOnce"), 1))
 
 

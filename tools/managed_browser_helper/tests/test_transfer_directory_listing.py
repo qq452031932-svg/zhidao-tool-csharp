@@ -199,7 +199,7 @@ class DirectoryRuntimeTests(unittest.TestCase):
                         def existing_only(inner, value): self.assertIs(True, value); called("existing"); return inner
                     def browser(_): called("browser"); return b
                     def budget(timeout, _monotonic, cancelled): return real_budget(timeout, lambda:b.now, cancelled)
-                    with patch.dict(sys.modules, {"DrissionPage": SimpleNamespace(Chromium=browser, ChromiumOptions=Options)}), patch.object(self.directory, "OperationBudget", side_effect=budget):
+                    with patch.dict(sys.modules, {"cdp_client": SimpleNamespace(CdpBrowser=browser, CdpOptions=Options)}), patch.object(self.directory, "OperationBudget", side_effect=budget):
                         self.assertEqual({"kind":stop}, main.read_transfer_directory(payload(), is_cancelled=lambda:b.cancelled))
                     self.assertEqual(trigger, calls[-1]); self.assertEqual([], b.calls)
 
@@ -220,7 +220,7 @@ class DirectoryRuntimeTests(unittest.TestCase):
             id = payload()["browserId"]; tab_ids = [payload()["targetId"]]
             def __init__(inner, _): pass
             def get_tab(inner, target_id): self.assertEqual(tab.tab_id, target_id); return tab
-        with patch.dict(sys.modules, {"DrissionPage": SimpleNamespace(Chromium=Browser, ChromiumOptions=Options)}):
+        with patch.dict(sys.modules, {"cdp_client": SimpleNamespace(CdpBrowser=Browser, CdpOptions=Options)}):
             self.assertEqual(observed(), main.read_transfer_directory(payload()))
         self.assertEqual([("address", "127.0.0.1:9222"), ("existing", True), ("script",)], calls)
 
@@ -250,7 +250,7 @@ class DirectoryRuntimeTests(unittest.TestCase):
                 input=json.dumps({"script":script,"probe":{"uid":uid,"budget":milliseconds,"expectedSourceUrl":expected_source_url,"href":"https://pan.baidu.com/s/WRONG"}}),
                 capture_output=True,text=True,encoding="utf-8",timeout=20)
             self.assertEqual(0,result.returncode,result.stderr); return json.loads(result.stdout)
-        b.observe_directory_listing = main._DrissionTarget(SimpleNamespace(run_js=run_js)).observe_directory_listing
+        b.observe_directory_listing = main._CdpTarget(SimpleNamespace(run_js=run_js)).observe_directory_listing
         self.assertEqual({"kind":"PageNotValidated"},self.read())
         self.assertEqual(payload()["sourceUri"],b.url)
 
