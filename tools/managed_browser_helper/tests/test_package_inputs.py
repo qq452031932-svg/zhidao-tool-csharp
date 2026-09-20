@@ -24,7 +24,7 @@ class PackageInputTests(unittest.TestCase):
         "SubmitShareOnce", "ObserveShareSubmissionOutcome", "SubmitExtractionCode",
     )
     EXPECTED_HELPER_SOURCE_FILES = (
-        "main.py", "protocol.py", "identity_query.py", "transfer_source.py",
+        "main.py", "protocol.py", "cdp_client.py", "identity_query.py", "transfer_source.py",
         "transfer_source_listing.py", "transfer_directory_listing.py",
         "transfer_directory_mutation.py", "transfer_picker.py",
         "transfer_target_baseline.py", "transfer_submission.py",
@@ -42,6 +42,7 @@ class PackageInputTests(unittest.TestCase):
             manifest_bytes_mutator=None):
         contents = {
             "THIRD_PARTY_NOTICES.txt": b"test notices\n",
+            "cdp_client.py": b"class CdpBrowser:\n    pass\n",
             "identity_query.py": b"def observe_identity():\n    return None\n",
             "main.py": b"import protocol\n",
             "protocol.py": b"PROTOCOL_VERSION = 3\n",

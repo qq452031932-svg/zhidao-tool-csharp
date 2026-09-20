@@ -26,6 +26,7 @@ $manifestName = 'helper-manifest.json'
 $helperSourceNames = @(
     'main.py',
     'protocol.py',
+    'cdp_client.py',
     'identity_query.py',
     'transfer_source.py',
     'transfer_source_listing.py',

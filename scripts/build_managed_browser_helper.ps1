@@ -288,7 +288,7 @@ foreach ($line in [IO.File]::ReadAllLines($requirementsPath)) {
     }
     $requirements += [pscustomobject]@{ Name = $Matches[1]; Version = $Matches[2]; Hash = $Matches[3] }
 }
-if ($requirements.Count -ne 18) { throw 'requirements.lock must contain exactly 18 pinned hashed distributions.' }
+if ($requirements.Count -ne 6) { throw 'requirements.lock must contain exactly 6 pinned hashed distributions.' }
 
 $pythonArchive = Get-VerifiedDownload $pythonArchiveUri (Join-Path $cachePath $pythonArchiveName) $pythonArchiveSha256
 $wheels = @()
@@ -325,7 +325,7 @@ try {
         finally { $wheelStream.Dispose() }
     }
 
-    foreach ($name in @('main.py', 'protocol.py', 'identity_query.py', 'transfer_source.py', 'transfer_source_listing.py', 'transfer_directory_listing.py', 'transfer_directory_mutation.py', 'transfer_picker.py', 'transfer_target_baseline.py', 'transfer_submission.py', 'share_submission.py', 'session_operations.py', 'requirements.lock')) {
+    foreach ($name in @('main.py', 'protocol.py', 'cdp_client.py', 'identity_query.py', 'transfer_source.py', 'transfer_source_listing.py', 'transfer_directory_listing.py', 'transfer_directory_mutation.py', 'transfer_picker.py', 'transfer_target_baseline.py', 'transfer_submission.py', 'share_submission.py', 'session_operations.py', 'requirements.lock')) {
         [IO.File]::Copy((Join-Path $helperSource $name), (Join-Path $staging $name), $false)
     }
 
@@ -452,13 +452,21 @@ try {
     $checkedInManifestBytes = [IO.File]::ReadAllBytes($embeddedManifestPath)
     if (-not [Linq.Enumerable]::SequenceEqual(
             [byte[]]$generatedManifestBytes, [byte[]]$checkedInManifestBytes)) {
-        throw 'The generated manifest differs from the checked-in manifest.'
+        $diagnosticPath = "$outputPath.generated"
+        [IO.Directory]::CreateDirectory($diagnosticPath) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $diagnosticPath 'helper-manifest.json'),
+            $manifestJson, $utf8NoBom)
+        throw "The generated manifest differs from the checked-in manifest. This build's manifest was saved to $diagnosticPath for review; copy it over the checked-in file only after confirming the pinned inputs changed on purpose."
     }
     $generatedNoticeBytes = $utf8NoBom.GetBytes($packagedNotice)
     $checkedInNoticeBytes = [IO.File]::ReadAllBytes($noticeSourcePath)
     if (-not [Linq.Enumerable]::SequenceEqual(
             [byte[]]$generatedNoticeBytes, [byte[]]$checkedInNoticeBytes)) {
-        throw 'The generated notice differs from the checked-in notice.'
+        $diagnosticPath = "$outputPath.generated"
+        [IO.Directory]::CreateDirectory($diagnosticPath) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $diagnosticPath 'THIRD_PARTY_NOTICES.txt'),
+            $packagedNotice, $utf8NoBom)
+        throw "The generated notice differs from the checked-in notice. This build's notice was saved to $diagnosticPath for review; copy it over the checked-in file only after confirming the pinned inputs changed on purpose."
     }
     [IO.Directory]::Move($staging, $outputPath)
     $staging = $null
