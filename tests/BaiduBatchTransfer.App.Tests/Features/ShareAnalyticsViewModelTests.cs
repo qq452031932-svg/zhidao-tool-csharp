@@ -460,7 +460,7 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.Contains("Text=\"{TemplateBinding Tag}\"", view, StringComparison.Ordinal);
         Assert.Contains("Value=\"↑\"", view, StringComparison.Ordinal);
         Assert.Contains("Value=\"↓\"", view, StringComparison.Ordinal);
-        Assert.DoesNotContain("Tag=\"{Binding DataContext.SharedAtSortGlyph", view, StringComparison.Ordinal);
+        Assert.DoesNotContain("Tag=\"{Binding Data.SharedAtSortGlyph", view, StringComparison.Ordinal);
         Assert.DoesNotContain("AutomationProperties.Name=\"分享时间\"", view, StringComparison.Ordinal);
         Assert.Contains("AutomationProperties.Name=\"历史累计\"", view, StringComparison.Ordinal);
     }
@@ -474,7 +474,8 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.Contains("x:Key=\"ShareAnalyticsSortedCellBrush\" Color=\"#FFF9E3\"", view, StringComparison.Ordinal);
         Assert.Contains("x:Key=\"ShareAnalyticsSortCellStyle\"", view, StringComparison.Ordinal);
         Assert.Equal(7, view.Split("<DataGridTemplateColumn.CellStyle>", StringSplitOptions.None).Length - 1);
-        Assert.Equal(7, view.Split("Binding DataContext.SortColumn", StringSplitOptions.None).Length - 1);
+        // 列头不在可视树，绑定经 BindingProxy 取视图模型；契约仍是七列都带排序高亮
+        Assert.Equal(7, view.Split("Binding Data.SortColumn", StringSplitOptions.None).Length - 1);
         Assert.DoesNotContain("Value=\"{x:Static analytics:AccountShareSortColumn.SharedAt}\"", view, StringComparison.Ordinal);
         Assert.Contains("Value=\"{x:Static analytics:AccountShareSortColumn.PriorDay4}\"", view, StringComparison.Ordinal);
         Assert.Contains("IsReadOnly=\"True\"", view, StringComparison.Ordinal);

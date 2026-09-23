@@ -139,7 +139,12 @@ public sealed class ShareAnalyticsViewStructureTests
                     new XElement(Presentation + "ResourceDictionary.MergedDictionaries",
                         new XElement(Presentation + "ResourceDictionary", new XAttribute("Source",
                             "/知道综合工具;component/Styles/SuperPanTheme.xaml"))), existingResources));
-                var view = Assert.IsType<UserControl>(XamlReader.Parse(document.ToString()));
+                // XamlReader 会到调用方（测试）程序集里找 XAML 引用的自定义类型，
+                // 所以补上它的归属；与上面硬编码资源字典路径同理。
+                var markup = document.ToString().Replace(
+                    "clr-namespace:BaiduBatchTransfer.App.Features.Common",
+                    "clr-namespace:BaiduBatchTransfer.App.Features.Common;assembly=知道综合工具");
+                var view = Assert.IsType<UserControl>(XamlReader.Parse(markup));
                 view.FontFamily = new System.Windows.Media.FontFamily("Microsoft YaHei UI");
                 view.FontSize = 14;
                 view.DataContext = viewModel;

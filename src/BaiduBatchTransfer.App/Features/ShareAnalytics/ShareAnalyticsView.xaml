@@ -2,8 +2,11 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:domain="clr-namespace:BaiduBatchTransfer.Core.Domain;assembly=BaiduBatchTransfer.Core"
-             xmlns:analytics="clr-namespace:BaiduBatchTransfer.Application.ShareAnalytics;assembly=BaiduBatchTransfer.Application">
+             xmlns:analytics="clr-namespace:BaiduBatchTransfer.Application.ShareAnalytics;assembly=BaiduBatchTransfer.Application"
+             xmlns:common="clr-namespace:BaiduBatchTransfer.App.Features.Common">
     <UserControl.Resources>
+        <!-- 列头不在可视树上，RelativeSource 找不到 DataGrid，绑定会静默失败；经此代理取视图模型 -->
+        <common:BindingProxy x:Key="AnalyticsVm" Data="{Binding}" />
         <SolidColorBrush x:Key="ShareAnalyticsSortedHeaderBrush" Color="#FFF3C4" />
         <SolidColorBrush x:Key="ShareAnalyticsSortedCellBrush" Color="#FFF9E3" />
 
@@ -240,14 +243,14 @@
                     <DataGridTemplateColumn Width="44">
                         <DataGridTemplateColumn.Header>
                             <Button AutomationProperties.Name="选择当前结果"
-                                    Command="{Binding DataContext.ToggleHeaderSelectionCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    Command="{Binding Data.ToggleHeaderSelectionCommand, Source={StaticResource AnalyticsVm}}"
                                     HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
                                     HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                                     Background="Transparent" BorderBrush="Transparent" BorderThickness="0" Padding="0">
                                 <CheckBox AutomationProperties.Name="选择"
                                           IsHitTestVisible="False" Focusable="False"
                                           IsThreeState="True"
-                                          IsChecked="{Binding DataContext.HeaderSelectionState, RelativeSource={RelativeSource AncestorType=DataGrid}, Mode=OneWay}" />
+                                          IsChecked="{Binding Data.HeaderSelectionState, Source={StaticResource AnalyticsVm}, Mode=OneWay}" />
                             </Button>
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate>
@@ -274,7 +277,7 @@
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding DataContext.SortColumn, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    <DataTrigger Binding="{Binding Data.SortColumn, Source={StaticResource AnalyticsVm}}"
                                                  Value="{x:Static analytics:AccountShareSortColumn.HistoricalTotal}">
                                         <Setter Property="Background" Value="{StaticResource ShareAnalyticsSortedCellBrush}" />
                                     </DataTrigger>
@@ -285,8 +288,8 @@
                             <Button Content="历史累计"
                                     AutomationProperties.Name="历史累计"
                                     Style="{StaticResource ShareAnalyticsSortButtonStyle}"
-                                    Tag="{Binding DataContext.HistoricalTotalSortGlyph, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    Command="{Binding DataContext.SortCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    Tag="{Binding Data.HistoricalTotalSortGlyph, Source={StaticResource AnalyticsVm}}"
+                                    Command="{Binding Data.SortCommand, Source={StaticResource AnalyticsVm}}"
                                     CommandParameter="{x:Static analytics:AccountShareSortColumn.HistoricalTotal}" />
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding HistoricalTotalText}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
@@ -295,7 +298,7 @@
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding DataContext.SortColumn, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    <DataTrigger Binding="{Binding Data.SortColumn, Source={StaticResource AnalyticsVm}}"
                                                  Value="{x:Static analytics:AccountShareSortColumn.NewValue}">
                                         <Setter Property="Background" Value="{StaticResource ShareAnalyticsSortedCellBrush}" />
                                     </DataTrigger>
@@ -306,8 +309,8 @@
                             <Button Content="新增"
                                     AutomationProperties.Name="新增"
                                     Style="{StaticResource ShareAnalyticsSortButtonStyle}"
-                                    Tag="{Binding DataContext.NewValueSortGlyph, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    Command="{Binding DataContext.SortCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    Tag="{Binding Data.NewValueSortGlyph, Source={StaticResource AnalyticsVm}}"
+                                    Command="{Binding Data.SortCommand, Source={StaticResource AnalyticsVm}}"
                                     CommandParameter="{x:Static analytics:AccountShareSortColumn.NewValue}" />
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding NewText}" Foreground="{Binding NewForeground}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
@@ -316,7 +319,7 @@
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding DataContext.SortColumn, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    <DataTrigger Binding="{Binding Data.SortColumn, Source={StaticResource AnalyticsVm}}"
                                                  Value="{x:Static analytics:AccountShareSortColumn.Today}">
                                         <Setter Property="Background" Value="{StaticResource ShareAnalyticsSortedCellBrush}" />
                                     </DataTrigger>
@@ -327,8 +330,8 @@
                             <Button Content="今天"
                                     AutomationProperties.Name="今天"
                                     Style="{StaticResource ShareAnalyticsSortButtonStyle}"
-                                    Tag="{Binding DataContext.TodaySortGlyph, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    Command="{Binding DataContext.SortCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    Tag="{Binding Data.TodaySortGlyph, Source={StaticResource AnalyticsVm}}"
+                                    Command="{Binding Data.SortCommand, Source={StaticResource AnalyticsVm}}"
                                     CommandParameter="{x:Static analytics:AccountShareSortColumn.Today}" />
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding TodayText}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
@@ -337,7 +340,7 @@
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding DataContext.SortColumn, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    <DataTrigger Binding="{Binding Data.SortColumn, Source={StaticResource AnalyticsVm}}"
                                                  Value="{x:Static analytics:AccountShareSortColumn.Yesterday}">
                                         <Setter Property="Background" Value="{StaticResource ShareAnalyticsSortedCellBrush}" />
                                     </DataTrigger>
@@ -348,8 +351,8 @@
                             <Button Content="昨天"
                                     AutomationProperties.Name="昨天"
                                     Style="{StaticResource ShareAnalyticsSortButtonStyle}"
-                                    Tag="{Binding DataContext.YesterdaySortGlyph, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    Command="{Binding DataContext.SortCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    Tag="{Binding Data.YesterdaySortGlyph, Source={StaticResource AnalyticsVm}}"
+                                    Command="{Binding Data.SortCommand, Source={StaticResource AnalyticsVm}}"
                                     CommandParameter="{x:Static analytics:AccountShareSortColumn.Yesterday}" />
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding YesterdayText}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
@@ -358,7 +361,7 @@
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding DataContext.SortColumn, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    <DataTrigger Binding="{Binding Data.SortColumn, Source={StaticResource AnalyticsVm}}"
                                                  Value="{x:Static analytics:AccountShareSortColumn.PriorDay2}">
                                         <Setter Property="Background" Value="{StaticResource ShareAnalyticsSortedCellBrush}" />
                                     </DataTrigger>
@@ -366,11 +369,11 @@
                             </Style>
                         </DataGridTemplateColumn.CellStyle>
                         <DataGridTemplateColumn.Header>
-                            <Button Content="{Binding DataContext.PriorDay2Header, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    AutomationProperties.Name="{Binding DataContext.PriorDay2Header, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                            <Button Content="{Binding Data.PriorDay2Header, Source={StaticResource AnalyticsVm}}"
+                                    AutomationProperties.Name="{Binding Data.PriorDay2Header, Source={StaticResource AnalyticsVm}}"
                                     Style="{StaticResource ShareAnalyticsSortButtonStyle}"
-                                    Tag="{Binding DataContext.PriorDay2SortGlyph, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    Command="{Binding DataContext.SortCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    Tag="{Binding Data.PriorDay2SortGlyph, Source={StaticResource AnalyticsVm}}"
+                                    Command="{Binding Data.SortCommand, Source={StaticResource AnalyticsVm}}"
                                     CommandParameter="{x:Static analytics:AccountShareSortColumn.PriorDay2}" />
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PriorDay2Text}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
@@ -379,7 +382,7 @@
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding DataContext.SortColumn, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    <DataTrigger Binding="{Binding Data.SortColumn, Source={StaticResource AnalyticsVm}}"
                                                  Value="{x:Static analytics:AccountShareSortColumn.PriorDay3}">
                                         <Setter Property="Background" Value="{StaticResource ShareAnalyticsSortedCellBrush}" />
                                     </DataTrigger>
@@ -387,11 +390,11 @@
                             </Style>
                         </DataGridTemplateColumn.CellStyle>
                         <DataGridTemplateColumn.Header>
-                            <Button Content="{Binding DataContext.PriorDay3Header, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    AutomationProperties.Name="{Binding DataContext.PriorDay3Header, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                            <Button Content="{Binding Data.PriorDay3Header, Source={StaticResource AnalyticsVm}}"
+                                    AutomationProperties.Name="{Binding Data.PriorDay3Header, Source={StaticResource AnalyticsVm}}"
                                     Style="{StaticResource ShareAnalyticsSortButtonStyle}"
-                                    Tag="{Binding DataContext.PriorDay3SortGlyph, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    Command="{Binding DataContext.SortCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    Tag="{Binding Data.PriorDay3SortGlyph, Source={StaticResource AnalyticsVm}}"
+                                    Command="{Binding Data.SortCommand, Source={StaticResource AnalyticsVm}}"
                                     CommandParameter="{x:Static analytics:AccountShareSortColumn.PriorDay3}" />
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PriorDay3Text}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
@@ -400,7 +403,7 @@
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding DataContext.SortColumn, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    <DataTrigger Binding="{Binding Data.SortColumn, Source={StaticResource AnalyticsVm}}"
                                                  Value="{x:Static analytics:AccountShareSortColumn.PriorDay4}">
                                         <Setter Property="Background" Value="{StaticResource ShareAnalyticsSortedCellBrush}" />
                                     </DataTrigger>
@@ -408,11 +411,11 @@
                             </Style>
                         </DataGridTemplateColumn.CellStyle>
                         <DataGridTemplateColumn.Header>
-                            <Button Content="{Binding DataContext.PriorDay4Header, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    AutomationProperties.Name="{Binding DataContext.PriorDay4Header, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                            <Button Content="{Binding Data.PriorDay4Header, Source={StaticResource AnalyticsVm}}"
+                                    AutomationProperties.Name="{Binding Data.PriorDay4Header, Source={StaticResource AnalyticsVm}}"
                                     Style="{StaticResource ShareAnalyticsSortButtonStyle}"
-                                    Tag="{Binding DataContext.PriorDay4SortGlyph, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    Command="{Binding DataContext.SortCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    Tag="{Binding Data.PriorDay4SortGlyph, Source={StaticResource AnalyticsVm}}"
+                                    Command="{Binding Data.SortCommand, Source={StaticResource AnalyticsVm}}"
                                     CommandParameter="{x:Static analytics:AccountShareSortColumn.PriorDay4}" />
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PriorDay4Text}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
@@ -424,7 +427,7 @@
                                            HorizontalAlignment="Center" VerticalAlignment="Center" />
                             </Grid>
                         </DataGridTemplateColumn.Header>
-                        <DataGridTemplateColumn.CellTemplate><DataTemplate><Button Content="打开" Command="{Binding DataContext.OpenCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}" CommandParameter="{Binding}" Padding="8,2" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
+                        <DataGridTemplateColumn.CellTemplate><DataTemplate><Button Content="打开" Command="{Binding Data.OpenCommand, Source={StaticResource AnalyticsVm}}" CommandParameter="{Binding}" Padding="8,2" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
                     <DataGridTemplateColumn Width="260">
                         <DataGridTemplateColumn.Header>
