@@ -8,6 +8,7 @@ stdout 只承载协议帧；任何诊断输出一律走 stderr，否则会污染
     stop    请求停止；助手会在下一个可中断点收尾并发回 done
     resume  回答一次 ask；continue 为 false 等同于停止
     ping    连通性探测，助手回 pong
+    read_keywords  读取一个关键词文件并回传；编码交给助手判别
 
 事件（助手 -> 宿主）：
     ready     启动完成，可以接收命令
@@ -20,6 +21,7 @@ stdout 只承载协议帧；任何诊断输出一律走 stderr，否则会污染
     done      本次采集结束
     error     本次命令失败，助手仍然存活
     pong      ping 的回应
+    keywords  read_keywords 的结果，含去重后的关键词与原始行数
 """
 
 from __future__ import annotations
@@ -28,13 +30,14 @@ import json
 
 PROTOCOL_VERSION = 1
 
-COMMANDS = ("start", "stop", "resume", "ping")
+COMMANDS = ("start", "stop", "resume", "ping", "read_keywords")
 EVENTS = ("ready", "started", "item", "progress", "status", "log",
-          "ask", "done", "error", "pong")
+          "ask", "done", "error", "pong", "keywords")
 
 MODES = ("precise", "fuzzy")
 MAX_FRAME_BYTES = 1_048_576
 MAX_KEYWORDS = 10_000
+MAX_KEYWORD_FILE_BYTES = 8 * 1024 * 1024
 
 
 class ProtocolError(Exception):
@@ -118,3 +121,47 @@ def parse_start(frame: dict) -> dict:
         "resume": bool(frame.get("resume", False)),
         "checkpoint_path": frame.get("checkpoint_path") or None,
     }
+
+
+def parse_read_keywords(frame: dict) -> str:
+    """校验 read_keywords 命令，返回要读取的路径。"""
+    path = str(frame.get("path") or "").strip()
+    if not path:
+        raise ProtocolError("read_keywords 需要 path")
+    return path
+
+
+def read_keyword_file(path) -> dict:
+    """读取关键词文件，返回去重后的关键词与原始行数。
+
+    编码判别与 lxds 的采集入口一致：先按 UTF-8（容忍 BOM），失败再按 GB18030。
+    中文 Windows 上用记事本另存的旧文件多是后者，直接按 UTF-8 读会炸。
+    """
+    from pathlib import Path
+
+    target = Path(path)
+    if not target.is_file():
+        raise ProtocolError("找不到文件：%s" % path)
+    size = target.stat().st_size
+    if size > MAX_KEYWORD_FILE_BYTES:
+        raise ProtocolError("文件超过 %d MB" % (MAX_KEYWORD_FILE_BYTES // (1024 * 1024)))
+
+    raw = target.read_bytes()
+    try:
+        content = raw.decode("utf-8-sig")
+        encoding = "utf-8"
+    except UnicodeDecodeError:
+        try:
+            content = raw.decode("gb18030")
+            encoding = "gb18030"
+        except UnicodeDecodeError as error:
+            raise ProtocolError("无法识别文件编码，请另存为 UTF-8 后重试") from error
+
+    lines = content.splitlines()
+    words = list(dict.fromkeys(
+        word for word in (line.strip() for line in lines) if word))
+    truncated = len(words) > MAX_KEYWORDS
+    if truncated:
+        words = words[:MAX_KEYWORDS]
+    return {"items": words, "lines": len(lines), "encoding": encoding,
+            "truncated": truncated}

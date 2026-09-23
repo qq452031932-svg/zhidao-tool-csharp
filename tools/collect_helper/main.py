@@ -182,6 +182,9 @@ def main(argv=None):
                 session.stop()
             elif command == "resume":
                 session.answer(frame.get("continue", False))
+            elif command == "read_keywords":
+                result = protocol.read_keyword_file(protocol.parse_read_keywords(frame))
+                channel.send("keywords", **result)
         except protocol.ProtocolError as error:
             channel.send("error", message=str(error))
         except Exception as error:  # noqa: BLE001 - 主循环必须活着

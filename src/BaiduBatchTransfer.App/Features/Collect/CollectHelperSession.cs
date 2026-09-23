@@ -78,6 +78,24 @@ public static class CollectHelperLocator
     }
 }
 
+/// <summary>关键词文件选择框。只挑文件，不读内容——编码判别交给助手。</summary>
+public sealed class WpfKeywordFileDialog : IKeywordFileDialog
+{
+    public string? Show()
+    {
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "选择关键词文件",
+            Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false,
+        };
+        var owner = System.Windows.Application.Current?.MainWindow;
+        var accepted = owner is null ? dialog.ShowDialog() : dialog.ShowDialog(owner);
+        return accepted == true ? dialog.FileName : null;
+    }
+}
+
 /// <summary>按需启动一个采集助手，并在页面存活期间复用它。</summary>
 public sealed class CollectHelperSession : ICollectHelperSession
 {

@@ -18,6 +18,10 @@ public sealed record CollectProgress(int Found, int Target);
 /// <summary>撞上风控，等待界面答复；在答复前采集侧是阻塞的。</summary>
 public sealed record CollectRiskPrompt(string Reason);
 
+/// <summary>从关键词文件读出的内容。Encoding 说明助手是按哪种编码解的。</summary>
+public sealed record CollectedKeywords(
+    IReadOnlyList<string> Items, int Lines, string Encoding, bool Truncated);
+
 /// <summary>一次采集的结束。Stopped 表示是被要求停止的，而非自然跑完。</summary>
 public sealed record CollectOutcome(int Found, bool Stopped, IReadOnlyDictionary<string, int> Stats);
 
@@ -91,6 +95,9 @@ public sealed class CollectHelperClient : IAsyncDisposable
 
     /// <summary>助手意外退出，信道已不可用。</summary>
     public event Action<string>? ChannelBroken;
+
+    /// <summary>关键词文件读取完成。</summary>
+    public event Action<CollectedKeywords>? KeywordsLoaded;
 
     internal static CollectHelperClient Create(ICollectHelperProcess process) => new(process);
 
@@ -184,6 +191,17 @@ public sealed class CollectHelperClient : IAsyncDisposable
             ["continue"] = shouldContinue,
         }, cancellationToken);
 
+    /// <summary>请助手读取一个关键词文件；编码判别由助手负责，结果经 KeywordsLoaded 回来。</summary>
+    public Task ReadKeywordsAsync(string path, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        return SendAsync(new Dictionary<string, object?>
+        {
+            ["cmd"] = "read_keywords",
+            ["path"] = path,
+        }, cancellationToken);
+    }
+
     private static List<Dictionary<string, string>> BuildAccounts(IReadOnlyList<CollectAccount> accounts)
     {
         var payload = new List<Dictionary<string, string>>(accounts.Count);
@@ -273,6 +291,11 @@ public sealed class CollectHelperClient : IAsyncDisposable
             case "ask":
                 RiskEncountered?.Invoke(new CollectRiskPrompt(Text(frame, "reason")));
                 break;
+            case "keywords":
+                KeywordsLoaded?.Invoke(new CollectedKeywords(
+                    Strings(frame, "items"), Number(frame, "lines"),
+                    Text(frame, "encoding"), Flag(frame, "truncated")));
+                break;
             case "done":
                 Completed?.Invoke(new CollectOutcome(Number(frame, "found"), Flag(frame, "stopped"), Stats(frame)));
                 break;
@@ -301,6 +324,17 @@ public sealed class CollectHelperClient : IAsyncDisposable
 
     private static bool Flag(JsonElement frame, string name) =>
         frame.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
+
+    private static IReadOnlyList<string> Strings(JsonElement frame, string name)
+    {
+        if (!frame.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Array)
+            return [];
+        var items = new List<string>(value.GetArrayLength());
+        foreach (var element in value.EnumerateArray())
+            if (element.ValueKind == JsonValueKind.String && element.GetString() is { Length: > 0 } text)
+                items.Add(text);
+        return items;
+    }
 
     private static IReadOnlyDictionary<string, int> Stats(JsonElement frame)
     {

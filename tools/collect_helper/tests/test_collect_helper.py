@@ -5,6 +5,7 @@
 """
 
 import json
+import pathlib
 import subprocess
 import sys
 import threading
@@ -133,6 +134,57 @@ class ProtocolTests(unittest.TestCase):
             "accounts": [{"cookie": "BDUSS=x"}]})
         self.assertEqual(["甲", "乙"], options["keywords"])
         self.assertEqual("账号1", options["accounts"][0]["name"])
+
+
+class KeywordFileTests(unittest.TestCase):
+    """关键词文件的读取契约。中文 txt 的编码是这里最容易翻车的地方。"""
+
+    def _write(self, payload, encoding):
+        import tempfile
+        handle = tempfile.NamedTemporaryFile(prefix="kw-", suffix=".txt", delete=False)
+        handle.write(payload.encode(encoding) if isinstance(payload, str) else payload)
+        handle.close()
+        self.addCleanup(lambda: pathlib.Path(handle.name).unlink(missing_ok=True))
+        return handle.name
+
+    def test_reads_utf8_with_and_without_bom(self):
+        for encoding in ("utf-8", "utf-8-sig"):
+            path = self._write("云边有个小卖部\n长安的荔枝\n", encoding)
+            result = protocol.read_keyword_file(path)
+            self.assertEqual(["云边有个小卖部", "长安的荔枝"], result["items"])
+            self.assertEqual("utf-8", result["encoding"])
+
+    def test_reads_legacy_gb18030_file(self):
+        path = self._write("雪中悍刀行\n三体\n", "gb18030")
+        result = protocol.read_keyword_file(path)
+        self.assertEqual(["雪中悍刀行", "三体"], result["items"])
+        self.assertEqual("gb18030", result["encoding"])
+
+    def test_trims_blank_lines_and_deduplicates(self):
+        path = self._write("  甲  \n\n乙\n甲\n   \n", "utf-8")
+        result = protocol.read_keyword_file(path)
+        self.assertEqual(["甲", "乙"], result["items"])
+        self.assertEqual(5, result["lines"])
+
+    def test_caps_the_keyword_count(self):
+        path = self._write("\n".join("词%d" % i for i in range(protocol.MAX_KEYWORDS + 50)), "utf-8")
+        result = protocol.read_keyword_file(path)
+        self.assertEqual(protocol.MAX_KEYWORDS, len(result["items"]))
+        self.assertTrue(result["truncated"])
+
+    def test_rejects_missing_file(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.read_keyword_file("这个文件不存在.txt")
+
+    def test_rejects_oversized_file(self):
+        path = self._write(b"x" * (protocol.MAX_KEYWORD_FILE_BYTES + 1), None)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.read_keyword_file(path)
+
+    def test_command_requires_a_path(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.parse_read_keywords({"cmd": "read_keywords"})
+        self.assertEqual("a.txt", protocol.parse_read_keywords({"cmd": "read_keywords", "path": "a.txt"}))
 
 
 class SessionTests(unittest.TestCase):

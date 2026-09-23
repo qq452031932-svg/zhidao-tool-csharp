@@ -232,6 +232,123 @@ public sealed class CollectViewModelTests
         Assert.True(session.Disposed);
     }
 
+    [Fact]
+    public async Task ImportedKeywordsAreAppendedNotOverwritten()
+    {
+        var process = new FakeCollectHelperProcess();
+        var client = CollectHelperClient.Create(process);
+        process.Emit(new { ev = "ready" });
+        await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
+        var model = new CollectViewModel(new FakeCollectHelperSession(client), action => action(),
+            new StubKeywordFileDialog(@"C:\words.txt"));
+
+        model.KeywordText = "手填的一个";
+        await model.ImportKeywordsCommand.ExecuteAsync(null);
+
+        var command = JsonDocument.Parse(process.WrittenCommands().Last()).RootElement;
+        Assert.Equal("read_keywords", command.GetProperty("cmd").GetString());
+        Assert.Equal(@"C:\words.txt", command.GetProperty("path").GetString());
+
+        process.Emit(new
+        {
+            ev = "keywords",
+            items = new[] { "云边有个小卖部", "长安的荔枝" },
+            lines = 3,
+            encoding = "gb18030",
+            truncated = false,
+        });
+
+        await WaitUntil(() => model.ParseKeywords().Count == 3);
+        Assert.Equal(new[] { "手填的一个", "云边有个小卖部", "长安的荔枝" }, model.ParseKeywords());
+        Assert.Contains("gb18030", model.StatusMessage);   // 告诉用户是按什么编码读的
+    }
+
+    [Fact]
+    public async Task ImportingIntoAnEmptyBoxJustFillsIt()
+    {
+        var process = new FakeCollectHelperProcess();
+        var client = CollectHelperClient.Create(process);
+        process.Emit(new { ev = "ready" });
+        await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
+        var model = new CollectViewModel(new FakeCollectHelperSession(client), action => action(),
+            new StubKeywordFileDialog(@"C:\words.txt"));
+
+        await model.ImportKeywordsCommand.ExecuteAsync(null);
+        process.Emit(new { ev = "keywords", items = new[] { "甲", "乙" }, lines = 2, encoding = "utf-8", truncated = false });
+
+        await WaitUntil(() => model.ParseKeywords().Count == 2);
+        Assert.Equal(new[] { "甲", "乙" }, model.ParseKeywords());
+    }
+
+    [Fact]
+    public async Task CancellingTheFileDialogSendsNothing()
+    {
+        var process = new FakeCollectHelperProcess();
+        var client = CollectHelperClient.Create(process);
+        process.Emit(new { ev = "ready" });
+        await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
+        var model = new CollectViewModel(new FakeCollectHelperSession(client), action => action(),
+            new StubKeywordFileDialog(null));
+
+        await model.ImportKeywordsCommand.ExecuteAsync(null);
+
+        Assert.Empty(process.WrittenCommands());
+    }
+
+    [Fact]
+    public async Task EmptyFileIsReportedInsteadOfSilentlyDoingNothing()
+    {
+        var process = new FakeCollectHelperProcess();
+        var client = CollectHelperClient.Create(process);
+        process.Emit(new { ev = "ready" });
+        await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
+        var model = new CollectViewModel(new FakeCollectHelperSession(client), action => action(),
+            new StubKeywordFileDialog(@"C:\empty.txt"));
+
+        await model.ImportKeywordsCommand.ExecuteAsync(null);
+        process.Emit(new { ev = "keywords", items = Array.Empty<string>(), lines = 0, encoding = "utf-8", truncated = false });
+
+        await WaitUntil(() => model.StatusMessage.Contains("没有可用的关键词"));
+        Assert.Empty(model.ParseKeywords());
+    }
+
+    [Fact]
+    public async Task ImportIsUnavailableWithoutAFilePicker()
+    {
+        var (model, _, _) = await CreateAsync();
+        Assert.False(model.CanImportKeywords);
+        Assert.False(model.ImportKeywordsCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task StartingAfterImportReusesTheSameHelperConnection()
+    {
+        var process = new FakeCollectHelperProcess();
+        var client = CollectHelperClient.Create(process);
+        process.Emit(new { ev = "ready" });
+        await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
+        var session = new FakeCollectHelperSession(client);
+        var model = new CollectViewModel(session, action => action(),
+            new StubKeywordFileDialog(@"C:\words.txt"));
+
+        await model.ImportKeywordsCommand.ExecuteAsync(null);
+        process.Emit(new { ev = "keywords", items = new[] { "甲" }, lines = 1, encoding = "utf-8", truncated = false });
+        await WaitUntil(() => model.ParseKeywords().Count == 1);
+
+        model.CookieText = "BDUSS=x";
+        await model.StartCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, session.ConnectCount);   // 复用同一个助手，且事件只订阅一次
+        process.Emit(new { ev = "item", name = "甲资源", link = "l", pwd = "p", source = "s" });
+        await WaitUntil(() => model.Resources.Count == 1);
+        Assert.Single(model.Resources);          // 重复订阅会让这里变成 2 行
+    }
+
+    private sealed class StubKeywordFileDialog(string? path) : IKeywordFileDialog
+    {
+        public string? Show() => path;
+    }
+
     private static async Task WaitUntil(Func<bool> condition)
     {
         var deadline = DateTime.UtcNow + Timeout;

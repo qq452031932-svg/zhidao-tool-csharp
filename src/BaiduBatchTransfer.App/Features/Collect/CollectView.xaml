@@ -16,7 +16,7 @@
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
-                    <RowDefinition Height="110" />
+                    <RowDefinition Height="140" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
@@ -25,18 +25,43 @@
                     <ColumnDefinition Width="340" />
                 </Grid.ColumnDefinitions>
 
-                <StackPanel Grid.ColumnSpan="2">
-                    <TextBlock Text="知道采集" FontSize="18" FontWeight="SemiBold" />
-                    <TextBlock Text="按关键词在百度知道里找带网盘链接的回答，提取资源名、链接与提取码。采到的结果可直接送进批量转存。"
-                               Foreground="{StaticResource MutedBrush}" Margin="0,5,0,12" TextWrapping="Wrap" />
-                </StackPanel>
+                <TextBlock Grid.ColumnSpan="2" TextWrapping="Wrap" Margin="0,0,0,12"
+                           Foreground="{StaticResource MutedBrush}"
+                           Text="按关键词在百度知道里找带网盘链接的回答，提取资源名、链接与提取码。采到的结果可直接送进批量转存。" />
 
-                <TextBox Grid.Row="1" Text="{Binding KeywordText, UpdateSourceTrigger=PropertyChanged}"
-                         AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
-                         ToolTip="每行一个关键词，也可以用逗号分隔" />
+                <DockPanel Grid.Row="1">
+                    <DockPanel DockPanel.Dock="Top" Margin="0,0,0,4">
+                        <Button DockPanel.Dock="Right" Content="从文件导入…" Padding="10,2"
+                                Command="{Binding ImportKeywordsCommand}"
+                                Visibility="{Binding CanImportKeywords, Converter={StaticResource BoolToVisibility}}"
+                                ToolTip="选择一个 txt，每行一个关键词；UTF-8 和 GBK 都能读" />
+                        <TextBlock Text="关键词（每行一个）" VerticalAlignment="Center"
+                                   Foreground="{StaticResource MutedBrush}" />
+                    </DockPanel>
+                    <Grid>
+                        <TextBox Text="{Binding KeywordText, UpdateSourceTrigger=PropertyChanged}"
+                                 AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
+                                 ToolTip="每行一个关键词，也可以用逗号分隔" />
+                        <TextBlock IsHitTestVisible="False" Margin="6,4,0,0" Opacity="0.6"
+                                   Foreground="{StaticResource MutedBrush}"
+                                   Text="每行一个关键词，例如：&#10;云边有个小卖部&#10;长安的荔枝">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding KeywordText}" Value="">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </Grid>
+                </DockPanel>
 
                 <StackPanel Grid.Row="1" Grid.Column="1" Margin="12,0,0,0">
-                    <TextBlock Text="知道账号 Cookie" Foreground="{StaticResource MutedBrush}" />
+                    <TextBlock Text="知道账号 Cookie" Foreground="{StaticResource MutedBrush}"
+                               Height="20" VerticalAlignment="Center" Margin="0,0,0,4" />
                     <TextBox Text="{Binding CookieText, UpdateSourceTrigger=PropertyChanged}"
                              Height="52" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
                              TextWrapping="Wrap" Margin="0,4,0,0"

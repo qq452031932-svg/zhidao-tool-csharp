@@ -1124,7 +1124,8 @@ public sealed class AppShellFactory(
         // 绑定状态）。同一份信息摆三处，只会在三处不一致时让人更困惑。
         homeWorkspace = new HomeWorkspaceView(new HomeWorkspaceViewModel());
         var collectSession = new CollectHelperSession();
-        var collectViewModel = new CollectViewModel(collectSession);
+        var collectViewModel = new CollectViewModel(collectSession,
+            keywordFileDialog: new WpfKeywordFileDialog());
         var collectWorkspace = new CollectView { DataContext = collectViewModel };
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),

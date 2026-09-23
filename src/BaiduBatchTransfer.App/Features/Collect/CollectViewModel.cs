@@ -12,6 +12,12 @@ namespace BaiduBatchTransfer.App.Features.Collect;
 /// <summary>结果表格里的一行。</summary>
 public sealed record CollectedRow(int Ordinal, string Name, string Link, string Pwd, string Source);
 
+/// <summary>选择关键词文件；取消返回 null。</summary>
+public interface IKeywordFileDialog
+{
+    string? Show();
+}
+
 /// <summary>按需提供一个已就绪的助手客户端，便于测试替换。</summary>
 public interface ICollectHelperSession : IAsyncDisposable
 {
@@ -27,6 +33,7 @@ public interface ICollectHelperSession : IAsyncDisposable
 public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
 {
     private readonly ICollectHelperSession session;
+    private readonly IKeywordFileDialog? keywordFileDialog;
     private readonly Action<Action> dispatch;
     private CollectHelperClient? client;
     private CancellationTokenSource? lifetime;
@@ -42,9 +49,11 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
     private int foundCount;
     private int targetTotal;
 
-    public CollectViewModel(ICollectHelperSession session, Action<Action>? dispatch = null)
+    public CollectViewModel(ICollectHelperSession session, Action<Action>? dispatch = null,
+        IKeywordFileDialog? keywordFileDialog = null)
     {
         this.session = session ?? throw new ArgumentNullException(nameof(session));
+        this.keywordFileDialog = keywordFileDialog;
         var uiContext = SynchronizationContext.Current;
         this.dispatch = dispatch ?? (action =>
         {
@@ -56,6 +65,8 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         StopCommand = new AsyncRelayCommand(StopAsync, () => IsCollecting && !IsRiskPromptVisible);
         ContinueAfterRiskCommand = new AsyncRelayCommand(() => AnswerRiskAsync(true), () => IsRiskPromptVisible);
         AbortAfterRiskCommand = new AsyncRelayCommand(() => AnswerRiskAsync(false), () => IsRiskPromptVisible);
+        ImportKeywordsCommand = new AsyncRelayCommand(
+            ImportKeywordsAsync, () => keywordFileDialog is not null && !IsBusy && !IsCollecting);
     }
 
     /// <summary>每行一个关键词。</summary>
@@ -160,6 +171,12 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
 
     public AsyncRelayCommand AbortAfterRiskCommand { get; }
 
+    /// <summary>从 txt 批量导入关键词；编码由助手判别。</summary>
+    public AsyncRelayCommand ImportKeywordsCommand { get; }
+
+    /// <summary>是否提供了选择文件的能力（未提供时界面隐藏该按钮）。</summary>
+    public bool CanImportKeywords => keywordFileDialog is not null;
+
     internal IReadOnlyList<string> ParseKeywords() =>
         KeywordText.Split(['\n', '\r', '，', ','], StringSplitOptions.RemoveEmptyEntries)
             .Select(word => word.Trim())
@@ -191,22 +208,54 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
             TargetTotal = IsPreciseMode ? keywords.Count : Math.Max(0, TargetCount);
             StatusMessage = "正在启动采集助手…";
 
-            lifetime = new CancellationTokenSource();
-            client = await session.ConnectAsync(lifetime.Token).ConfigureAwait(true);
-            Attach(client);
+            var helper = await EnsureConnectedAsync().ConfigureAwait(true);
 
             IsCollecting = true;
             StatusMessage = "采集进行中…";
-            await client.StartCollectingAsync(new CollectRequest(
+            await helper.StartCollectingAsync(new CollectRequest(
                 IsPreciseMode ? "precise" : "fuzzy",
                 keywords,
                 [new CollectAccount("知道账号", CookieText.Trim())],
-                Count: IsPreciseMode ? 0 : Math.Max(1, TargetCount)), lifetime.Token).ConfigureAwait(true);
+                Count: IsPreciseMode ? 0 : Math.Max(1, TargetCount)),
+                lifetime?.Token ?? CancellationToken.None).ConfigureAwait(true);
         }
         catch (Exception error)
         {
             IsCollecting = false;
             StatusMessage = $"启动失败：{error.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private async Task<CollectHelperClient> EnsureConnectedAsync()
+    {
+        if (client is not null) return client;
+        lifetime ??= new CancellationTokenSource();
+        var helper = await session.ConnectAsync(lifetime.Token).ConfigureAwait(true);
+        Attach(helper);   // 只订阅一次，避免重复连接后事件被处理多遍
+        client = helper;
+        return helper;
+    }
+
+    private async Task ImportKeywordsAsync()
+    {
+        var path = keywordFileDialog?.Show();
+        if (string.IsNullOrWhiteSpace(path)) return;
+
+        IsBusy = true;
+        try
+        {
+            StatusMessage = "正在读取关键词文件…";
+            var helper = await EnsureConnectedAsync().ConfigureAwait(true);
+            await helper.ReadKeywordsAsync(path, lifetime?.Token ?? CancellationToken.None)
+                .ConfigureAwait(true);
+        }
+        catch (Exception error)
+        {
+            StatusMessage = $"读取失败：{error.Message}";
         }
         finally
         {
@@ -275,6 +324,23 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
             IsRiskPromptVisible = false;
             StatusMessage = $"采集助手已断开：{message}";
         });
+        helper.KeywordsLoaded += loaded => dispatch(() =>
+        {
+            if (loaded.Items.Count == 0)
+            {
+                StatusMessage = "文件里没有可用的关键词。";
+                return;
+            }
+
+            // 追加而不是覆盖：用户可能已经手填了几个
+            var incoming = string.Join("\n", loaded.Items);
+            KeywordText = string.IsNullOrWhiteSpace(KeywordText)
+                ? incoming
+                : KeywordText.TrimEnd() + "\n" + incoming;
+            StatusMessage = loaded.Truncated
+                ? $"已导入 {loaded.Items.Count} 个关键词（文件过大，仅取前 {loaded.Items.Count} 个）。"
+                : $"已从 {loaded.Lines} 行中导入 {loaded.Items.Count} 个关键词（{loaded.Encoding}）。";
+        });
         helper.Completed += outcome => dispatch(() =>
         {
             IsCollecting = false;
@@ -298,6 +364,7 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
     private void RefreshCommands()
     {
         StartCommand.NotifyCanExecuteChanged();
+        ImportKeywordsCommand.NotifyCanExecuteChanged();
         StopCommand.NotifyCanExecuteChanged();
         ContinueAfterRiskCommand.NotifyCanExecuteChanged();
         AbortAfterRiskCommand.NotifyCanExecuteChanged();
