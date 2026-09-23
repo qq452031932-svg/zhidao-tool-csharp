@@ -22,3 +22,4 @@ src/BaiduBatchTransfer.App/Branding/ProductIdentity.Generated.cs text eol=lf
 src/BaiduBatchTransfer.LegacyLauncher/ProductIdentity.Generated.cs text eol=lf
 services/ota_admin/internal/release/product_identity_generated.go text eol=lf
 eng/ota/production-source-overrides.sha256 text eol=lf
+tools/collect_helper/** text eol=lf
