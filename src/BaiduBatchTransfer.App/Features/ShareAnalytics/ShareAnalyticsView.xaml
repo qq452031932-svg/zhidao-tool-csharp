@@ -183,7 +183,7 @@
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <TextBox x:Name="TitleSearchInput" MinWidth="90"
-                             Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged, Delay=300}" Padding="8,5"
+                             Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged, Delay=300}"
                              AutomationProperties.Name="标题搜索" ToolTip="按标题搜索，回车立即筛选" />
                     <ComboBox Grid.Column="1" Margin="6,0,0,0" ItemsSource="{Binding StatusFilterOptions}"
                               SelectedItem="{Binding SelectedStatusOption}" DisplayMemberPath="Label" />

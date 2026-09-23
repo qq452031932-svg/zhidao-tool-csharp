@@ -214,7 +214,9 @@
 
     <Style TargetType="TextBox">
         <Setter Property="Height" Value="34" />
-        <Setter Property="Padding" Value="10,4" />
+        <!-- 模板里 Padding 既当 ScrollViewer 的 Margin、又被内容用一次，故生效两遍：
+             实测 文本内缩 = 2 × Padding + 3。取 2 得 7px，与采集页的多行框一致。 -->
+        <Setter Property="Padding" Value="2,4" />
         <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
