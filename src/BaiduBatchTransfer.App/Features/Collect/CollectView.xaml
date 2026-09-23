@@ -38,7 +38,7 @@
                     </Grid.ColumnDefinitions>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="104" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
                     <TextBlock Text="关键词（每行一个）" Margin="0,0,0,6"
@@ -46,13 +46,19 @@
 
                     <!-- 空白时给出示例，避免一个不知道填什么的空框 -->
                     <Grid Grid.Row="1">
-                        <TextBox Text="{Binding KeywordText, UpdateSourceTrigger=PropertyChanged}"
+                        <TextBox x:Name="KeywordBox"
+                                 Text="{Binding KeywordText, UpdateSourceTrigger=PropertyChanged}"
                                  AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
-                                 VerticalContentAlignment="Top"
+                                 VerticalContentAlignment="Top" Height="104" Padding="2,6"
                                  ToolTip="每行一个关键词，也可以用逗号分隔" />
-                        <TextBlock IsHitTestVisible="False" Margin="7,5,0,0" Opacity="0.55"
-                                   VerticalAlignment="Top" Foreground="{StaticResource MutedBrush}"
-                                   Text="每行一个关键词，例如：&#10;云边有个小卖部&#10;长安的荔枝">
+                        <!-- 占位提示。Margin 是量出来的，不是算出来的：
+                             用 UI 自动化读到真实文本落在框左上角偏移 (7,13) 处，
+                             只读 TextBox 的内部渲染和可编辑的差 (2,6)，对不齐，故改回 TextBlock。
+                             注意：改 Padding 或字号后这两个数要重新量。 -->
+                        <TextBlock IsHitTestVisible="False" Margin="7,13,0,0" Opacity="0.5"
+                                   VerticalAlignment="Top" HorizontalAlignment="Left"
+                                   Foreground="{StaticResource MutedBrush}"
+                                   Text="每行一个关键词，例如：云边有个小卖部">
                             <TextBlock.Style>
                                 <Style TargetType="TextBlock">
                                     <Setter Property="Visibility" Value="Collapsed" />
@@ -75,7 +81,7 @@
                     <TextBox Grid.Row="1" Grid.Column="2"
                              Text="{Binding CookieText, UpdateSourceTrigger=PropertyChanged}"
                              AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
-                             VerticalContentAlignment="Top"
+                             VerticalContentAlignment="Top" Height="104" Padding="2,6"
                              ToolTip="登录 zhidao.baidu.com 后复制完整 Cookie。只在本机使用，不会写入日志或结果文件。" />
                 </Grid>
 
