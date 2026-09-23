@@ -1,6 +1,7 @@
 ﻿using System.IO;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Features.Collect;
 using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Features.Home;
 using BaiduBatchTransfer.App.Features.ShareAnalytics;
@@ -1122,6 +1123,9 @@ public sealed class AppShellFactory(
         // 首页不碰授权状态：页头有常驻徽标，设置中心有完整卡片（含激活按钮与机器
         // 绑定状态）。同一份信息摆三处，只会在三处不一致时让人更困惑。
         homeWorkspace = new HomeWorkspaceView(new HomeWorkspaceViewModel());
+        var collectSession = new CollectHelperSession();
+        var collectViewModel = new CollectViewModel(collectSession);
+        var collectWorkspace = new CollectView { DataContext = collectViewModel };
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),
             remoteResourcePicker,
@@ -1166,7 +1170,8 @@ public sealed class AppShellFactory(
             shareAnalyticsPreferenceLoadFailed: shareAnalyticsPreferenceLoadFailed,
             enterShareData: shareAnalyticsViewModel.EnterAsync,
             leaveShareData: shareAnalyticsViewModel.Leave,
-            licenseAuthorizationState: licenseAuthorizationState);
+            licenseAuthorizationState: licenseAuthorizationState,
+            collectWorkspace: collectWorkspace);
         mainViewModel.ConfigureOtaAcceptanceBuild(buildInfo.IsOtaAcceptanceBuild);
         mainWindow = new MainWindow(mainViewModel);
 
@@ -1229,6 +1234,9 @@ public sealed class AppShellFactory(
             transferViewModel.Dispose();
             shareAnalyticsViewModel.Dispose();
             shareViewModel.Dispose();
+            // 助手在 stdin 关闭后会自行退出，清理无需阻塞窗口关闭；
+            // 万一它不退，DisposeAsync 内部有上限并会结束该进程。
+            _ = collectViewModel.DisposeAsync();
             handoff.Dispose();
             shellLifetime.Dispose();
         }

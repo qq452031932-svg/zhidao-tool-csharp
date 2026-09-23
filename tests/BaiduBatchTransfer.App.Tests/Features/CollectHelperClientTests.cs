@@ -1,9 +1,7 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -41,7 +39,7 @@ public sealed class CollectHelperClientTests
     [Fact]
     public async Task ReadyGatesStartupAndTimesOutWhenTheHelperIsSilent()
     {
-        using var process = new FakeProcess();
+        using var process = new FakeCollectHelperProcess();
         await using var client = CollectHelperClient.Create(process);
 
         var pending = client.WaitUntilReadyAsync(TimeSpan.FromMilliseconds(150), CancellationToken.None);
@@ -54,7 +52,7 @@ public sealed class CollectHelperClientTests
     [Fact]
     public async Task EventsAreTranslatedIntoTypedCallbacks()
     {
-        using var process = new FakeProcess();
+        using var process = new FakeCollectHelperProcess();
         await using var client = CollectHelperClient.Create(process);
 
         var resources = new List<CollectedResource>();
@@ -116,7 +114,7 @@ public sealed class CollectHelperClientTests
     [Fact]
     public async Task MalformedOutputIsReportedButNeverBreaksTheChannel()
     {
-        using var process = new FakeProcess();
+        using var process = new FakeCollectHelperProcess();
         await using var client = CollectHelperClient.Create(process);
 
         var logs = new List<string>();
@@ -140,7 +138,7 @@ public sealed class CollectHelperClientTests
     [Fact]
     public async Task CommandsAreSerializedAsOneJsonLineEach()
     {
-        using var process = new FakeProcess();
+        using var process = new FakeCollectHelperProcess();
         await using var client = CollectHelperClient.Create(process);
         process.Emit(new { ev = "ready" });
         await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
@@ -177,7 +175,7 @@ public sealed class CollectHelperClientTests
     [Fact]
     public async Task AccountWithoutExitKindOmitsTheField()
     {
-        using var process = new FakeProcess();
+        using var process = new FakeCollectHelperProcess();
         await using var client = CollectHelperClient.Create(process);
         process.Emit(new { ev = "ready" });
         await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
@@ -194,7 +192,7 @@ public sealed class CollectHelperClientTests
     [Fact]
     public async Task HelperExitIsSurfacedAsABrokenChannel()
     {
-        using var process = new FakeProcess();
+        using var process = new FakeCollectHelperProcess();
         await using var client = CollectHelperClient.Create(process);
 
         string? broken = null;
@@ -212,7 +210,7 @@ public sealed class CollectHelperClientTests
     [Fact]
     public async Task DisposeClosesStandardInputSoTheHelperCanFinishOnItsOwn()
     {
-        var process = new FakeProcess();
+        var process = new FakeCollectHelperProcess();
         var client = CollectHelperClient.Create(process);
         process.Emit(new { ev = "ready" });
         await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
@@ -229,7 +227,7 @@ public sealed class CollectHelperClientTests
     [Fact]
     public async Task ShutdownIsBoundedEvenWhenTheHelperRefusesToExit()
     {
-        var process = new FakeProcess(exitsWhenInputCloses: false);
+        var process = new FakeCollectHelperProcess(exitsWhenInputCloses: false);
         var client = CollectHelperClient.Create(process);
         process.Emit(new { ev = "ready" });
         await client.WaitUntilReadyAsync(Timeout, CancellationToken.None);
@@ -328,117 +326,5 @@ public sealed class CollectHelperClientTests
         }
 
         Assert.Fail("等待条件超时");
-    }
-
-    /// <summary>脚本化的假助手进程：测试喂事件、收命令，全程不起真进程。</summary>
-    private sealed class FakeProcess : ICollectHelperProcess
-    {
-        private readonly ScriptedReader reader = new();
-        private readonly RecordingWriter writer;
-        private readonly TaskCompletionSource exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        private readonly bool exitsWhenInputCloses;
-
-        /// <param name="exitsWhenInputCloses">
-        /// 真实助手在 stdin 关闭后会自行退出；传 false 可模拟卡住不退的助手。
-        /// </param>
-        public FakeProcess(bool exitsWhenInputCloses = true)
-        {
-            this.exitsWhenInputCloses = exitsWhenInputCloses;
-            writer = new RecordingWriter(() =>
-            {
-                StandardInputClosed = true;
-                if (this.exitsWhenInputCloses) CompleteOutput();
-            });
-        }
-
-        public TextWriter StandardInput => writer;
-        public TextReader StandardOutput => reader;
-        public Task ExitTask => exited.Task;
-        public bool StandardInputClosed { get; private set; }
-        public bool WasKilled { get; private set; }
-
-        public void Emit(object frame) => reader.Emit(JsonSerializer.Serialize(frame));
-
-        public void EmitRaw(string line) => reader.Emit(line);
-
-        public void CompleteOutput()
-        {
-            reader.Complete();
-            exited.TrySetResult();
-        }
-
-        public IReadOnlyList<string> WrittenCommands() => writer.Lines();
-
-        public void Kill()
-        {
-            WasKilled = true;
-            CompleteOutput();
-        }
-
-        public void Dispose()
-        {
-            reader.Complete();
-            exited.TrySetResult();
-        }
-    }
-
-    private sealed class ScriptedReader : TextReader
-    {
-        private readonly BlockingCollection<string> lines = new();
-
-        public void Emit(string line) => lines.Add(line);
-
-        public void Complete()
-        {
-            if (!lines.IsAddingCompleted) lines.CompleteAdding();
-        }
-
-        public override string? ReadLine()
-        {
-            try
-            {
-                return lines.Take();
-            }
-            catch (InvalidOperationException)
-            {
-                return null;   // 输出已结束
-            }
-        }
-    }
-
-    private sealed class RecordingWriter : TextWriter
-    {
-        private readonly List<string> lines = [];
-        private readonly StringBuilder current = new();
-        private readonly Action onClose;
-        private readonly object sync = new();
-
-        public RecordingWriter(Action onClose) => this.onClose = onClose;
-
-        public override Encoding Encoding => Encoding.UTF8;
-
-        public IReadOnlyList<string> Lines()
-        {
-            lock (sync) return lines.ToArray();
-        }
-
-        public override void Write(char value)
-        {
-            lock (sync)
-            {
-                if (value == '\n')
-                {
-                    lines.Add(current.ToString().TrimEnd('\r'));
-                    current.Clear();
-                }
-                else
-                {
-                    current.Append(value);
-                }
-            }
-        }
-
-        public override void Close() => onClose();
     }
 }

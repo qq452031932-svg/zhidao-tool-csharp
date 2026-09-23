@@ -22,6 +22,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private readonly object fileExclusionWorkspace;
     private readonly object statisticsWorkspace;
     private readonly object settingsWorkspace;
+    private readonly object? collectWorkspace;
     private readonly IAccountLoginLauncher loginLauncher;
     private readonly IAccountManagementLauncher? accountManagementLauncher;
     private readonly Func<Action<int>, CancellationToken, Task>? refreshAccounts;
@@ -73,7 +74,8 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         bool shareAnalyticsPreferenceLoadFailed = false,
         Func<CancellationToken, Task>? enterShareData = null,
         Action? leaveShareData = null,
-        LicenseRuntimeAuthorizationState? licenseAuthorizationState = null)
+        LicenseRuntimeAuthorizationState? licenseAuthorizationState = null,
+        object? collectWorkspace = null)
     {
         this.homeWorkspace = homeWorkspace ?? throw new ArgumentNullException(nameof(homeWorkspace));
         this.shareDataWorkspace = shareDataWorkspace ?? throw new ArgumentNullException(nameof(shareDataWorkspace));
@@ -82,6 +84,8 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         this.fileExclusionWorkspace = fileExclusionWorkspace ?? throw new ArgumentNullException(nameof(fileExclusionWorkspace));
         this.statisticsWorkspace = statisticsWorkspace ?? throw new ArgumentNullException(nameof(statisticsWorkspace));
         this.settingsWorkspace = settingsWorkspace ?? throw new ArgumentNullException(nameof(settingsWorkspace));
+        // 采集页尚未在所有宿主里装配，缺席时导航项保持不可用而不是报错
+        this.collectWorkspace = collectWorkspace;
         this.loginLauncher = loginLauncher ?? throw new ArgumentNullException(nameof(loginLauncher));
         this.accountManagementLauncher = accountManagementLauncher;
         this.refreshAccounts = refreshAccounts;
@@ -116,6 +120,9 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         ShowFileExclusionCommand = new RelayCommand(() => ShowWorkspace(this.fileExclusionWorkspace, "文件排除"));
         ShowStatisticsCommand = new RelayCommand(() => ShowWorkspace(this.statisticsWorkspace, "数据统计"));
         ShowSettingsCommand = new RelayCommand(() => ShowWorkspace(this.settingsWorkspace, "设置中心"));
+        ShowCollectCommand = new RelayCommand(
+            () => ShowWorkspace(this.collectWorkspace!, "知道采集"),
+            () => this.collectWorkspace is not null);
         OpenAccountLoginCommand = new AsyncRelayCommand(
             OpenAccountLoginAsync,
             () => loginLauncher.IsAvailable && !IsAccountOperationBusy);
@@ -172,6 +179,10 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     public IRelayCommand ShowFileExclusionCommand { get; }
     public IRelayCommand ShowStatisticsCommand { get; }
     public IRelayCommand ShowSettingsCommand { get; }
+    public IRelayCommand ShowCollectCommand { get; }
+
+    /// <summary>采集页是否已装配；未装配时导航里不显示该项。</summary>
+    public bool IsCollectAvailable => collectWorkspace is not null;
     public IAsyncRelayCommand OpenAccountLoginCommand { get; }
     public IAsyncRelayCommand OpenAccountManagementCommand { get; }
     public IAsyncRelayCommand RefreshAccountsCommand { get; }

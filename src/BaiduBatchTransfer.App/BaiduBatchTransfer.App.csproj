@@ -244,6 +244,11 @@ public sealed class ValidateLicenseProductionTrust : Task
              Link="managed-browser-helper\%(RecursiveDir)%(Filename)%(Extension)"
              CopyToOutputDirectory="PreserveNewest"
              CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="$(MSBuildProjectDirectory)\..\..\tools\collect_helper\**\*.py"
+             Exclude="$(MSBuildProjectDirectory)\..\..\tools\collect_helper\tests\**\*.py;$(MSBuildProjectDirectory)\..\..\tools\collect_helper\demo.py;$(MSBuildProjectDirectory)\..\..\tools\collect_helper\**\__pycache__\**\*.py"
+             Link="collect-helper\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <Target Name="ValidateManagedBrowserHelperReleasePackage"

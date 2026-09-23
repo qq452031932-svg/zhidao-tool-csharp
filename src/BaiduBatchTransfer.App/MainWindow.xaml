@@ -385,6 +385,22 @@
                                 </Style>
                             </Button.Style>
                         </Button>
+                        <Button Content="知道采集" Command="{Binding ShowCollectCommand}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource NavItemStyle}">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsCollectAvailable}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding CurrentWorkspaceTitle}" Value="知道采集">
+                                            <Setter Property="Background" Value="{StaticResource NavSelectedBrush}" />
+                                            <Setter Property="Foreground" Value="{StaticResource BrandBrush}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Button.Style>
+                        </Button>
                         <Button Content="监控反馈" Command="{Binding ShowShareDataCommand}">
                             <Button.Style>
                                 <Style TargetType="Button" BasedOn="{StaticResource NavItemStyle}">
