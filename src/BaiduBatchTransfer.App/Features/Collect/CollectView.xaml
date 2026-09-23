@@ -3,6 +3,17 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <UserControl.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+        <!-- 只对模糊模式有意义的控件，精准模式下淡化 -->
+        <Style x:Key="FuzzyOnlyLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Opacity" Value="0.45" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsFuzzyMode}" Value="True">
+                    <Setter Property="Opacity" Value="1" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
     </UserControl.Resources>
     <Grid>
         <Grid.RowDefinitions>
@@ -13,37 +24,34 @@
 
         <!-- 采集参数 -->
         <Border Style="{StaticResource Card}">
-            <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="140" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="340" />
-                </Grid.ColumnDefinitions>
-
-                <TextBlock Grid.ColumnSpan="2" TextWrapping="Wrap" Margin="0,0,0,12"
+            <StackPanel>
+                <TextBlock TextWrapping="Wrap" Margin="0,0,0,14"
                            Foreground="{StaticResource MutedBrush}"
                            Text="按关键词在百度知道里找带网盘链接的回答，提取资源名、链接与提取码。采到的结果可直接送进批量转存。" />
 
-                <DockPanel Grid.Row="1">
-                    <DockPanel DockPanel.Dock="Top" Margin="0,0,0,4">
-                        <Button DockPanel.Dock="Right" Content="从文件导入…" Padding="10,2"
-                                Command="{Binding ImportKeywordsCommand}"
-                                Visibility="{Binding CanImportKeywords, Converter={StaticResource BoolToVisibility}}"
-                                ToolTip="选择一个 txt，每行一个关键词；UTF-8 和 GBK 都能读" />
-                        <TextBlock Text="关键词（每行一个）" VerticalAlignment="Center"
-                                   Foreground="{StaticResource MutedBrush}" />
-                    </DockPanel>
-                    <Grid>
+                <!-- 关键词与 Cookie 并排等宽 -->
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="16" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="104" />
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Text="关键词（每行一个）" Margin="0,0,0,6"
+                               Foreground="{StaticResource MutedBrush}" />
+
+                    <!-- 空白时给出示例，避免一个不知道填什么的空框 -->
+                    <Grid Grid.Row="1">
                         <TextBox Text="{Binding KeywordText, UpdateSourceTrigger=PropertyChanged}"
                                  AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
+                                 VerticalContentAlignment="Top"
                                  ToolTip="每行一个关键词，也可以用逗号分隔" />
-                        <TextBlock IsHitTestVisible="False" Margin="6,4,0,0" Opacity="0.6"
-                                   Foreground="{StaticResource MutedBrush}"
+                        <TextBlock IsHitTestVisible="False" Margin="7,5,0,0" Opacity="0.55"
+                                   VerticalAlignment="Top" Foreground="{StaticResource MutedBrush}"
                                    Text="每行一个关键词，例如：&#10;云边有个小卖部&#10;长安的荔枝">
                             <TextBlock.Style>
                                 <Style TargetType="TextBlock">
@@ -57,74 +65,76 @@
                             </TextBlock.Style>
                         </TextBlock>
                     </Grid>
+
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,6">
+                        <TextBlock Text="知道账号 Cookie" Foreground="{StaticResource MutedBrush}" />
+                        <TextBlock Text="仅在本机使用，不写入日志与结果文件。" Margin="8,0,0,0" FontSize="11"
+                                   VerticalAlignment="Center" Opacity="0.75"
+                                   Foreground="{StaticResource MutedBrush}" />
+                    </StackPanel>
+                    <TextBox Grid.Row="1" Grid.Column="2"
+                             Text="{Binding CookieText, UpdateSourceTrigger=PropertyChanged}"
+                             AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
+                             VerticalContentAlignment="Top"
+                             ToolTip="登录 zhidao.baidu.com 后复制完整 Cookie。只在本机使用，不会写入日志或结果文件。" />
+                </Grid>
+
+                <Button Content="从文件导入…" Padding="12,3" Margin="0,8,0,0" HorizontalAlignment="Left"
+                        Command="{Binding ImportKeywordsCommand}"
+                        Visibility="{Binding CanImportKeywords, Converter={StaticResource BoolToVisibility}}"
+                        ToolTip="选择一个 txt，每行一个关键词；UTF-8 和 GBK 都能读" />
+
+                <!-- 模式与目标条数：目标条数只对模糊模式有意义，精准时置灰 -->
+                <DockPanel Margin="0,14,0,0" LastChildFill="False">
+                    <RadioButton DockPanel.Dock="Left" Content="精准：每词一条"
+                                 IsChecked="{Binding IsPreciseMode}" VerticalAlignment="Center"
+                                 ToolTip="每个关键词各采一条，最省账号" />
+                    <RadioButton DockPanel.Dock="Left" Content="模糊：采够为止" Margin="20,0,0,0"
+                                 IsChecked="{Binding IsFuzzyMode}" VerticalAlignment="Center"
+                                 ToolTip="围绕关键词扩展搜索，直到采够目标条数" />
+                    <TextBox DockPanel.Dock="Right" Width="70" VerticalAlignment="Center"
+                             Text="{Binding TargetCount, UpdateSourceTrigger=PropertyChanged}"
+                             IsEnabled="{Binding IsFuzzyMode}" />
+                    <TextBlock DockPanel.Dock="Right" Text="目标条数" Margin="0,0,8,0"
+                               Style="{StaticResource FuzzyOnlyLabel}" />
                 </DockPanel>
 
-                <StackPanel Grid.Row="1" Grid.Column="1" Margin="12,0,0,0">
-                    <TextBlock Text="知道账号 Cookie" Foreground="{StaticResource MutedBrush}"
-                               Height="20" VerticalAlignment="Center" Margin="0,0,0,4" />
-                    <TextBox Text="{Binding CookieText, UpdateSourceTrigger=PropertyChanged}"
-                             Height="52" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
-                             TextWrapping="Wrap" Margin="0,4,0,0"
-                             ToolTip="登录 zhidao.baidu.com 后复制完整 Cookie。只在本机使用，不会写入日志或结果文件。" />
-                    <TextBlock Text="仅在本机使用，不写入日志与结果文件。"
-                               Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,4,0,0" />
-                </StackPanel>
-
-                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,12,0,0">
-                    <RadioButton Content="精准（按词各采一条）" IsChecked="{Binding IsPreciseMode}"
-                                 VerticalAlignment="Center" />
-                    <RadioButton Content="模糊（采够数量为止）" IsChecked="{Binding IsFuzzyMode}"
-                                 VerticalAlignment="Center" Margin="16,0,0,0" />
-                    <TextBlock Text="目标条数" VerticalAlignment="Center" Margin="16,0,6,0"
-                               Foreground="{StaticResource MutedBrush}" />
-                    <TextBox Text="{Binding TargetCount, UpdateSourceTrigger=PropertyChanged}" Width="70"
-                             VerticalAlignment="Center"
-                             IsEnabled="{Binding IsFuzzyMode}" />
-                </StackPanel>
-
-                <StackPanel Grid.Row="3" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,12,0,0">
-                    <Button Content="开始采集" Command="{Binding StartCommand}" Style="{StaticResource PrimaryButton}" />
-                    <Button Content="停止" Command="{Binding StopCommand}" Margin="8,0,0,0" />
+                <DockPanel Margin="0,14,0,0" LastChildFill="True">
+                    <Button DockPanel.Dock="Left" Content="开始采集" Command="{Binding StartCommand}"
+                            Style="{StaticResource PrimaryButton}" />
+                    <Button DockPanel.Dock="Left" Content="停止" Command="{Binding StopCommand}" Margin="8,0,0,0" />
                     <TextBlock Text="{Binding StatusMessage}" VerticalAlignment="Center" Margin="16,0,0,0"
-                               Foreground="{StaticResource MutedBrush}" TextTrimming="CharacterEllipsis" />
-                </StackPanel>
-            </Grid>
+                               Foreground="{StaticResource MutedBrush}" TextTrimming="CharacterEllipsis"
+                               ToolTip="{Binding StatusMessage}" />
+                </DockPanel>
+            </StackPanel>
         </Border>
 
-        <!-- 风控提示：采集此刻正阻塞等待选择 -->
+        <!-- 风控提示：采集此刻正阻塞等待选择，平时折叠不占位 -->
         <Border Grid.Row="1" Background="{StaticResource WarningRowBrush}" CornerRadius="4"
-                Padding="12,10" Margin="0,8,0,0"
+                Padding="14,10" Margin="0,10,0,0"
                 Visibility="{Binding IsRiskPromptVisible, Converter={StaticResource BoolToVisibility}}">
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
+            <DockPanel LastChildFill="True">
+                <Button DockPanel.Dock="Right" Content="停止采集" Margin="8,0,0,0"
+                        Command="{Binding AbortAfterRiskCommand}" />
+                <Button DockPanel.Dock="Right" Content="换好了，继续" Style="{StaticResource PrimaryButton}"
+                        Command="{Binding ContinueAfterRiskCommand}" />
                 <StackPanel VerticalAlignment="Center">
-                    <TextBlock Text="{Binding RiskReason}" FontWeight="SemiBold" />
-                    <TextBlock Text="采集已暂停。换个网络节点后可继续，也可以就此停止。"
-                               Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
+                    <TextBlock Text="{Binding RiskReason}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Text="采集已暂停，正在等你选择。换个网络节点后可继续，也可以就此停止。"
+                               Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                               TextTrimming="CharacterEllipsis" />
                 </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                    <Button Content="换好了，继续" Command="{Binding ContinueAfterRiskCommand}"
-                            Style="{StaticResource PrimaryButton}" />
-                    <Button Content="停止采集" Command="{Binding AbortAfterRiskCommand}" Margin="8,0,0,0" />
-                </StackPanel>
-            </Grid>
+            </DockPanel>
         </Border>
 
         <!-- 采集结果 -->
-        <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,8,0,0">
-            <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                    <RowDefinition Height="96" />
-                </Grid.RowDefinitions>
-
-                <StackPanel Orientation="Horizontal">
-                    <TextBlock Text="采集结果" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center" />
-                    <TextBlock VerticalAlignment="Center" Margin="12,0,0,0"
+        <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,10,0,0">
+            <DockPanel LastChildFill="True">
+                <DockPanel DockPanel.Dock="Top" LastChildFill="True" Margin="0,0,0,10">
+                    <TextBlock DockPanel.Dock="Left" Text="采集结果" FontSize="15" FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                    <TextBlock DockPanel.Dock="Left" VerticalAlignment="Center" Margin="14,0,0,0"
                                Foreground="{StaticResource MutedBrush}">
                         <Run Text="已采" />
                         <Run Text="{Binding FoundCount, Mode=OneWay}" FontWeight="SemiBold" />
@@ -132,27 +142,17 @@
                         <Run Text="{Binding TargetTotal, Mode=OneWay}" />
                         <Run Text="条" />
                     </TextBlock>
-                    <ProgressBar Width="180" Height="6" Margin="12,0,0,0" VerticalAlignment="Center"
-                                 Minimum="0" Maximum="{Binding TargetTotal}" Value="{Binding FoundCount, Mode=OneWay}" />
-                </StackPanel>
+                    <ProgressBar Height="6" Margin="14,0,0,0" VerticalAlignment="Center"
+                                 Minimum="0" Maximum="{Binding TargetTotal}"
+                                 Value="{Binding FoundCount, Mode=OneWay}" />
+                </DockPanel>
 
-                <DataGrid Grid.Row="1" ItemsSource="{Binding Resources}" Style="{StaticResource DenseDataGridStyle}"
-                          AutoGenerateColumns="False" IsReadOnly="True" Margin="0,8,0,0"
-                          HeadersVisibility="Column" CanUserAddRows="False">
-                    <DataGrid.Columns>
-                        <DataGridTextColumn Header="序号" Binding="{Binding Ordinal}" Width="56" />
-                        <DataGridTextColumn Header="资源名称" Binding="{Binding Name}" Width="2*" />
-                        <DataGridTextColumn Header="资源链接" Binding="{Binding Link}" Width="3*" />
-                        <DataGridTextColumn Header="提取码" Binding="{Binding Pwd}" Width="80" />
-                        <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="2*" />
-                    </DataGrid.Columns>
-                </DataGrid>
-
-                <DockPanel Grid.Row="2" Margin="0,8,0,0">
-                    <TextBlock Text="运行日志" DockPanel.Dock="Top" Foreground="{StaticResource MutedBrush}"
-                               FontSize="11" />
-                    <ListBox ItemsSource="{Binding Logs}" BorderThickness="0"
-                             ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                <!-- 运行日志压矮但保留多行：采集出问题时这是唯一线索 -->
+                <DockPanel DockPanel.Dock="Bottom" Height="72" Margin="0,10,0,0" LastChildFill="True">
+                    <TextBlock DockPanel.Dock="Top" Text="运行日志" FontSize="11" Margin="0,0,0,2"
+                               Foreground="{StaticResource MutedBrush}" />
+                    <ListBox ItemsSource="{Binding Logs}" BorderThickness="0" Background="Transparent"
+                             FontSize="11" ScrollViewer.HorizontalScrollBarVisibility="Auto">
                         <ListBox.ItemContainerStyle>
                             <Style TargetType="ListBoxItem">
                                 <Setter Property="Padding" Value="0,1" />
@@ -160,7 +160,20 @@
                         </ListBox.ItemContainerStyle>
                     </ListBox>
                 </DockPanel>
-            </Grid>
+
+                <DataGrid ItemsSource="{Binding Resources}" Style="{StaticResource DenseDataGridStyle}"
+                          AutoGenerateColumns="False" IsReadOnly="True"
+                          HeadersVisibility="Column" CanUserAddRows="False">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="序号" Binding="{Binding Ordinal}" Width="56" />
+                        <DataGridTextColumn Header="资源名称" Binding="{Binding Name}" Width="2*" />
+                        <DataGridTextColumn Header="资源链接" Binding="{Binding Link}" Width="3*" />
+                        <DataGridTextColumn Header="提取码" Binding="{Binding Pwd}" Width="80" />
+                        <!-- 来源保留原帖链接：可疑资源要能点回去看是谁发的 -->
+                        <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="2*" />
+                    </DataGrid.Columns>
+                </DataGrid>
+            </DockPanel>
         </Border>
     </Grid>
 </UserControl>
