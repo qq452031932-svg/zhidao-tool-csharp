@@ -730,12 +730,34 @@ public sealed class BaiduWebApiClient
             -9 => BaiduErrorKind.InvalidExtractionCode,
             -6 or -7 or -10 => BaiduErrorKind.ExpiredLogin,
             -62 or -64 or 9019 => BaiduErrorKind.VerificationRequired,
-            -8 or 12 or 31034 => BaiduErrorKind.TransientService,
+            -8 or 31034 => BaiduErrorKind.TransientService,
+            12 when TryReadDuplicatedPaths(root, out _) => BaiduErrorKind.DuplicateSkipped,
+            12 when root.TryGetProperty("target_file_nums_limit", out _) ||
+                    root.TryGetProperty("non_vip_limit", out _) ||
+                    root.TryGetProperty("target_file_nums", out _) => BaiduErrorKind.FileCountLimitExceeded,
+            12 => BaiduErrorKind.TransientService,
             120 or 121 => BaiduErrorKind.InsufficientCapacity,
             2 or 3 or 4 => BaiduErrorKind.InvalidTargetPath,
             _ => BaiduErrorKind.UnknownResponse,
         };
         throw new BaiduWebApiException(error, acceptance);
+    }
+
+    private static bool TryReadDuplicatedPaths(JsonElement root, out HashSet<string> paths)
+    {
+        paths = new HashSet<string>(StringComparer.Ordinal);
+        if (!root.TryGetProperty("duplicated", out var duplicated) ||
+            duplicated.ValueKind != JsonValueKind.Object ||
+            !duplicated.TryGetProperty("list", out var list) ||
+            list.ValueKind != JsonValueKind.Array)
+            return false;
+        foreach (var item in list.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) continue;
+            var path = ReadString(item, "path");
+            if (path is not null) paths.Add(path);
+        }
+        return true;
     }
 
     private static BaiduAdapterResult<T> Failure<T>(BaiduWebApiException exception) =>

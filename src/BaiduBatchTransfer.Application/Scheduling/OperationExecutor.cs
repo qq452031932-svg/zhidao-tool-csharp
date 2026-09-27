@@ -68,6 +68,21 @@ public interface IOperationExecutionStore
         DateTimeOffset now,
         CancellationToken cancellationToken = default,
         int? expectedAttemptCount = null);
+    Task CompleteDuplicateWithEvidenceAsync(
+        Guid operationId,
+        string? requestId,
+        RemoteItemIdentitySet exactRemoteItems,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null) =>
+        CompleteSucceededWithEvidenceAsync(operationId, requestId, exactRemoteItems,
+            now, cancellationToken, expectedAttemptCount);
+    Task MarkDuplicateSkippedWithoutEvidenceAsync(
+        Guid operationId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null) =>
+        throw new NotSupportedException("The execution store does not support duplicate completion without exact evidence.");
     Task MarkFailedAsync(
         Guid operationId,
         string code,
@@ -459,7 +474,18 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         if (!saveResult.IsSuccess)
         {
             var errorKind = saveResult.ErrorKind!.Value;
-            if (errorKind is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
+            if (errorKind == BaiduErrorKind.DuplicateSkipped)
+            {
+                if (snapshot.RequiresExactShareEvidence)
+                    await store.MarkFailedAsync(snapshot.OperationId,
+                        "DuplicateEvidenceUnavailable",
+                        "重复文件存在，但无法定位确切文件，分享未生成。",
+                        globallyInvalid: false, now, cancellationToken, attemptCount).ConfigureAwait(false);
+                else
+                    await store.MarkDuplicateSkippedWithoutEvidenceAsync(
+                        snapshot.OperationId, now, cancellationToken, attemptCount).ConfigureAwait(false);
+            }
+            else if (errorKind is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
             {
                 await PauseForAccountInterventionAsync(
                     snapshot.OperationId,
@@ -490,7 +516,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                 await FailAsync(
                     snapshot.OperationId,
                     errorKind,
-                    errorKind is BaiduErrorKind.InvalidLink or BaiduErrorKind.InvalidExtractionCode,
+                    errorKind is BaiduErrorKind.InvalidLink or BaiduErrorKind.InvalidExtractionCode
+                        or BaiduErrorKind.FileCountLimitExceeded,
                     attemptCount,
                     cancellationToken).ConfigureAwait(false);
             }

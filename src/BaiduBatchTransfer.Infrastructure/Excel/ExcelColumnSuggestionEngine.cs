@@ -8,7 +8,7 @@ public sealed class ExcelColumnSuggestionEngine
     private static readonly HashSet<string> HeaderIndicators = new(StringComparer.OrdinalIgnoreCase)
     {
         "源标题", "标题", "名称", "资源名称", "source title", "title", "name",
-        "分享链接", "原分享链接", "链接", "share url", "share link", "url", "link",
+        "分享链接", "原分享链接", "资源链接", "网盘链接", "链接", "share url", "share link", "url", "link",
         "提取码", "访问码", "extraction code", "code",
         "目标目录", "目标路径", "target path",
         "外层目录", "创建目录名称", "outer folder",
@@ -18,7 +18,7 @@ public sealed class ExcelColumnSuggestionEngine
 
     private static readonly HashSet<string> LinkHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
-        "分享链接", "原分享链接", "链接", "share url", "share link", "url", "link",
+        "分享链接", "原分享链接", "资源链接", "网盘链接", "链接", "share url", "share link", "url", "link",
     };
 
     private static readonly HashSet<string> TitleHeaders = new(StringComparer.OrdinalIgnoreCase)

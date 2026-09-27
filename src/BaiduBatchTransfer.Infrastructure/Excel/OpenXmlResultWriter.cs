@@ -23,7 +23,7 @@ public sealed class OpenXmlResultWriter : IBatchResultWriter
 {
     public const int ExcelMaximumRowsPerSheet = 1_048_576;
 
-    private static readonly string[] Headers = ["源行号", "分享链接", "状态", "账号", "目标目录", "备注", "错误"];
+    private static readonly string[] Headers = ["资源名称", "分享链接", "提取码", "状态", "账号", "目标目录", "备注", "错误"];
     private readonly int maxRowsPerSheet;
 
     public OpenXmlResultWriter(int maxRowsPerSheet = ExcelMaximumRowsPerSheet)

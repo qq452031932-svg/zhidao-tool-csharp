@@ -8,6 +8,8 @@ public enum BaiduErrorKind
     VerificationRequired,
     InsufficientCapacity,
     InvalidTargetPath,
+    DuplicateSkipped,
+    FileCountLimitExceeded,
     TransientService,
     UnknownResponse,
     NotValidated,
