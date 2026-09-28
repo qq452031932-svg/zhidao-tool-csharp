@@ -54,9 +54,10 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
     {
         this.session = session ?? throw new ArgumentNullException(nameof(session));
         this.keywordFileDialog = keywordFileDialog;
-        var uiContext = SynchronizationContext.Current;
+        // 延迟捕获 UI 上下文：构造时可能还在启动线程，SynchronizationContext.Current 为 null
         this.dispatch = dispatch ?? (action =>
         {
+            var uiContext = SynchronizationContext.Current;
             if (uiContext is null) action();
             else uiContext.Post(_ => action(), null);
         });
@@ -67,6 +68,7 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         AbortAfterRiskCommand = new AsyncRelayCommand(() => AnswerRiskAsync(false), () => IsRiskPromptVisible);
         ImportKeywordsCommand = new AsyncRelayCommand(
             ImportKeywordsAsync, () => keywordFileDialog is not null && !IsBusy && !IsCollecting);
+        ValidateCookieCommand = new AsyncRelayCommand(ValidateCookieAsync, () => !IsBusy && !IsCollecting);
     }
 
     /// <summary>每行一个关键词。</summary>
@@ -174,6 +176,9 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
     /// <summary>从 txt 批量导入关键词；编码由助手判别。</summary>
     public AsyncRelayCommand ImportKeywordsCommand { get; }
 
+    /// <summary>验证知道账号 Cookie 是否有效。</summary>
+    public AsyncRelayCommand ValidateCookieCommand { get; }
+
     /// <summary>是否提供了选择文件的能力（未提供时界面隐藏该按钮）。</summary>
     public bool CanImportKeywords => keywordFileDialog is not null;
 
@@ -232,8 +237,27 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
 
     private async Task<CollectHelperClient> EnsureConnectedAsync()
     {
-        if (client is not null) return client;
-        lifetime ??= new CancellationTokenSource();
+        // 如果 client 存在且进程还活着，直接返回
+        if (client is not null && !client.HasExited) return client;
+
+        // 清理旧连接（如果有）
+        if (client is not null)
+        {
+            // 尝试发送 stop 命令清理 Python 端的残留状态（如果进程还活着）
+            try
+            {
+                if (!client.HasExited)
+                    await client.StopCollectingAsync(CancellationToken.None).ConfigureAwait(true);
+            }
+            catch { /* 进程可能已死，忽略错误 */ }
+
+            client = null;
+            lifetime?.Cancel();
+            lifetime?.Dispose();
+            lifetime = null;
+        }
+
+        lifetime = new CancellationTokenSource();
         var helper = await session.ConnectAsync(lifetime.Token).ConfigureAwait(true);
         Attach(helper);   // 只订阅一次，避免重复连接后事件被处理多遍
         client = helper;
@@ -256,6 +280,45 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         catch (Exception error)
         {
             StatusMessage = $"读取失败：{error.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private async Task ValidateCookieAsync()
+    {
+        if (string.IsNullOrWhiteSpace(CookieText))
+        {
+            StatusMessage = "请先填入知道账号的 Cookie。";
+            return;
+        }
+
+        IsBusy = true;
+        var originalStatus = StatusMessage;
+        try
+        {
+            StatusMessage = "正在验证 Cookie…";
+            var helper = await EnsureConnectedAsync().ConfigureAwait(true);
+
+            // 发起一次最小采集测试 Cookie 有效性
+            await helper.StartCollectingAsync(new CollectRequest(
+                "precise",
+                ["__validation_test__"],
+                [new CollectAccount("知道账号", CookieText.Trim())],
+                Count: 0),
+                lifetime?.Token ?? CancellationToken.None).ConfigureAwait(true);
+
+            // 立即停止，我们只要测试 Cookie 能不能用
+            await Task.Delay(500).ConfigureAwait(true);
+            await helper.StopCollectingAsync(lifetime?.Token ?? CancellationToken.None).ConfigureAwait(true);
+
+            StatusMessage = "✓ Cookie 验证通过，可以开始采集。";
+        }
+        catch (Exception error)
+        {
+            StatusMessage = $"✗ Cookie 验证失败：{error.Message}";
         }
         finally
         {
@@ -323,6 +386,10 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
             IsCollecting = false;
             IsRiskPromptVisible = false;
             StatusMessage = $"采集助手已断开：{message}";
+            client = null;  // 清空死连接，下次重新启动
+            lifetime?.Cancel();
+            lifetime?.Dispose();
+            lifetime = null;
         });
         helper.KeywordsLoaded += loaded => dispatch(() =>
         {
@@ -351,12 +418,17 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
                 : $"采集完成，共采到 {outcome.Found} 条。";
             if (outcome.Stats.TryGetValue("no_pwd", out var missing) && missing > 0)
                 AppendLog($"其中 {missing} 条没有提取码。");
+            client = null;  // 清空连接，下次重新启动
+            lifetime?.Cancel();
+            lifetime?.Dispose();
+            lifetime = null;
         });
     }
 
     private void AppendLog(string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return;
+        System.Diagnostics.Debug.WriteLine($"[AppendLog] {text}");
         Logs.Add(text);
         while (Logs.Count > 500) Logs.RemoveAt(0);
     }
