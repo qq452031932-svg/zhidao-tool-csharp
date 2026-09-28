@@ -72,6 +72,9 @@ public sealed class CollectHelperClient : IAsyncDisposable
         readPump = Task.Run(PumpAsync);
     }
 
+    /// <summary>进程是否已退出。</summary>
+    public bool HasExited => process.ExitTask.IsCompleted;
+
     /// <summary>采到一条资源。</summary>
     public event Action<CollectedResource>? ResourceCollected;
 

@@ -19,6 +19,19 @@ public sealed class CollectHelperClientTests
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
 
     [Fact]
+    public async Task HasExitedTracksTheHelperProcessLifetime()
+    {
+        using var process = new FakeCollectHelperProcess();
+        await using var client = CollectHelperClient.Create(process);
+
+        Assert.False(client.HasExited);
+
+        process.CompleteOutput();
+
+        Assert.True(client.HasExited);
+    }
+
+    [Fact]
     public void StartInfoIsolatesTheInterpreterAndPinsUtf8()
     {
         var info = CollectHelperClient.CreateStartInfo(@"C:\bundle\python.exe", @"C:\bundle\collect\main.py");
