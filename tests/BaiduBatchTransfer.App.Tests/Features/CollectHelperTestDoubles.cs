@@ -34,6 +34,8 @@ internal sealed class FakeCollectHelperProcess : ICollectHelperProcess
 
     public TextReader StandardOutput => reader;
 
+    public TextReader StandardError => TextReader.Null;
+
     public Task ExitTask => exited.Task;
 
     public bool StandardInputClosed { get; private set; }
