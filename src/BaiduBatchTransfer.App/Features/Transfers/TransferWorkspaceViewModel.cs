@@ -128,6 +128,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         Wizard.PropertyChanged += OnComposedPropertyChanged;
         RunPanel.PropertyChanged += OnStatusSourcePropertyChanged;
         RunPanel.BatchTerminal += OnBatchTerminal;
+        RunPanel.ResultsRequested += OnResultsRequested;
         RunPanel.Results.PropertyChanged += OnStatusSourcePropertyChanged;
         RunPanel.Results.ManualRefreshCompleted += OnManualResultsRefreshCompleted;
         RunPanel.Results.Items.CollectionChanged += OnResultItemsChanged;
@@ -528,7 +529,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public void ApplyImportedDraft(ImportDraftReady draft)
     {
         if (isClosed) return;
-        SelectedDataTabIndex = 0;
+        if (!IsStarting) SelectedDataTabIndex = PendingLinksTabIndex;
         if (Import.SessionId != draft.SessionId) Import.AttachSession(draft.SessionId);
         if (Wizard.CurrentImportSessionId == draft.SessionId)
         {
@@ -926,6 +927,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         Wizard.PropertyChanged -= OnComposedPropertyChanged;
         RunPanel.PropertyChanged -= OnStatusSourcePropertyChanged;
         RunPanel.BatchTerminal -= OnBatchTerminal;
+        RunPanel.ResultsRequested -= OnResultsRequested;
         RunPanel.Results.PropertyChanged -= OnStatusSourcePropertyChanged;
         RunPanel.Results.ManualRefreshCompleted -= OnManualResultsRefreshCompleted;
         RunPanel.Results.Items.CollectionChanged -= OnResultItemsChanged;
@@ -1042,7 +1044,6 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         {
             foreach (var row in Import.Rows.Where(row => row.Disposition == "Ready" && batchPendingRowIds.Contains(row.RowId)))
                 row.RuntimeStatusText = "已进入任务";
-            SelectedDataTabIndex = 1;
             RunPanel.PresentBatch(batchJobId);
             OnPropertyChanged(nameof(CreatedBatchJobId));
             RaiseStartState();
@@ -1165,6 +1166,11 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         ClearLogsCommand.NotifyCanExecuteChanged();
     }
 
+    private void OnResultsRequested(object? sender, EventArgs args)
+    {
+        if (!isClosed) SelectedDataTabIndex = ResultsTabIndex;
+    }
+
     private void OnBatchTerminal(object? sender, WorkspaceBatchTerminalEvent terminal)
     {
         if (isClosed) return;
@@ -1194,7 +1200,12 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         {
             await dialogService.ShowMessageAsync("转存任务已完成", message, lifetime.Token).ConfigureAwait(true);
         }
-        catch (Exception) { }
+        catch (OperationCanceledException) when (isClosed || lifetime.IsCancellationRequested) { }
+        catch (Exception)
+        {
+            if (!isClosed)
+                logBuffer.AppendSafe("完成提示未能显示，请查看运行日志和处理结果。", WorkspaceLogLevel.Warning);
+        }
     }
 
     private void OnResultItemsChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -1229,7 +1240,10 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             e.PropertyName == nameof(JobResultsViewModel.BatchJobId) &&
             RunPanel.Results.BatchJobId != Guid.Empty)
         {
-            SelectedDataTabIndex = 1;
+            // Opening history may navigate to results; initializing the job just started
+            // must not override the run log or the user's subsequent tab choice.
+            if (!IsStarting && RunPanel.Results.BatchJobId != createdBatchJobId)
+                SelectedDataTabIndex = ResultsTabIndex;
             return;
         }
         if (e.PropertyName != nameof(StatusMessage)) return;

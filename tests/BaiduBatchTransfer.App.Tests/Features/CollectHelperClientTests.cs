@@ -43,7 +43,7 @@ public sealed class CollectHelperClientTests
         Assert.True(info.RedirectStandardInput);
         Assert.True(info.RedirectStandardOutput);
         Assert.True(info.RedirectStandardError);
-        Assert.Equal(new[] { "-B", "-E", "-s", @"C:\bundle\collect\main.py" }, info.ArgumentList);
+        Assert.Equal(new[] { "-B", "-E", "-s", "-X", "utf8", "-u", @"C:\bundle\collect\main.py" }, info.ArgumentList);
         // 信道固定 UTF-8，否则中文资源名会被控制台代码页破坏
         Assert.Equal("utf-8", info.StandardOutputEncoding!.WebName);
         Assert.Equal("utf-8", info.StandardInputEncoding!.WebName);
@@ -299,6 +299,58 @@ public sealed class CollectHelperClientTests
         }
 
         return null;
+    }
+
+    [Fact]
+    public async Task StandardErrorReachesLogsWithoutExposingAccountCookies()
+    {
+        using var process = new FakeCollectHelperProcess();
+        await using var client = CollectHelperClient.Create(process);
+        var logged = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.LogWritten += line => logged.TrySetResult(line);
+        await client.StartCollectingAsync(new CollectRequest("precise", ["测试关键词"],
+            [new CollectAccount("测试账号", "BDUSS=private-test-cookie; STOKEN=private-test-token")]), CancellationToken.None);
+
+        process.EmitError("网络请求失败 BDUSS=private-test-cookie; STOKEN=private-test-token");
+
+        var diagnostic = await logged.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Contains("网络请求失败", diagnostic);
+        Assert.DoesNotContain("private-test-cookie", diagnostic);
+        Assert.DoesNotContain("private-test-token", diagnostic);
+    }
+
+    [Fact]
+    public async Task DelayedDiagnosticsRedactCookiesFromPreviousRuns()
+    {
+        using var process = new FakeCollectHelperProcess();
+        await using var client = CollectHelperClient.Create(process);
+        var logged = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.LogWritten += line => logged.TrySetResult(line);
+        foreach (var cookie in new[] { "BDUSS=previous-test-cookie", "BDUSS=current-test-cookie" })
+            await client.StartCollectingAsync(new CollectRequest("precise", ["测试关键词"],
+                [new CollectAccount("测试账号", cookie)]), CancellationToken.None);
+
+        process.EmitError("请求失败 previous-test-cookie current-test-cookie");
+
+        var diagnostic = await logged.Task.WaitAsync(Timeout);
+        Assert.DoesNotContain("previous-test-cookie", diagnostic);
+        Assert.DoesNotContain("current-test-cookie", diagnostic);
+        Assert.Contains("请求失败", diagnostic);
+    }
+
+    [Fact]
+    public async Task OversizedRequestFailsBeforeWritingToHelper()
+    {
+        using var process = new FakeCollectHelperProcess();
+        await using var client = CollectHelperClient.Create(process);
+        var request = new CollectRequest("precise", Enumerable.Repeat(new string('测', 140), 10000).ToArray(),
+            [new CollectAccount("测试账号", "BDUSS=dummy")]);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.StartCollectingAsync(request, CancellationToken.None));
+
+        Assert.Contains("过大", error.Message);
+        Assert.Empty(process.WrittenCommands());
     }
 
     private static string? FindInterpreter(string repositoryRoot)

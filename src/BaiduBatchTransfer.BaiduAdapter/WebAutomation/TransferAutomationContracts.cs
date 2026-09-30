@@ -3,13 +3,6 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 
-public sealed record TransferListingCompleteness(
-    bool IsComplete,
-    bool IsStable,
-    int TotalCount,
-    bool ReachedEnd,
-    string GenerationToken);
-
 public enum TransferRemoteItemKind
 {
     File,

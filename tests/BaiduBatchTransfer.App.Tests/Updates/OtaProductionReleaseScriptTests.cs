@@ -210,6 +210,55 @@ public sealed class OtaProductionReleaseScriptTests
     }
 
     [Fact]
+    public async Task ProductionSnapshotIncludesCommittedCollectorAndIgnoresUnreviewedWorkingFiles()
+    {
+        var root = Path.Combine(FindRepositoryRoot(), ".artifacts", $"ota-collector-snapshot-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var snapshot = Path.Combine(root, "snapshot");
+        Directory.CreateDirectory(Path.Combine(source, "src"));
+        Directory.CreateDirectory(Path.Combine(source, "eng", "ota"));
+        Directory.CreateDirectory(Path.Combine(source, "tools", "collect_helper", "lxds"));
+        try
+        {
+            var application = Path.Combine(source, "src", "Example.cs");
+            await File.WriteAllTextAsync(application, "class Example {}\n", new UTF8Encoding(false));
+            var hash = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(application))).ToLowerInvariant();
+            await File.WriteAllTextAsync(Path.Combine(source, "eng", "ota", "production-source-overrides.sha256"),
+                $"{hash}  src/Example.cs\n", new UTF8Encoding(false));
+            var helperFiles = new[] { "main.py", "protocol.py", "lxds/fuzzy_coverage.py" };
+            foreach (var name in helperFiles)
+                await File.WriteAllTextAsync(Path.Combine(source, "tools", "collect_helper", name), "# reviewed " + name + "\n");
+            RunGit(source, "init");
+            RunGit(source, "-c", "core.autocrlf=false", "add", ".");
+            RunGit(source, "-c", "user.name=Snapshot Test", "-c", "user.email=snapshot@example.test", "commit", "-m", "reviewed fixture");
+            await File.WriteAllTextAsync(Path.Combine(source, "tools", "collect_helper", "main.py"), "# unreviewed edit\n");
+            await File.WriteAllTextAsync(Path.Combine(source, "tools", "collect_helper", "unreviewed.py"), "# not committed\n");
+            var wrapper = Path.Combine(root, "snapshot.ps1");
+            await File.WriteAllTextAsync(wrapper, $$"""
+                $ErrorActionPreference = 'Stop'
+                $tokens = $null; $errors = $null
+                $ast = [Management.Automation.Language.Parser]::ParseFile('{{PsQuote(BuildScriptPath())}}', [ref]$tokens, [ref]$errors)
+                if ($errors.Count) { throw 'build script parse failed' }
+                $names = @('Get-LowerSha256','Export-ReviewedGitBlob','Get-TrackedGitPaths','Copy-ProductionSourceSnapshot')
+                foreach ($function in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                    if ($function.Name -in $names) { Invoke-Expression $function.Extent.Text }
+                }
+                Copy-ProductionSourceSnapshot '{{PsQuote(source)}}' '{{PsQuote(snapshot)}}' 'HEAD'
+                """);
+            var result = await RunPowerShellAsync(wrapper);
+            Assert.True(result.ExitCode == 0, result.Output);
+            foreach (var name in helperFiles)
+            {
+                var path = Path.Combine(snapshot, "tools", "collect_helper", name);
+                Assert.True(File.Exists(path), "Production snapshot omitted collector file: " + name);
+                Assert.Equal("# reviewed " + name + "\n", await File.ReadAllTextAsync(path));
+            }
+            Assert.False(File.Exists(Path.Combine(snapshot, "tools", "collect_helper", "unreviewed.py")));
+        }
+        finally { DeleteDirectoryTree(root); }
+    }
+
+    [Fact]
     public void ProductionSnapshotEnumeratesGitPathsAsNulDelimitedStrictUtf8()
     {
         var script = File.ReadAllText(BuildScriptPath());

@@ -1,4 +1,4 @@
-﻿using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.App.Features.Licensing;
@@ -35,16 +35,6 @@ public sealed class StartupRecoveryRunner(
             timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
         await localResultExports.RecoverAsync(cancellationToken).ConfigureAwait(false);
     }
-}
-
-public sealed class UnavailableAppRecoveryRunner : IAppRecoveryRunner
-{
-    public bool IsAvailable => false;
-    public string UnavailableMessage => "Windows 单实例保护尚不可用，数据库和任务调度均未启动。";
-    public Task PrepareLocalAsync(CancellationToken cancellationToken) =>
-        throw new InvalidOperationException(UnavailableMessage);
-    public Task RecoverAuthorizedAsync(CancellationToken cancellationToken) =>
-        throw new InvalidOperationException(UnavailableMessage);
 }
 
 public sealed record AppStartupResult(

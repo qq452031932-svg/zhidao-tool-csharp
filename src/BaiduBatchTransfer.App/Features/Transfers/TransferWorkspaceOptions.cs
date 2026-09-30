@@ -78,22 +78,3 @@ public sealed class LocalResultDirectoryPreparer : ILocalResultDirectoryPreparer
         return Task.CompletedTask;
     }
 }
-
-// Task 6 replaces this process-local bridge with durable storage.
-public sealed class InMemoryTransferResultDestinationSink : ITransferResultDestinationSink
-{
-    private readonly object sync = new();
-    private readonly Dictionary<Guid, TransferResultDestination> values = [];
-
-    public Task SetAsync(
-        TransferResultDestination destination,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(destination);
-        cancellationToken.ThrowIfCancellationRequested();
-        var validated = destination.Validate();
-        lock (sync) values[validated.BatchJobId] = validated;
-        return Task.CompletedTask;
-    }
-
-}

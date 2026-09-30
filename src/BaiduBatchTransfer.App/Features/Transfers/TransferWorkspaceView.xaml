@@ -207,7 +207,9 @@
                                 <RowDefinition Height="*" />
                                 <RowDefinition Height="42" />
                             </Grid.RowDefinitions>
-                            <DataGrid ItemsSource="{Binding Import.Rows}" SelectedItem="{Binding Import.SelectedRow}"
+                            <DataGrid ItemsSource="{Binding Import.Rows}"
+                                      SelectedItem="{Binding Import.SelectedRow, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                      SelectionMode="Single" SelectionUnit="FullRow" IsSynchronizedWithCurrentItem="True"
                                       Style="{StaticResource DenseDataGridStyle}" RowHeight="34"
                                       IsReadOnly="True" EnableRowVirtualization="True"
                                       EnableColumnVirtualization="True"
@@ -215,7 +217,13 @@
                                       VirtualizingPanel.VirtualizationMode="Recycling"
                                       ScrollViewer.CanContentScroll="True">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Header="行号" Binding="{Binding SourceRowNumber}" Width="58" />
+                                    <DataGridTextColumn Header="序号" Binding="{Binding DisplayOrdinal}" Width="58">
+                                        <DataGridTextColumn.ElementStyle>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="ToolTip" Value="{Binding SourceRowNumber, StringFormat=来源行号：{0}}" />
+                                            </Style>
+                                        </DataGridTextColumn.ElementStyle>
+                                    </DataGridTextColumn>
                                     <DataGridTextColumn Header="原分享链接" Binding="{Binding ShareUrl}" Width="2*" />
                                     <DataGridTextColumn Header="原提取码" Binding="{Binding ExtractionCode}" Width="82" />
                                     <DataGridTextColumn Header="指定账号" Binding="{Binding RequestedAccountName}" Width="110" />

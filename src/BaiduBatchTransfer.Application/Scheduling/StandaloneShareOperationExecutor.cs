@@ -249,18 +249,6 @@ public sealed class StandaloneShareOperationExecutor(
             : Stale();
     }
 
-    private async Task<StandaloneShareExecutionResult> MarkResultPendingAsync(
-        StandaloneShareOperationRecord operation,
-        StandaloneShareOperationLease lease,
-        CancellationToken cancellationToken)
-    {
-        var changed = await store.TryMarkResultPendingAsync(
-            operation.Id, operation.BatchId, operation.AccountId, operation.Generation,
-            lease.LeaseGeneration, lease.LeaseOwnerId, operation.Revision,
-            timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
-        return changed ? Pending("提交结果需要精确核对。") : Stale();
-    }
-
     private async Task<StandaloneShareExecutionResult> ReleasePendingAsync(
         StandaloneShareOperationRecord operation,
         StandaloneShareOperationLease lease,

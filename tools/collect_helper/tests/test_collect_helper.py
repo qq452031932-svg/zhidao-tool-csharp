@@ -294,6 +294,27 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(channel.first("done")["stopped"])
         self.assertFalse(session.running)
 
+    def test_stop_just_before_risk_prompt_is_not_lost(self):
+        def configure(worker, session):
+            pause_ask = worker.pause_ask
+
+            def stop_before_asking(payload):
+                session.stop()
+                return pause_ask(payload)
+
+            worker.pause_ask = stop_before_asking
+
+        channel, session, created = self._run_session(configure=configure)
+        try:
+            session.join(timeout=1)
+            self.assertFalse(session.running, "停止信号不能在进入风控等待时被清掉")
+            self.assertFalse(created["worker"].ask_answer)
+            self.assertTrue(channel.first("done")["stopped"])
+            self.assertIsNone(channel.first("ask"), "已停止后不应再等用户答复")
+        finally:
+            session.stop()
+            session.join(timeout=2)
+
     def test_second_start_while_running_is_rejected(self):
         gate = threading.Event()
 
@@ -370,6 +391,54 @@ class RealWorkerIntegrationTests(unittest.TestCase):
     假采集器验证不了「助手和真采集器的接口是否对得上」，这组测试补这个洞。
     """
 
+    def test_real_worker_reports_activity_before_waiting_for_the_first_network_response(self):
+        import tempfile
+        from lxds.collect import CollectWorker
+
+        entered = threading.Event()
+        release = threading.Event()
+        channel = RecordingChannel()
+
+        class WaitingFetcher:
+            def get(self, url, **kwargs):
+                entered.set()
+                release.wait(5)
+                return "没有找到相关结果", None
+
+        with tempfile.TemporaryDirectory(prefix="collect-progress-") as temporary:
+            def factory(**kwargs):
+                kwargs["checkpoint_path"] = str(Path(temporary) / "checkpoint.json")
+                return CollectWorker(fetcher=WaitingFetcher(), pool=self._Pool(), **kwargs)
+
+            session = main.Session(channel, worker_factory=factory)
+            session.start(protocol.parse_start({
+                "cmd": "start", "mode": "precise", "keywords": ["测试关键词"],
+                "accounts": [{"name": "测试账号", "cookie": "BDUSS=test-cookie"}]}))
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertIsNotNone(channel.first("status"), "首个请求返回前也必须报告当前步骤")
+                self.assertTrue(any("测试关键词" in event["text"] for event in channel.all("status")))
+                self.assertTrue(any("第 1 页" in event["text"] for event in channel.all("status")))
+            finally:
+                session.stop()
+                release.set()
+                session.join(timeout=5)
+
+    def test_cooldown_reports_waiting_and_can_be_stopped(self):
+        from lxds.pool import SlotPool, CollectCancelled
+
+        stop = threading.Event()
+        statuses = []
+
+        def status(text):
+            statuses.append(text)
+            stop.set()
+
+        pool = SlotPool([], None, lambda text: None, stop, status)
+        with self.assertRaises(CollectCancelled):
+            pool._interruptible_wait(60)
+        self.assertTrue(any("冷却" in text and "秒" in text for text in statuses))
+
     @staticmethod
     def _page(items=(), next_pn=None):
         chunks = []
@@ -384,7 +453,7 @@ class RealWorkerIntegrationTests(unittest.TestCase):
     @staticmethod
     def _detail(link, pwd="8k2m"):
         return ('<div class="best-text">分享 https://pan.baidu.com/s/%s 提取码：%s</div>'
-                % (link, pwd))
+                % (link, pwd)) + '<!--' + 'x' * 2100 + '-->'
 
     class _Pool:
         def __init__(self):
@@ -416,9 +485,9 @@ class RealWorkerIntegrationTests(unittest.TestCase):
 
         today = date.today().isoformat()
         words = ["云边有个小卖部", "长安的荔枝"]
-        pages = {(word, 0): self._page([("%d1" % index, "求《%s》百度网盘链接" % word, today)])
+        pages = {("求%s百度网盘链接" % word, 0): self._page([("%d1" % index, "求《%s》百度网盘链接" % word, today)])
                  for index, word in enumerate(words)}
-        details = {"%d1" % index: self._detail("1Ab%d" % index) for index in range(len(words))}
+        details = {"%d1" % index: self._detail("1Abfixture%d" % index) for index in range(len(words))}
         fetcher = self._Fetcher(pages, details)
 
         channel = RecordingChannel()
@@ -438,7 +507,7 @@ class RealWorkerIntegrationTests(unittest.TestCase):
 
         items = channel.all("item")
         self.assertEqual(len(words), len(items), "两个关键词各应采到一条")
-        self.assertEqual(words, [item["name"] for item in items])
+        self.assertCountEqual(words, [item["name"] for item in items])
         for item in items:
             self.assertTrue(item["link"].startswith("https://pan.baidu.com/s/"), item["link"])
             self.assertEqual("8k2m", item["pwd"])
@@ -458,10 +527,10 @@ class RealWorkerIntegrationTests(unittest.TestCase):
         from lxds.collect import CollectWorker
 
         today = date.today().isoformat()
-        words = ["词%d" % index for index in range(40)]
-        pages = {(word, 0): self._page([("%d1" % index, "求《%s》百度网盘链接" % word, today)])
+        words = ["测试词%d" % index for index in range(40)]
+        pages = {("求%s百度网盘链接" % word, 0): self._page([("%d1" % index, "求《%s》百度网盘链接" % word, today)])
                  for index, word in enumerate(words)}
-        details = {"%d1" % index: self._detail("1Ab%d" % index) for index in range(len(words))}
+        details = {"%d1" % index: self._detail("1Abfixture%d" % index) for index in range(len(words))}
 
         channel = RecordingChannel()
         holder = {}

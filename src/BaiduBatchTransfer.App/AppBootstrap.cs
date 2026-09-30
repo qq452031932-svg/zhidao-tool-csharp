@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Collect;
@@ -1125,7 +1125,17 @@ public sealed class AppShellFactory(
         homeWorkspace = new HomeWorkspaceView(new HomeWorkspaceViewModel());
         var collectSession = new CollectHelperSession();
         var collectViewModel = new CollectViewModel(collectSession,
-            keywordFileDialog: new WpfKeywordFileDialog());
+            keywordFileDialog: new WpfKeywordFileDialog(),
+            resultActions: new CollectResultActions(textClipboard, resultSaveDialog, dialogService,
+                importViewModel,
+                () => transferViewModel.CanEditConfiguration && wizardViewModel.CanEdit &&
+                    transferViewModel.CreatedBatchJobId is null,
+                () =>
+                {
+                    transferViewModel.IsConfigurationExpanded = true;
+                    transferViewModel.SelectedDataTabIndex = TransferWorkspaceViewModel.PendingLinksTabIndex;
+                    mainViewModel?.ShowBatchTransferCommand.Execute(null);
+                }));
         var collectWorkspace = new CollectView { DataContext = collectViewModel };
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),

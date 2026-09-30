@@ -81,6 +81,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
 
     public JobResultsViewModel Results { get; }
     public event EventHandler<WorkspaceBatchTerminalEvent>? BatchTerminal;
+    public event EventHandler? ResultsRequested;
     public ObservableCollection<WorkspaceBatchItem> Batches { get; }
     public WorkspaceBatchItem? SelectedBatch
     {
@@ -300,6 +301,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         IsBusy = true;
         try
         {
+            ResultsRequested?.Invoke(this, EventArgs.Empty);
             await Results.InitializeAsync(batchJobId, operation.Token).ConfigureAwait(true);
             if (IsCurrent(operation)) StatusMessage = "已加载所选批次。";
         }

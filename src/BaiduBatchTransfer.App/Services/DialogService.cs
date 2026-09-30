@@ -23,21 +23,6 @@ public interface ITextClipboard
     Task SetTextAsync(string text, CancellationToken cancellationToken = default);
 }
 
-public sealed class WpfTextClipboard(IUiDispatcher dispatcher) : ITextClipboard
-{
-    public async Task SetTextAsync(string text, CancellationToken cancellationToken = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(text);
-        await dispatcher.InvokeAsync(
-            () =>
-            {
-                Clipboard.SetText(text);
-                return true;
-            },
-            cancellationToken).ConfigureAwait(true);
-    }
-}
-
 public sealed class WpfUiDispatcher : IUiDispatcher
 {
     public Task<T> InvokeAsync<T>(Func<T> action, CancellationToken cancellationToken = default)
@@ -76,20 +61,22 @@ public sealed class WpfExcelFileDialog : IExcelFileDialog
 public sealed class DialogService(
     IUiDispatcher dispatcher,
     IExcelFileDialog excelFileDialog,
-    IBrowserDirectoryDialog? browserDirectoryDialog = null) : IDialogService, IBrowserDirectoryPicker
+    IBrowserDirectoryDialog? browserDirectoryDialog = null,
+    IMessageBoxPresenter? messageBox = null) : IDialogService, IBrowserDirectoryPicker
 {
+    private readonly IMessageBoxPresenter messageBox = messageBox ?? new WpfMessageBoxPresenter();
     public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        var result = MessageBox.Show(message, title, MessageBoxButton.YesNo, MessageBoxImage.Question);
-        return Task.FromResult(result == MessageBoxResult.Yes);
+        return dispatcher.InvokeAsync(
+            () => messageBox.Show(title, message, MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes,
+            cancellationToken);
     }
 
     public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Information);
-        return Task.CompletedTask;
+        return dispatcher.InvokeAsync(
+            () => messageBox.Show(title, message, MessageBoxButton.OK, MessageBoxImage.Information),
+            cancellationToken);
     }
 
     public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default) =>
@@ -113,25 +100,11 @@ public interface IAccountSummaryProvider
     Task<int> GetActiveAccountCountAsync(CancellationToken cancellationToken = default);
 }
 
-public sealed class UnavailableAccountLoginLauncher : IAccountLoginLauncher
-{
-    public bool IsAvailable => false;
-    public string StatusMessage => "百度登录功能尚不可用，当前版本不能开始转存。";
-    public Task OpenAsync(CancellationToken cancellationToken = default) =>
-        throw new InvalidOperationException(StatusMessage);
-}
-
 public interface IAdapterAvailability
 {
     bool CanStartTransfers { get; }
     string StatusMessage { get; }
     bool RequiresBulkPrecheckBeforeStart => true;
-}
-
-public sealed class UnavailableAdapterAvailability : IAdapterAvailability
-{
-    public bool CanStartTransfers => false;
-    public string StatusMessage => "百度转存功能尚不可用，当前版本不能开始任务。";
 }
 
 internal sealed class TemporaryAcceptanceAdapterAvailability(
