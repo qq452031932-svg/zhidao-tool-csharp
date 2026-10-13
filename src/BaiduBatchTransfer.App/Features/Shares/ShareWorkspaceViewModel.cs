@@ -82,7 +82,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     private readonly ILicenseAuthorizationGate? licenseGate;
     private readonly int historyPageSize;
     private readonly CancellationTokenSource lifetime = new();
-    private readonly WorkspaceLogBuffer logBuffer = new();
+    private readonly WorkspaceLogBuffer logBuffer;
     private readonly ObservableCollection<ShareSelectionGroup> selectionGroups = [];
     private readonly ObservableCollection<SharePendingDisplayRow> pendingRows = [];
     private ShareAccountOption? activeAccount;
@@ -117,9 +117,11 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         ILocalResultExportStore? localResultExportStore = null,
         ILicenseAuthorizationGate? licenseGate = null,
         LocalTerminalHistoryService? historyCleanupService = null,
-        ILocalHistoryCleanupInteraction? historyCleanupInteraction = null)
+        ILocalHistoryCleanupInteraction? historyCleanupInteraction = null,
+        IRunLog? runLog = null)
     {
         ArgumentNullException.ThrowIfNull(accounts);
+        logBuffer = new(appended: runLog.ForWorkspace("分享"));
         this.resourcePicker = resourcePicker ?? throw new ArgumentNullException(nameof(resourcePicker));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.resultDialog = resultDialog ?? throw new ArgumentNullException(nameof(resultDialog));
@@ -1304,59 +1306,4 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         NextHistoryPageCommand?.NotifyCanExecuteChanged();
         ClearLogsCommand?.NotifyCanExecuteChanged();
     }
-}
-
-public sealed class UnavailableRemoteResourcePicker : IRemoteResourcePicker
-{
-    public Task<IReadOnlyList<OwnedRemoteSelection>> PickAsync(
-        Guid accountId,
-        CancellationToken cancellationToken = default) =>
-        throw new InvalidOperationException("网盘资源选择功能尚未准备好。");
-}
-
-public sealed class UnavailableStandaloneShareStore : IStandaloneShareStore
-{
-    public Task<StandaloneShareBatchCreationReceipt> CreateOrGetBatchAsync(
-        StandaloneSharePendingBatchEnvelope envelope,
-        CancellationToken cancellationToken = default) =>
-        throw new InvalidOperationException("分享记录功能尚未准备好。");
-
-    public Task<StandaloneShareBatchCreationReceipt?> GetBatchCreationAsync(
-        Guid batchId,
-        string draftFingerprint,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult<StandaloneShareBatchCreationReceipt?>(null);
-
-    public Task<Page<StandaloneShareBatchRecord>> GetBatchesAsync(
-        PageQuery query,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult(new Page<StandaloneShareBatchRecord>([], 0, query.PageNumber, query.PageSize));
-
-    public Task<IReadOnlyList<StandaloneShareOperationRecord>> GetOperationsAsync(
-        Guid batchId,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult<IReadOnlyList<StandaloneShareOperationRecord>>([]);
-
-    public Task<StandaloneShareBatchSnapshot?> GetBatchSnapshotAsync(
-        Guid batchId,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult<StandaloneShareBatchSnapshot?>(null);
-
-    public Task<StandaloneShareMutationResult<StandaloneShareBatchRecord>> TryPauseBatchAsync(
-        Guid batchId, long expectedRevision, DateTimeOffset updatedAt,
-        CancellationToken cancellationToken = default) => BatchUnavailable();
-
-    public Task<StandaloneShareMutationResult<StandaloneShareBatchRecord>> TryResumeBatchAsync(
-        Guid batchId, long expectedRevision, DateTimeOffset updatedAt,
-        CancellationToken cancellationToken = default) => BatchUnavailable();
-
-    public Task<StandaloneShareMutationResult<StandaloneShareOperationRecord>> TryRetryFailedOperationAsync(
-        Guid operationId, int expectedGeneration, long expectedRevision, DateTimeOffset updatedAt,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult(new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
-            StandaloneShareMutationDisposition.InvalidState, null));
-
-    private static Task<StandaloneShareMutationResult<StandaloneShareBatchRecord>> BatchUnavailable() =>
-        Task.FromResult(new StandaloneShareMutationResult<StandaloneShareBatchRecord>(
-            StandaloneShareMutationDisposition.InvalidState, null));
 }

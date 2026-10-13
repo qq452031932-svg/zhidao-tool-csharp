@@ -25,7 +25,7 @@
         <!-- 采集参数 -->
         <Border Style="{StaticResource Card}">
             <StackPanel>
-                <TextBlock TextWrapping="Wrap" Margin="0,0,0,14"
+                <TextBlock TextWrapping="Wrap" Margin="0,0,0,8"
                            Foreground="{StaticResource MutedBrush}"
                            Text="按关键词在百度知道里找带网盘链接的回答，提取资源名、链接与提取码。采到的结果可直接送进批量转存。" />
 
@@ -39,6 +39,7 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
                     <TextBlock Text="关键词（每行一个）" Margin="0,0,0,6"
@@ -50,7 +51,8 @@
                                  Text="{Binding KeywordText, UpdateSourceTrigger=PropertyChanged}"
                                  AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
                                  VerticalContentAlignment="Top" Height="104" Padding="2,6"
-                                 ToolTip="每行一个关键词，也可以用逗号分隔" />
+                                 IsEnabled="{Binding CanEditTask}"
+                                 ToolTip="{Binding KeywordInputHint}" />
                         <!-- 占位提示。Margin 是量出来的，不是算出来的：
                              用 UI 自动化读到真实文本落在框左上角偏移 (7,13) 处，
                              只读 TextBox 的内部渲染和可编辑的差 (2,6)，对不齐，故改回 TextBlock。
@@ -83,31 +85,41 @@
                              AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
                              VerticalContentAlignment="Top" Height="104" Padding="2,6"
                              ToolTip="登录 zhidao.baidu.com 后复制完整 Cookie。只在本机使用，不会写入日志或结果文件。" />
+                    <Button Grid.Row="2" Content="从文件导入…" Padding="12,3" Margin="0,8,0,0" HorizontalAlignment="Left"
+                            Command="{Binding ImportKeywordsCommand}"
+                            Visibility="{Binding CanImportKeywords, Converter={StaticResource BoolToVisibility}}"
+                            ToolTip="支持 Excel (.xlsx)、CSV、TSV、TXT；自动识别关键词列，去重后追加，当前批次最多 10000 个关键词" />
+
+                    <Button Grid.Row="2" Grid.Column="2" Content="验证 Cookie"
+                            Command="{Binding ValidateCookieCommand}"
+                            Padding="12,3" Margin="0,8,0,0" HorizontalAlignment="Left"
+                            ToolTip="查询知道账号登录状态，无需填写关键词" />
                 </Grid>
 
-                <Button Content="从文件导入…" Padding="12,3" Margin="0,8,0,0" HorizontalAlignment="Left"
-                        Command="{Binding ImportKeywordsCommand}"
-                        Visibility="{Binding CanImportKeywords, Converter={StaticResource BoolToVisibility}}"
-                        ToolTip="选择一个 txt，每行一个关键词；UTF-8 和 GBK 都能读" />
-
                 <!-- 模式与目标条数：目标条数只对模糊模式有意义，精准时置灰 -->
-                <DockPanel Margin="0,14,0,0" LastChildFill="False">
+                <DockPanel Margin="0,8,0,0" LastChildFill="False">
                     <RadioButton DockPanel.Dock="Left" Content="精准：每词一条"
                                  IsChecked="{Binding IsPreciseMode}" VerticalAlignment="Center"
+                                 IsEnabled="{Binding CanEditTask}"
                                  ToolTip="每个关键词各采一条，最省账号" />
                     <RadioButton DockPanel.Dock="Left" Content="模糊：采够为止" Margin="20,0,0,0"
                                  IsChecked="{Binding IsFuzzyMode}" VerticalAlignment="Center"
+                                 IsEnabled="{Binding CanEditTask}"
                                  ToolTip="围绕关键词扩展搜索，直到采够目标条数" />
                     <TextBox DockPanel.Dock="Right" Width="70" VerticalAlignment="Center"
                              Text="{Binding TargetCount, UpdateSourceTrigger=PropertyChanged}"
-                             IsEnabled="{Binding IsFuzzyMode}" />
+                             IsEnabled="{Binding CanEditTargetCount}" />
                     <TextBlock DockPanel.Dock="Right" Text="目标条数" Margin="0,0,8,0"
                                Style="{StaticResource FuzzyOnlyLabel}" />
                 </DockPanel>
 
-                <DockPanel Margin="0,14,0,0" LastChildFill="True">
+                <DockPanel Margin="0,8,0,0" LastChildFill="True">
                     <Button DockPanel.Dock="Left" Content="开始采集" Command="{Binding StartCommand}"
                             Style="{StaticResource PrimaryButton}" />
+                    <!-- 暂停会保存进度，之后（包括重开软件后）可接着采；停止则结束本次任务 -->
+                    <Button DockPanel.Dock="Left" Content="{Binding PauseButtonText}"
+                            Command="{Binding PauseResumeCommand}" Margin="8,0,0,0"
+                            ToolTip="暂停会保存进度，之后可点「继续」接着采，关闭软件后再打开也可以" />
                     <Button DockPanel.Dock="Left" Content="停止" Command="{Binding StopCommand}" Margin="8,0,0,0" />
                     <TextBlock Text="{Binding StatusMessage}" VerticalAlignment="Center" Margin="16,0,0,0"
                                Foreground="{StaticResource MutedBrush}" TextTrimming="CharacterEllipsis"
@@ -127,7 +139,7 @@
                         Command="{Binding ContinueAfterRiskCommand}" />
                 <StackPanel VerticalAlignment="Center">
                     <TextBlock Text="{Binding RiskReason}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-                    <TextBlock Text="采集已暂停，正在等你选择。换个网络节点后可继续，也可以就此停止。"
+                    <TextBlock Text="采集遇到账号限制，正在等你选择。换个网络节点后可继续，也可以就此停止。"
                                Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
                                TextTrimming="CharacterEllipsis" />
                 </StackPanel>
@@ -153,30 +165,57 @@
                                  Value="{Binding FoundCount, Mode=OneWay}" />
                 </DockPanel>
 
-                <!-- 运行日志压矮但保留多行：采集出问题时这是唯一线索 -->
-                <DockPanel DockPanel.Dock="Bottom" Height="72" Margin="0,10,0,0" LastChildFill="True">
+                <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,6">
+                    <Button Content="复制链接" Command="{Binding CopyLinksCommand}" Margin="0,0,8,0" />
+                    <Button Content="导出 Excel" Command="{Binding ExportResultsCommand}" Margin="0,0,8,0" />
+                    <Button Content="送入批量转存" Command="{Binding SendToTransferCommand}" Margin="0,0,12,0" />
+                    <TextBlock Text="{Binding ResultScopeText}" VerticalAlignment="Center" FontSize="11"
+                               Foreground="{StaticResource MutedBrush}" ToolTip="按住 Ctrl 或 Shift 可多选；未选中时操作全部结果。" />
+                </WrapPanel>
+                <TextBlock DockPanel.Dock="Top" Text="{Binding ResultActionMessage}" ToolTip="{Binding ResultActionMessage}"
+                           TextTrimming="CharacterEllipsis" Foreground="{StaticResource MutedBrush}" FontSize="11">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Margin" Value="0,0,0,6" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding ResultActionMessage}" Value="">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+                <!-- 日志保留独立滚动区域，给结果操作留出空间。 -->
+                <DockPanel DockPanel.Dock="Bottom" Height="90" Margin="0,10,0,0" LastChildFill="True">
                     <TextBlock DockPanel.Dock="Top" Text="运行日志" FontSize="11" Margin="0,0,0,2"
                                Foreground="{StaticResource MutedBrush}" />
-                    <ListBox ItemsSource="{Binding Logs}" BorderThickness="0" Background="Transparent"
-                             FontSize="11" ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                    <ListBox x:Name="RunLogList" ItemsSource="{Binding Logs}" BorderThickness="0" Background="Transparent"
+                             FontSize="11" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding}" TextWrapping="Wrap" />
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
                         <ListBox.ItemContainerStyle>
                             <Style TargetType="ListBoxItem">
                                 <Setter Property="Padding" Value="0,1" />
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
                             </Style>
                         </ListBox.ItemContainerStyle>
                     </ListBox>
                 </DockPanel>
 
-                <DataGrid ItemsSource="{Binding Resources}" Style="{StaticResource DenseDataGridStyle}"
+                <DataGrid x:Name="ResultsGrid" ItemsSource="{Binding Resources}" Style="{StaticResource DenseDataGridStyle}"
                           AutoGenerateColumns="False" IsReadOnly="True"
+                          SelectionMode="Extended" SelectionUnit="FullRow"
                           HeadersVisibility="Column" CanUserAddRows="False">
                     <DataGrid.Columns>
                         <DataGridTextColumn Header="序号" Binding="{Binding Ordinal}" Width="56" />
-                        <DataGridTextColumn Header="资源名称" Binding="{Binding Name}" Width="2*" />
-                        <DataGridTextColumn Header="资源链接" Binding="{Binding Link}" Width="3*" />
+                        <DataGridTextColumn Header="资源名称" Binding="{Binding Name}" Width="2*" MinWidth="140" />
+                        <DataGridTextColumn Header="资源链接" Binding="{Binding Link}" Width="3*" MinWidth="180" />
                         <DataGridTextColumn Header="提取码" Binding="{Binding Pwd}" Width="80" />
                         <!-- 来源保留原帖链接：可疑资源要能点回去看是谁发的 -->
-                        <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="2*" />
+                        <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="2*" MinWidth="100" />
                     </DataGrid.Columns>
                 </DataGrid>
             </DockPanel>

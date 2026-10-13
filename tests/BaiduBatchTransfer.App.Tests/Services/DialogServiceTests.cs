@@ -1,10 +1,84 @@
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Services;
+using System.Windows;
 
 namespace BaiduBatchTransfer.App.Tests.Services;
 
 public sealed class DialogServiceTests
 {
+    [Fact]
+    public async Task CompletionAndConfirmationDialogsAlwaysUseUiDispatcher()
+    {
+        var dispatcher = new RecordingDispatcher();
+        var presenter = new RecordingMessageBox(() => dispatcher.IsInsideInvocation);
+        var service = new DialogService(dispatcher, new RecordingExcelFileDialog("unused.xlsx"), messageBox: presenter);
+
+        await Task.Run(() => service.ShowMessageAsync("转存任务已完成", "完成 5 条，失败 0 条。"));
+        var confirmed = await Task.Run(() => service.ConfirmAsync("确认", "继续？"));
+
+        Assert.True(confirmed);
+        Assert.Equal(2, dispatcher.InvocationCount);
+        Assert.Equal(2, presenter.Calls.Count);
+        Assert.All(presenter.Calls, call => Assert.True(call.InsideDispatcher));
+        Assert.Equal(MessageBoxButton.OK, presenter.Calls[0].Buttons);
+        Assert.Equal(MessageBoxButton.YesNo, presenter.Calls[1].Buttons);
+    }
+
+    [Fact]
+    public async Task CancelledMessageDoesNotOpenDialog()
+    {
+        var dispatcher = new RecordingDispatcher();
+        var presenter = new RecordingMessageBox(() => dispatcher.IsInsideInvocation);
+        var service = new DialogService(dispatcher, new RecordingExcelFileDialog("unused.xlsx"), messageBox: presenter);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.ShowMessageAsync("完成", "消息", cancellation.Token));
+        Assert.Empty(presenter.Calls);
+    }
+
+    [Fact]
+    public void MessageBoxUsesTheCurrentMainWindowAsOwner()
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var window = new Window();
+                Window? currentOwner = null;
+                Window? actualOwner = null;
+                var presenter = new WpfMessageBoxPresenter(() => currentOwner, (owner, title, message, buttons, image) =>
+                {
+                    actualOwner = owner;
+                    Assert.Equal("完成", title);
+                    Assert.Equal("完成 5 条", message);
+                    return MessageBoxResult.OK;
+                });
+                currentOwner = window;
+                presenter.Show("完成", "完成 5 条", MessageBoxButton.OK, MessageBoxImage.Information);
+                Assert.Same(window, actualOwner);
+            }
+            catch (Exception error) { failure = error; }
+            finally { System.Windows.Threading.Dispatcher.CurrentDispatcher.InvokeShutdown(); }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.IsBackground = true;
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(5)));
+        if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    private sealed class RecordingMessageBox(Func<bool> insideDispatcher) : IMessageBoxPresenter
+    {
+        public List<(bool InsideDispatcher, MessageBoxButton Buttons)> Calls { get; } = [];
+        public MessageBoxResult Show(string title, string message, MessageBoxButton buttons, MessageBoxImage image)
+        {
+            Calls.Add((insideDispatcher(), buttons));
+            return buttons == MessageBoxButton.YesNo ? MessageBoxResult.Yes : MessageBoxResult.OK;
+        }
+    }
+
     [Fact]
     public async Task AsyncExcelSelectionAlwaysUsesUiDispatcher()
     {

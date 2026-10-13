@@ -84,6 +84,8 @@ public sealed record ImportPreviewRow(
     string? PrecheckStatus = null) : System.ComponentModel.INotifyPropertyChanged
 {
     private string? runtimeStatusText;
+    /// <summary>当前导入预览的连续序号；来源行号仍用于追溯和分页。</summary>
+    public long DisplayOrdinal { get; internal set; }
     public string Disposition { get; } = Disposition;
     public string? PrecheckStatus { get; } = PrecheckStatus;
     public string? RuntimeStatusText

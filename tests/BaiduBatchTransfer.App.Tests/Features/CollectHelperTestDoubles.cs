@@ -1,10 +1,10 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using System.Threading.Channels;
 using BaiduBatchTransfer.App.Features.Collect;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
@@ -13,6 +13,7 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 internal sealed class FakeCollectHelperProcess : ICollectHelperProcess
 {
     private readonly ScriptedReader reader = new();
+    private readonly ScriptedReader errorReader = new();
     private readonly RecordingWriter writer;
     private readonly TaskCompletionSource exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly bool exitsWhenInputCloses;
@@ -34,7 +35,7 @@ internal sealed class FakeCollectHelperProcess : ICollectHelperProcess
 
     public TextReader StandardOutput => reader;
 
-    public TextReader StandardError => TextReader.Null;
+    public TextReader StandardError => errorReader;
 
     public Task ExitTask => exited.Task;
 
@@ -46,9 +47,12 @@ internal sealed class FakeCollectHelperProcess : ICollectHelperProcess
 
     public void EmitRaw(string line) => reader.Emit(line);
 
+    public void EmitError(string line) => errorReader.Emit(line);
+
     public void CompleteOutput()
     {
         reader.Complete();
+        errorReader.Complete();
         exited.TrySetResult();
     }
 
@@ -63,30 +67,33 @@ internal sealed class FakeCollectHelperProcess : ICollectHelperProcess
     public void Dispose()
     {
         reader.Complete();
+        errorReader.Complete();
         exited.TrySetResult();
     }
 
     private sealed class ScriptedReader : TextReader
     {
-        private readonly BlockingCollection<string> lines = new();
+        private readonly Channel<string> lines = Channel.CreateUnbounded<string>();
 
         public void Emit(string line)
         {
-            if (!lines.IsAddingCompleted) lines.Add(line);
+            lines.Writer.TryWrite(line);
         }
 
         public void Complete()
         {
-            if (!lines.IsAddingCompleted) lines.CompleteAdding();
+            lines.Writer.TryComplete();
         }
 
-        public override string? ReadLine()
+        public override string? ReadLine() => ReadLineAsync().GetAwaiter().GetResult();
+
+        public override async Task<string?> ReadLineAsync()
         {
             try
             {
-                return lines.Take();
+                return await lines.Reader.ReadAsync();
             }
-            catch (InvalidOperationException)
+            catch (ChannelClosedException)
             {
                 return null;   // 输出已结束
             }

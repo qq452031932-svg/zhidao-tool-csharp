@@ -37,16 +37,6 @@ public sealed class StartupRecoveryRunner(
     }
 }
 
-public sealed class UnavailableAppRecoveryRunner : IAppRecoveryRunner
-{
-    public bool IsAvailable => false;
-    public string UnavailableMessage => "Windows 单实例保护尚不可用，数据库和任务调度均未启动。";
-    public Task PrepareLocalAsync(CancellationToken cancellationToken) =>
-        throw new InvalidOperationException(UnavailableMessage);
-    public Task RecoverAuthorizedAsync(CancellationToken cancellationToken) =>
-        throw new InvalidOperationException(UnavailableMessage);
-}
-
 public sealed record AppStartupResult(
     bool CoordinatorMayStart,
     string StatusMessage,

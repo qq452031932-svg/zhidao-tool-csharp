@@ -9,8 +9,8 @@ using System.Threading.Tasks;
 
 namespace BaiduBatchTransfer.App.Features.Collect;
 
-/// <summary>采到的一条资源。</summary>
-public sealed record CollectedResource(string Name, string Link, string Pwd, string Source);
+/// <summary>采到的一条资源。Restored 表示续采时从断点交还的旧结果，而非本轮新采。</summary>
+public sealed record CollectedResource(string Name, string Link, string Pwd, string Source, bool Restored = false);
 
 /// <summary>已采数量与目标数量；Target 为 0 表示不限量。</summary>
 public sealed record CollectProgress(int Found, int Target);
@@ -20,10 +20,13 @@ public sealed record CollectRiskPrompt(string Reason);
 
 /// <summary>从关键词文件读出的内容。Encoding 说明助手是按哪种编码解的。</summary>
 public sealed record CollectedKeywords(
-    IReadOnlyList<string> Items, int Lines, string Encoding, bool Truncated);
+    IReadOnlyList<string> Items, int Lines, string Encoding, bool Truncated, string Source = "", int Total = 0);
 
-/// <summary>一次采集的结束。Stopped 表示是被要求停止的，而非自然跑完。</summary>
-public sealed record CollectOutcome(int Found, bool Stopped, IReadOnlyDictionary<string, int> Stats);
+/// <summary>
+/// 一次采集的结束。Stopped 表示没有自然跑完；其中 Paused 是用户主动暂停，Failed 是出错中断。
+/// </summary>
+public sealed record CollectOutcome(int Found, bool Stopped, IReadOnlyDictionary<string, int> Stats,
+    bool Paused = false, bool Failed = false);
 
 /// <summary>一次采集的参数。</summary>
 public sealed record CollectRequest(
@@ -44,6 +47,7 @@ internal interface ICollectHelperProcess : IDisposable
 {
     TextWriter StandardInput { get; }
     TextReader StandardOutput { get; }
+    TextReader StandardError { get; }
     Task ExitTask { get; }
     void Kill();
 }
@@ -62,6 +66,10 @@ public sealed class CollectHelperClient : IAsyncDisposable
 
     private readonly ICollectHelperProcess process;
     private readonly Task readPump;
+    private readonly Task errorPump;
+    private readonly object sensitiveValuesLock = new();
+    private string[] sensitiveValues = [];
+    private int channelBroken;
     private readonly SemaphoreSlim writeGate = new(1, 1);
     private readonly TaskCompletionSource readyGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int disposed;
@@ -70,10 +78,14 @@ public sealed class CollectHelperClient : IAsyncDisposable
     {
         this.process = process;
         readPump = Task.Run(PumpAsync);
+        errorPump = Task.Run(PumpErrorAsync);
     }
 
     /// <summary>进程是否已退出。</summary>
     public bool HasExited => process.ExitTask.IsCompleted;
+
+    public bool IsConnected => Volatile.Read(ref disposed) == 0 &&
+        Volatile.Read(ref channelBroken) == 0 && !HasExited && !readPump.IsCompleted;
 
     /// <summary>采到一条资源。</summary>
     public event Action<CollectedResource>? ResourceCollected;
@@ -95,6 +107,8 @@ public sealed class CollectHelperClient : IAsyncDisposable
 
     /// <summary>助手报告的错误；助手本身仍然存活。</summary>
     public event Action<string>? Failed;
+
+    public event Action<string>? StartRejected;
 
     /// <summary>助手意外退出，信道已不可用。</summary>
     public event Action<string>? ChannelBroken;
@@ -144,8 +158,8 @@ public sealed class CollectHelperClient : IAsyncDisposable
             StandardOutputEncoding = new UTF8Encoding(false),
             StandardErrorEncoding = new UTF8Encoding(false),
         };
-        // -B 不写字节码，-E 忽略环境变量，-s 排除用户站点目录
-        foreach (var argument in new[] { "-B", "-E", "-s", mainScriptPath }) info.ArgumentList.Add(argument);
+        // -E 会忽略 PYTHONIOENCODING；显式 -X utf8 保证导入阶段的诊断也使用 UTF-8。
+        foreach (var argument in new[] { "-B", "-E", "-s", "-X", "utf8", "-u", mainScriptPath }) info.ArgumentList.Add(argument);
         return info;
     }
 
@@ -167,6 +181,16 @@ public sealed class CollectHelperClient : IAsyncDisposable
     public Task StartCollectingAsync(CollectRequest request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        // stderr 可能晚于上一轮 done 到达，保留本进程接收过的 Cookie，防止换号后泄漏旧值。
+        lock (sensitiveValuesLock)
+        {
+            var values = request.Accounts.SelectMany(account =>
+                new[] { account.Cookie }.Concat(account.Cookie.Split(';').Select(part =>
+                    part.Contains('=') ? part[(part.IndexOf('=') + 1)..].Trim() : part.Trim())
+                    .Where(value => value.Length >= 4)));
+            Volatile.Write(ref sensitiveValues, sensitiveValues.Concat(values)
+                .Where(value => value.Length > 0).Distinct().OrderByDescending(value => value.Length).ToArray());
+        }
         var command = new Dictionary<string, object?>
         {
             ["cmd"] = "start",
@@ -185,6 +209,10 @@ public sealed class CollectHelperClient : IAsyncDisposable
     /// <summary>请求停止；助手会在下一个可中断点收尾，并仍然给出 Completed。</summary>
     public Task StopCollectingAsync(CancellationToken cancellationToken) =>
         SendAsync(new Dictionary<string, object?> { ["cmd"] = "stop" }, cancellationToken);
+
+    /// <summary>用户主动暂停；助手收尾后给出 Paused 的 Completed，进度留在断点里。</summary>
+    public Task PauseCollectingAsync(CancellationToken cancellationToken) =>
+        SendAsync(new Dictionary<string, object?> { ["cmd"] = "pause" }, cancellationToken);
 
     /// <summary>答复一次风控询问。</summary>
     public Task AnswerRiskAsync(bool shouldContinue, CancellationToken cancellationToken) =>
@@ -221,6 +249,9 @@ public sealed class CollectHelperClient : IAsyncDisposable
     private async Task SendAsync(Dictionary<string, object?> command, CancellationToken cancellationToken)
     {
         var line = JsonSerializer.Serialize(command, JsonOptions);
+        // 与 Python protocol.MAX_FRAME_BYTES 保持一致，包含 WriteLine 的换行符。
+        if (Encoding.UTF8.GetByteCount(line) + Encoding.UTF8.GetByteCount(process.StandardInput.NewLine) > 1024 * 1024)
+            throw new InvalidOperationException("采集参数过大，请减少关键词数量或分批采集。");
         await writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -235,6 +266,7 @@ public sealed class CollectHelperClient : IAsyncDisposable
 
     private async Task PumpAsync()
     {
+        var failure = "采集助手输出通道已关闭。";
         try
         {
             while (await process.StandardOutput.ReadLineAsync().ConfigureAwait(false) is { } line)
@@ -245,11 +277,33 @@ public sealed class CollectHelperClient : IAsyncDisposable
         }
         catch (Exception error) when (Volatile.Read(ref disposed) == 0)
         {
-            ChannelBroken?.Invoke(error.Message);
+            failure = $"采集助手输出通道中断：{SafeDiagnostic(error.Message)}";
         }
 
         readyGate.TrySetException(new InvalidOperationException("采集助手在就绪前退出。"));
-        if (Volatile.Read(ref disposed) == 0) ChannelBroken?.Invoke("采集助手已退出。");
+        if (Volatile.Read(ref disposed) == 0 && Interlocked.Exchange(ref channelBroken, 1) == 0)
+            ChannelBroken?.Invoke(HasExited ? "采集助手已退出。" : failure);
+    }
+
+    private async Task PumpErrorAsync()
+    {
+        try
+        {
+            while (await process.StandardError.ReadLineAsync().ConfigureAwait(false) is { } line)
+                if (line.Length > 0) LogWritten?.Invoke($"[助手诊断] {SafeDiagnostic(line)}");
+        }
+        catch (Exception) when (Volatile.Read(ref disposed) != 0) { }
+        catch (Exception)
+        {
+            LogWritten?.Invoke("采集助手诊断通道中断，请查看采集状态。");
+        }
+    }
+
+    private string SafeDiagnostic(string text)
+    {
+        foreach (var value in Volatile.Read(ref sensitiveValues))
+            text = text.Replace(value, "[已隐藏]", StringComparison.Ordinal);
+        return text;
     }
 
     private void Dispatch(string line)
@@ -261,7 +315,7 @@ public sealed class CollectHelperClient : IAsyncDisposable
         }
         catch (JsonException)
         {
-            LogWritten?.Invoke($"忽略无法解析的助手输出：{Truncate(line)}");
+            LogWritten?.Invoke($"忽略无法解析的助手输出：{Truncate(SafeDiagnostic(line))}");
             return;
         }
 
@@ -269,7 +323,7 @@ public sealed class CollectHelperClient : IAsyncDisposable
             !frame.TryGetProperty("ev", out var eventName) ||
             eventName.ValueKind != JsonValueKind.String)
         {
-            LogWritten?.Invoke($"忽略缺少事件名的助手输出：{Truncate(line)}");
+            LogWritten?.Invoke($"忽略缺少事件名的助手输出：{Truncate(SafeDiagnostic(line))}");
             return;
         }
 
@@ -280,30 +334,36 @@ public sealed class CollectHelperClient : IAsyncDisposable
                 break;
             case "item":
                 ResourceCollected?.Invoke(new CollectedResource(
-                    Text(frame, "name"), Text(frame, "link"), Text(frame, "pwd"), Text(frame, "source")));
+                    Text(frame, "name"), Text(frame, "link"), Text(frame, "pwd"), Text(frame, "source"),
+                    Flag(frame, "restored")));
                 break;
             case "progress":
                 ProgressChanged?.Invoke(new CollectProgress(Number(frame, "found"), Number(frame, "target")));
                 break;
             case "status":
-                StatusChanged?.Invoke(Text(frame, "text"));
+                StatusChanged?.Invoke(SafeDiagnostic(Text(frame, "text")));
                 break;
             case "log":
-                LogWritten?.Invoke(Text(frame, "text"));
+                LogWritten?.Invoke(SafeDiagnostic(Text(frame, "text")));
                 break;
             case "ask":
-                RiskEncountered?.Invoke(new CollectRiskPrompt(Text(frame, "reason")));
+                RiskEncountered?.Invoke(new CollectRiskPrompt(SafeDiagnostic(Text(frame, "reason"))));
                 break;
             case "keywords":
                 KeywordsLoaded?.Invoke(new CollectedKeywords(
                     Strings(frame, "items"), Number(frame, "lines"),
-                    Text(frame, "encoding"), Flag(frame, "truncated")));
+                    Text(frame, "encoding"), Flag(frame, "truncated"), Text(frame, "source"), Number(frame, "total")));
                 break;
             case "done":
-                Completed?.Invoke(new CollectOutcome(Number(frame, "found"), Flag(frame, "stopped"), Stats(frame)));
+                Completed?.Invoke(new CollectOutcome(Number(frame, "found"), Flag(frame, "stopped"), Stats(frame),
+                    Flag(frame, "paused"), Flag(frame, "failed")));
                 break;
             case "error":
-                Failed?.Invoke(Text(frame, "message"));
+                var message = SafeDiagnostic(Text(frame, "message"));
+                Failed?.Invoke(message);
+                if (Text(frame, "command") == "start" &&
+                    frame.TryGetProperty("running", out var running) && running.ValueKind == JsonValueKind.False)
+                    StartRejected?.Invoke(message);
                 break;
             case "started":
             case "pong":
@@ -393,6 +453,7 @@ public sealed class CollectHelperClient : IAsyncDisposable
         }
 
         await Task.WhenAny(readPump, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false);
+        await Task.WhenAny(errorPump, Task.Delay(TimeSpan.FromSeconds(1))).ConfigureAwait(false);
         writeGate.Dispose();
         process.Dispose();
     }
@@ -407,12 +468,11 @@ public sealed class CollectHelperClient : IAsyncDisposable
             process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             process.Exited += (_, _) => exited.TrySetResult();
             if (!process.Start()) throw new InvalidOperationException("无法启动采集助手进程。");
-            process.BeginErrorReadLine();
-            process.ErrorDataReceived += (_, _) => { };
         }
 
         public TextWriter StandardInput => process.StandardInput;
         public TextReader StandardOutput => process.StandardOutput;
+        public TextReader StandardError => process.StandardError;
         public Task ExitTask => exited.Task;
 
         public void Kill() => process.Kill(entireProcessTree: true);

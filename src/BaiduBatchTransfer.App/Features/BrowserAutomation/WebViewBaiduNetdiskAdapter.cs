@@ -9,7 +9,6 @@ namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
 public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdapter
 {
-    private static readonly Uri OfficialFilesUri = new("https://pan.baidu.com/disk/main");
     private readonly IBaiduNetdiskAdapter readOnlyAdapter;
     private readonly IVisibleWebAutomationBroker broker;
     private readonly IAccountProfilePathPolicy profilePaths;

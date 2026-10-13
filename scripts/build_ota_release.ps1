@@ -556,7 +556,8 @@ function Invoke-ProductionRelease {
             'scripts/ProductIdentity.ps1',
             'scripts/Test-OtaUploadBundle.ps1',
             'scripts/verify_managed_browser_helper_package.ps1',
-            'tools/managed_browser_helper')
+            'tools/managed_browser_helper',
+            'tools/collect_helper')
         $tracked = @(Get-TrackedGitPaths $Source $Commit $sourcePathspecs)
         if ($tracked.Count -eq 0) { throw 'Unable to enumerate the commit-pinned production source allowlist.' }
         foreach ($relativePath in $tracked) {

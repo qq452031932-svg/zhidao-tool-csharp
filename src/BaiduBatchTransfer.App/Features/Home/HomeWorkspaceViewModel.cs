@@ -22,16 +22,18 @@ public sealed class HomeWorkspaceViewModel
 
     public string ProductName => "知道综合工具";
     public string VersionDisplay => $"v{Updates.ApplicationBuildInfo.Current.ProductVersion}";
-    public string Tagline => "百度网盘批量管理工作台：批量转存、分享监控与账号管理。";
+    public string Tagline => "百度知道资源采集与网盘批量管理工作台。";
     public string ContactHint => "技术支持与卡密购买请联系微信：swatfanhua";
 
     public IReadOnlyList<HomeFeature> Features { get; } =
     [
         new("批量转存", "导入分享链接或 Excel，按目标目录批量转存，可多账号复制或分流。"),
+        new("知道采集", "按关键词精准或模糊采集网盘资源，支持表格导入、结果导出及送入批量转存。"),
         new("监控反馈", "跟踪分享链接状态，失效时能第一时间发现。"),
         new("广告插入", "在转存结果中批量插入推广内容。"),
         new("文件排除", "按规则跳过不需要的文件，避免占用容量。"),
         new("数据统计", "汇总转存与分享的执行情况。"),
+        new("设置中心", "管理软件授权、检查更新和常用设置。"),
         new("账号管理", "登录并管理多个百度网盘账号，查看各账号剩余容量。"),
     ];
 

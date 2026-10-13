@@ -106,6 +106,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     private bool durableSessionObserved;
     private bool isClosed;
     private long totalRows;
+    private long displayOrdinalOffset;
     private long? nextCursor;
     private ImportPreviewRow? selectedRow;
     private string selectedShareUrl = string.Empty;
@@ -264,18 +265,39 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
             cancellationToken);
     }
 
-    public async Task ImportExcelAsync(string filePath, CancellationToken cancellationToken = default)
+    public async Task ImportExcelAsync(string filePath, CancellationToken cancellationToken = default,
+        bool preserveCurrentOnFailure = false)
     {
         if (!CanEdit || string.IsNullOrWhiteSpace(filePath)) return;
         using var activity = activityGate.TryEnterActivity();
         if (activity is null) return;
         var newSessionId = Guid.NewGuid();
-        BeginNewImport();
+        var previousSession = sessionId;
+        var previousDurable = durableSessionObserved;
+        var previousCanResume = CanResumeImport;
+        BeginNewImport(discardPrevious: !preserveCurrentOnFailure);
         await RunImportAsync(
             newSessionId,
             isResume: false,
             (progress, token) => workflow.ImportExcelAsync(newSessionId, filePath, progress, token),
             cancellationToken);
+        if (!preserveCurrentOnFailure || isClosed) return;
+        if (sessionId is null)
+        {
+            // 列映射取消或文件检查失败时，尚未建立新会话；旧表格、选择和统计仍在。
+            sessionId = previousSession;
+            durableSessionObserved = previousDurable;
+            CanResumeImport = previousCanResume;
+            pageGeneration++;
+            OnPropertyChanged(nameof(SessionId));
+            RaiseCommands();
+            if (previousSession is not null) StatusMessage += " 原导入内容已保留。";
+        }
+        else if (previousSession is { } replaced && replaced != sessionId)
+        {
+            // 新会话已落盘（包括可恢复的部分导入），此时才释放旧来源。
+            workflow.DiscardReplaySource(replaced);
+        }
     }
 
     public async Task SelectAndImportExcelAsync(CancellationToken cancellationToken = default)
@@ -509,6 +531,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         var expectedSession = sessionId.Value;
         var generation = pageGeneration;
+        var requestedOrdinalOffset = cursor is null ? 0 : displayOrdinalOffset + Rows.Count;
         try
         {
             var page = await pageSource.LoadAsync(new(expectedSession, PageSize, cursor), linked.Token);
@@ -518,7 +541,13 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
             void Apply()
             {
                 Rows.Clear();
-                foreach (var item in page.Items) Rows.Add(item);
+                var ordinal = requestedOrdinalOffset;
+                foreach (var item in page.Items)
+                {
+                    item.DisplayOrdinal = ++ordinal;
+                    Rows.Add(item);
+                }
+                displayOrdinalOffset = requestedOrdinalOffset;
                 SelectedRow = selectedRowId is { } rowId
                     ? Rows.FirstOrDefault(x => x.RowId == rowId)
                     : null;
@@ -582,9 +611,9 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
             ? workflow.CanResumeAsync(persistedSessionId, CancellationToken.None)
             : Task.FromResult(false);
 
-    private void BeginNewImport()
+    private void BeginNewImport(bool discardPrevious = true)
     {
-        if (sessionId is { } previousSessionId)
+        if (discardPrevious && sessionId is { } previousSessionId)
             workflow.DiscardReplaySource(previousSessionId);
         durableSessionObserved = false;
         CanResumeImport = false;

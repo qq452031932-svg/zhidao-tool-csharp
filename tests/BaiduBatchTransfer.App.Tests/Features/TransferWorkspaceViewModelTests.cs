@@ -584,18 +584,50 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
-    public async Task ASuccessfulStartHandsTheRunLogOverToTheResults()
+    public async Task ASuccessfulStartKeepsTheRunLogVisibleThroughResultInitialization()
     {
-        // 点"开始转存"先把运行日志顶到前台，任务真的建起来之后再交给处理结果。
-        // 失败的早退因此停在日志上（见 LicenseFailureStopsBeforeTransferJobCreation…），
-        // 成功的则停在结果上——两种情况用户都不会对着没有变化的"待处理链接"空等。
         using var fixture = Fixture.Valid();
         fixture.ViewModel.SelectedDataTabIndex = TransferWorkspaceViewModel.PendingLinksTabIndex;
 
         await fixture.ViewModel.StartAsync();
 
         Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
+        Assert.Equal(TransferWorkspaceViewModel.RunLogTabIndex, fixture.ViewModel.SelectedDataTabIndex);
+        await fixture.RunPanel.Results.InitializeAsync(fixture.ViewModel.CreatedBatchJobId!.Value);
+        Assert.Equal(TransferWorkspaceViewModel.RunLogTabIndex, fixture.ViewModel.SelectedDataTabIndex);
+
+        // A manual choice remains in effect during subsequent refreshes.
+        fixture.ViewModel.SelectedDataTabIndex = TransferWorkspaceViewModel.ResultsTabIndex;
+        await fixture.RunPanel.Results.RefreshAsync();
         Assert.Equal(TransferWorkspaceViewModel.ResultsTabIndex, fixture.ViewModel.SelectedDataTabIndex);
+    }
+
+    [Fact]
+    public async Task OpeningAnotherHistoricalBatchStillShowsItsResults()
+    {
+        using var fixture = Fixture.Valid();
+        await fixture.ViewModel.StartAsync();
+        fixture.ViewModel.SelectedDataTabIndex = TransferWorkspaceViewModel.RunLogTabIndex;
+
+        await fixture.RunPanel.Results.InitializeAsync(Guid.NewGuid());
+
+        Assert.Equal(TransferWorkspaceViewModel.ResultsTabIndex, fixture.ViewModel.SelectedDataTabIndex);
+    }
+
+    [Fact]
+    public async Task ExplicitlyOpeningTheCurrentBatchShowsResultsAndStopsNavigatingAfterClose()
+    {
+        using var fixture = Fixture.Valid();
+        await fixture.ViewModel.StartAsync();
+        fixture.ViewModel.SelectedDataTabIndex = TransferWorkspaceViewModel.RunLogTabIndex;
+
+        await fixture.RunPanel.LoadSelectedBatchAsync();
+
+        Assert.Equal(TransferWorkspaceViewModel.ResultsTabIndex, fixture.ViewModel.SelectedDataTabIndex);
+        fixture.ViewModel.SelectedDataTabIndex = TransferWorkspaceViewModel.RunLogTabIndex;
+        fixture.ViewModel.Close();
+        await fixture.RunPanel.LoadSelectedBatchAsync();
+        Assert.Equal(TransferWorkspaceViewModel.RunLogTabIndex, fixture.ViewModel.SelectedDataTabIndex);
     }
 
     [Fact]
@@ -1054,7 +1086,7 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
-    public async Task PendingRowsStartOnlyForIncludedRawReadyRowsAndExplicitlySelectResults()
+    public async Task PendingRowsStartOnlyForIncludedRawReadyRowsAndKeepRunLogVisible()
     {
         using var fixture = Fixture.Valid();
         var included = new ImportPreviewRow(Guid.NewGuid(), 1, "url", null, null, "任意文字", null, "Ready");
@@ -1065,7 +1097,7 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
         Assert.Equal("已进入任务", included.DisplayDispositionText);
         Assert.Null(excluded.RuntimeStatusText);
-        Assert.Equal(1, fixture.ViewModel.SelectedDataTabIndex);
+        Assert.Equal(TransferWorkspaceViewModel.RunLogTabIndex, fixture.ViewModel.SelectedDataTabIndex);
         var later = new ImportPreviewRow(Guid.NewGuid(), 3, "url", null, null, "就绪", null, "Ready");
         fixture.Import.Rows.Add(later);
         Assert.Null(later.RuntimeStatusText);
@@ -1317,6 +1349,9 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.Equal("Completed", fixture.RunPanel.SelectedBatch?.BatchStatus);
         var log = Assert.Single(vm.Logs, entry => entry.Message == dialog.Message);
         Assert.Equal(expectedLevel, log.Level);
+        if (failDialog)
+            Assert.Contains(vm.Logs, entry => entry.Level == WorkspaceLogLevel.Warning &&
+                entry.Message.Contains("完成提示未能显示"));
         workflow.FailSummary = false;
         await fixture.RunPanel.Results.RefreshAsync();
         await fixture.RunPanel.InitializeAsync();
@@ -2086,6 +2121,12 @@ public sealed class TransferWorkspaceViewModelTests
     public async Task StartSavesCurrentEditThenPrechecksBeforeConfirmation()
     {
         using var fixture = Fixture.Valid();
+        var selectedTabs = new List<int>();
+        fixture.ViewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(TransferWorkspaceViewModel.SelectedDataTabIndex))
+                selectedTabs.Add(fixture.ViewModel.SelectedDataTabIndex);
+        };
         fixture.Import.SelectedRow = new(
             Guid.NewGuid(), 1, "https://pan.baidu.com/s/original", "a1b2", null, "就绪", null);
         fixture.Import.SelectedShareUrl = "https://pan.baidu.com/s/edited";
@@ -2100,6 +2141,7 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.Equal("https://pan.baidu.com/s/edited", fixture.ImportWorkflow.SavedUrl);
         Assert.Equal("c3d4", fixture.ImportWorkflow.SavedCode);
         Assert.DoesNotContain("创建任务", fixture.Dialog.LastConfirmationMessage, StringComparison.Ordinal);
+        Assert.Equal([TransferWorkspaceViewModel.RunLogTabIndex], selectedTabs);
     }
 
     [Fact]

@@ -6,7 +6,9 @@ stdout 只承载协议帧；任何诊断输出一律走 stderr，否则会污染
 命令（宿主 -> 助手）：
     start   开始一次采集；携带模式、关键词、目标数量与账号
     stop    请求停止；助手会在下一个可中断点收尾并发回 done
-    resume  回答一次 ask；continue 为 false 等同于停止
+    pause   用户主动暂停；同样收尾并发回 done（paused 为 true），进度留在断点里，
+            之后用 resume 为 true 的 start 接着采
+    resume  回答一次风控 ask；continue 为 false 等同于停止（与 pause 后的续采无关）
     ping    连通性探测，助手回 pong
     read_keywords  读取一个关键词文件并回传；编码交给助手判别
 
@@ -18,7 +20,7 @@ stdout 只承载协议帧；任何诊断输出一律走 stderr，否则会污染
     status    面向用户的状态文字
     log       诊断文字
     ask       撞上风控，等待宿主答复；在收到 resume 前助手会阻塞
-    done      本次采集结束
+    done      本次采集结束；stopped 表示未自然采完，paused 表示因用户暂停，failed 表示出错中断
     error     本次命令失败，助手仍然存活
     pong      ping 的回应
     keywords  read_keywords 的结果，含去重后的关键词与原始行数
@@ -30,7 +32,7 @@ import json
 
 PROTOCOL_VERSION = 1
 
-COMMANDS = ("start", "stop", "resume", "ping", "read_keywords")
+COMMANDS = ("start", "stop", "pause", "resume", "ping", "read_keywords")
 EVENTS = ("ready", "started", "item", "progress", "status", "log",
           "ask", "done", "error", "pong", "keywords")
 
@@ -116,11 +118,18 @@ def parse_start(frame: dict) -> dict:
         "count": count,
         "accounts": normalized,
         "time_range": str(frame.get("time_range") or "auto"),
-        "detail_mode": bool(frame.get("detail_mode", True)),
+        "detail_mode": normalize_detail_mode(frame.get("detail_mode", True)),
         "dedupe_names": bool(frame.get("dedupe_names", True)),
         "resume": bool(frame.get("resume", False)),
         "checkpoint_path": frame.get("checkpoint_path") or None,
     }
+
+
+def normalize_detail_mode(value):
+    """保留宿主 bool 协议，并映射到原版三种详情模式。"""
+    if isinstance(value, bool):
+        return "auto" if value else "off"
+    return value if value in ("auto", "off", "always") else "auto"
 
 
 def parse_read_keywords(frame: dict) -> str:
@@ -132,36 +141,9 @@ def parse_read_keywords(frame: dict) -> str:
 
 
 def read_keyword_file(path) -> dict:
-    """读取关键词文件，返回去重后的关键词与原始行数。
-
-    编码判别与 lxds 的采集入口一致：先按 UTF-8（容忍 BOM），失败再按 GB18030。
-    中文 Windows 上用记事本另存的旧文件多是后者，直接按 UTF-8 读会炸。
-    """
-    from pathlib import Path
-
-    target = Path(path)
-    if not target.is_file():
-        raise ProtocolError("找不到文件：%s" % path)
-    size = target.stat().st_size
-    if size > MAX_KEYWORD_FILE_BYTES:
-        raise ProtocolError("文件超过 %d MB" % (MAX_KEYWORD_FILE_BYTES // (1024 * 1024)))
-
-    raw = target.read_bytes()
+    """读取关键词列；保留原协议入口与上限。"""
+    from keyword_files import KeywordFileError, read_keyword_file as read
     try:
-        content = raw.decode("utf-8-sig")
-        encoding = "utf-8"
-    except UnicodeDecodeError:
-        try:
-            content = raw.decode("gb18030")
-            encoding = "gb18030"
-        except UnicodeDecodeError as error:
-            raise ProtocolError("无法识别文件编码，请另存为 UTF-8 后重试") from error
-
-    lines = content.splitlines()
-    words = list(dict.fromkeys(
-        word for word in (line.strip() for line in lines) if word))
-    truncated = len(words) > MAX_KEYWORDS
-    if truncated:
-        words = words[:MAX_KEYWORDS]
-    return {"items": words, "lines": len(lines), "encoding": encoding,
-            "truncated": truncated}
+        return read(path, max_bytes=MAX_KEYWORD_FILE_BYTES, max_keywords=MAX_KEYWORDS)
+    except (KeywordFileError, OSError) as error:
+        raise ProtocolError(str(error)) from error

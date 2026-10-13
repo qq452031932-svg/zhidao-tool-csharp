@@ -213,6 +213,7 @@ public sealed class CollectViewModelTests
         var (model, process, _) = await CreateAsync();
         await Configure(model).StartCommand.ExecuteAsync(null);
         process.Emit(new { ev = "item", name = "旧的一条", link = "l", pwd = "p", source = "s" });
+        process.Emit(new { ev = "log", text = "旧日志" });
         await WaitUntil(() => model.Resources.Count == 1);
 
         process.Emit(new { ev = "done", found = 1, stopped = false, stats = new { found = 1 } });
@@ -220,7 +221,8 @@ public sealed class CollectViewModelTests
 
         await model.StartCommand.ExecuteAsync(null);
         Assert.Empty(model.Resources);
-        Assert.Empty(model.Logs);
+        Assert.DoesNotContain(model.Logs, entry => entry.Contains("旧日志"));
+        Assert.Contains(model.Logs, entry => entry.Contains("正在启动采集助手"));
         Assert.Equal(0, model.FoundCount);
     }
 
@@ -344,9 +346,105 @@ public sealed class CollectViewModelTests
         Assert.Single(model.Resources);          // 重复订阅会让这里变成 2 行
     }
 
+    [Fact]
+    public async Task CookieValidationDoesNotTreatHelperCommandsAsProofOfLogin()
+    {
+        var (_, process, session) = await CreateAsync();
+        var model = new CollectViewModel(session, action => action(),
+            cookieValidator: new StubCookieValidator((_, _) => Task.FromResult(
+                new ZhidaoCookieValidationResult(false, "Cookie 已失效或未登录。"))));
+        model.CookieText = "BDUSS=invalid-test-cookie";
+
+        await model.ValidateCookieCommand.ExecuteAsync(null);
+
+        Assert.DoesNotContain("验证通过", model.StatusMessage);
+        Assert.Empty(process.WrittenCommands());
+        Assert.Equal(0, session.ConnectCount);
+    }
+
+    [Fact]
+    public async Task CookieValidationWaitsForTheAccountResponseAndRejectsChangedInput()
+    {
+        var pending = new TaskCompletionSource<ZhidaoCookieValidationResult>();
+        var (_, _, session) = await CreateAsync();
+        var model = new CollectViewModel(session, action => action(),
+            cookieValidator: new StubCookieValidator((_, _) => pending.Task));
+        model.CookieText = "BDUSS=first-test-cookie";
+
+        var validation = model.ValidateCookieCommand.ExecuteAsync(null);
+        Assert.True(model.IsBusy);
+        Assert.False(model.StartCommand.CanExecute(null));
+        Assert.False(model.ValidateCookieCommand.CanExecute(null));
+        Assert.DoesNotContain("验证通过", model.StatusMessage);
+
+        model.CookieText = "BDUSS=changed-test-cookie";
+        pending.SetResult(new(true, "Cookie 验证通过。"));
+        await validation;
+        Assert.Contains("已更改", model.StatusMessage);
+        Assert.DoesNotContain("验证通过", model.StatusMessage);
+        Assert.False(model.IsBusy);
+        Assert.True(model.ValidateCookieCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task CookieValidationReportsTheConfirmedResultWithoutKeywordsOrCollection()
+    {
+        var (_, process, session) = await CreateAsync();
+        var model = new CollectViewModel(session, action => action(),
+            cookieValidator: new StubCookieValidator((cookie, _) =>
+            {
+                Assert.Equal("BDUSS=test-cookie", cookie);
+                return Task.FromResult(new ZhidaoCookieValidationResult(true, "Cookie 验证通过。"));
+            }));
+        model.CookieText = "  BDUSS=test-cookie  ";
+        await model.ValidateCookieCommand.ExecuteAsync(null);
+        Assert.Contains("验证通过", model.StatusMessage);
+        Assert.False(model.IsCollecting);
+        Assert.Empty(model.Resources);
+        Assert.Empty(process.WrittenCommands());
+        Assert.Equal(0, session.ConnectCount);
+    }
+
+    private sealed class StubCookieValidator(
+        Func<string, CancellationToken, Task<ZhidaoCookieValidationResult>> validate) : IZhidaoCookieValidator
+    {
+        public Task<ZhidaoCookieValidationResult> ValidateAsync(string cookie, CancellationToken cancellationToken) =>
+            validate(cookie, cancellationToken);
+    }
+
+    [Fact]
+    public async Task StartingAgainAfterCompletionDoesNotDuplicateSubscriptions()
+    {
+        var (model, process, session) = await CreateAsync();
+        await Configure(model).StartCommand.ExecuteAsync(null);
+        process.Emit(new { ev = "done", found = 0, stopped = false, stats = new { } });
+        await WaitUntil(() => !model.IsCollecting);
+
+        await model.StartCommand.ExecuteAsync(null);
+        process.Emit(new { ev = "item", name = "测试资源", link = "test", pwd = "abcd", source = "test" });
+        process.Emit(new { ev = "progress", found = 1, target = 2 });
+        await WaitUntil(() => model.FoundCount == 1);
+        Assert.Single(model.Resources);
+        Assert.Equal(1, session.ConnectCount);
+    }
+
     private sealed class StubKeywordFileDialog(string? path) : IKeywordFileDialog
     {
         public string? Show() => path;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RejectedStartReleasesTheUiOnlyWhenNoCollectionIsRunning(bool helperRunning)
+    {
+        var (model, process, _) = await CreateAsync();
+        await Configure(model).StartCommand.ExecuteAsync(null);
+        process.Emit(new { ev = "error", command = "start", running = helperRunning, message = "启动请求被拒绝" });
+        await WaitUntil(() => helperRunning
+            ? model.StatusMessage == "启动请求被拒绝"
+            : model.StatusMessage.Contains("未能开始"));
+        Assert.Equal(helperRunning, model.IsCollecting);
     }
 
     private static async Task WaitUntil(Func<bool> condition)

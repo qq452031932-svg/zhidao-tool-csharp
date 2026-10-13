@@ -11,7 +11,6 @@ public sealed class ExistingShareDecisionService
     private readonly IBaiduSessionStore sessionStore;
     private readonly IExistingShareDecisionStore store;
     private readonly TimeProvider timeProvider;
-    private readonly ShareReconciliationPolicy policy = new();
 
     public ExistingShareDecisionService(
         IBaiduShareAdapter adapter,
@@ -245,11 +244,6 @@ public sealed class ExistingShareDecisionService
                 value.AccountId, value.DiscoveredCount, value.CompatibleCount, value.IncompatibleCount,
                 accounts.Single(account => account.AccountId == value.AccountId).AccountDisplayName)).ToArray());
     }
-
-    private static PermanentShareRequest Request(BatchShareSettingsRecord settings, RemoteItemIdentitySet items) =>
-        string.Equals(settings.ExtractionCodeMode, "Random", StringComparison.Ordinal)
-            ? new(items)
-            : new(items, settings.FixedExtractionCode);
 
     private static void ValidateAccount(ShareDecisionAccountContext account, Guid batchJobId)
     {

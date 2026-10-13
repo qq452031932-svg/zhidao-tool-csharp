@@ -134,6 +134,9 @@ public static class AppBootstrap
         services.AddSingleton<IApplicationUpdateService>(sp =>
             sp.GetRequiredService<ApplicationUpdateService>());
         services.AddSingleton(paths);
+        services.AddSingleton<IRunLog>(_ => new FileRunLog(Path.Combine(paths.RootDirectory, "logs")));
+        services.AddSingleton<ICollectPauseStore>(_ => new FileCollectPauseStore(
+            Path.Combine(paths.RootDirectory, "collect", "paused-task.json")));
         services.AddSingleton(_ => new SqliteConnectionFactory(paths.DatabasePath));
         services.AddSingleton<IUnitOfWorkFactory, SqliteUnitOfWorkFactory>();
         services.AddSingleton<SqliteAccountCapacityStore>();
@@ -918,7 +921,9 @@ public sealed class AppShellFactory(
     LocalTerminalHistoryService historyCleanupService,
     ILocalHistoryCleanupInteraction historyCleanupInteraction,
     ICurrentImportCleanupInteraction currentImportCleanupInteraction,
-    ILicenseActivationPresenter? licenseActivationPresenter = null) : IAppShellFactory
+    ILicenseActivationPresenter? licenseActivationPresenter = null,
+    ICollectPauseStore? collectPauseStore = null,
+    IRunLog? runLog = null) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
@@ -1045,7 +1050,8 @@ public sealed class AppShellFactory(
             // 未激活时点"开始转存"要当场弹窗并给出激活入口，而不是只写一行日志。
             licenseActivationPresenter is null
                 ? null
-                : token => licenseActivationPresenter.PresentAsync(token));
+                : token => licenseActivationPresenter.PresentAsync(token),
+            runLog);
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
         // 首页在 ReadLicenseSettings 之后才能装配，因为它要显示授权状态。
         object homeWorkspace = new DeferredWorkspaceView(
@@ -1125,7 +1131,19 @@ public sealed class AppShellFactory(
         homeWorkspace = new HomeWorkspaceView(new HomeWorkspaceViewModel());
         var collectSession = new CollectHelperSession();
         var collectViewModel = new CollectViewModel(collectSession,
-            keywordFileDialog: new WpfKeywordFileDialog());
+            keywordFileDialog: new WpfKeywordFileDialog(),
+            resultActions: new CollectResultActions(textClipboard, resultSaveDialog, dialogService,
+                importViewModel,
+                () => transferViewModel.CanEditConfiguration && wizardViewModel.CanEdit &&
+                    transferViewModel.CreatedBatchJobId is null,
+                () =>
+                {
+                    transferViewModel.IsConfigurationExpanded = true;
+                    transferViewModel.SelectedDataTabIndex = TransferWorkspaceViewModel.PendingLinksTabIndex;
+                    mainViewModel?.ShowBatchTransferCommand.Execute(null);
+                }),
+            pauseStore: collectPauseStore,
+            runLog: runLog);
         var collectWorkspace = new CollectView { DataContext = collectViewModel };
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),
@@ -1138,7 +1156,8 @@ public sealed class AppShellFactory(
             localResultExportStore: localResultExportStore,
             licenseGate: licenseGate,
             historyCleanupService: historyCleanupService,
-            historyCleanupInteraction: historyCleanupInteraction);
+            historyCleanupInteraction: historyCleanupInteraction,
+            runLog: runLog);
         var shareWorkspace = new ShareWorkspaceView(shareViewModel);
         var accountRefresh = new AccountRefreshCoordinator(
             accountProvider,

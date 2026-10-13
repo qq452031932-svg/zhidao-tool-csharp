@@ -283,22 +283,6 @@ public sealed class LocalImportWorkflow(
     private IAsyncEnumerable<ImportSourceRow> ReadTextAsync(string text, CancellationToken cancellationToken) =>
         textParser.ParseAsync(new StringReader(text), cancellationToken);
 
-    private async IAsyncEnumerable<ImportSourceRow> ReadExcelAsync(
-        string filePath,
-        ConfirmedImportColumnMapping mapping,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-    {
-        await using var stream = new FileStream(
-            filePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: 64 * 1024,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
-        await foreach (var row in excelReader.ReadAsync(stream, mapping, cancellationToken).ConfigureAwait(false))
-            yield return row;
-    }
-
     private async Task<TabularWorkbookInspection> InspectExcelAsync(
         string filePath,
         CancellationToken cancellationToken)

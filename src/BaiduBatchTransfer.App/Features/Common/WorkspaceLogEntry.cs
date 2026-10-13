@@ -76,11 +76,14 @@ public sealed class WorkspaceLogBuffer
 
     private readonly ObservableCollection<WorkspaceLogEntry> entries = [];
     private readonly TimeProvider timeProvider;
+    private readonly Action<WorkspaceLogEntry>? appended;
     private WorkspaceLogEntry? lastAppendedEntry;
 
-    public WorkspaceLogBuffer(TimeProvider? timeProvider = null)
+    /// <param name="appended">每追加一条就通知一次，用于把界面日志同时落盘；清空界面日志不影响它。</param>
+    public WorkspaceLogBuffer(TimeProvider? timeProvider = null, Action<WorkspaceLogEntry>? appended = null)
     {
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.appended = appended;
         Entries = new ReadOnlyObservableCollection<WorkspaceLogEntry>(entries);
     }
 
@@ -118,6 +121,7 @@ public sealed class WorkspaceLogBuffer
             entries.RemoveAt(0);
             if (ReferenceEquals(removed, lastAppendedEntry)) lastAppendedEntry = null;
         }
+        appended?.Invoke(entry);
     }
 
     internal static string SanitizeForEntry(string message)

@@ -4,6 +4,7 @@ using System.ComponentModel;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Features.Licensing;
+using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Updates;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -22,6 +23,7 @@ public partial class App : System.Windows.Application
     private UpdateAwareShutdownOrchestrator? updateShutdownOrchestrator;
     private int shutdownRequested;
     private bool allowShutdown;
+    private IRunLog? runLog;
 
     public App(IApplicationUpdateRuntime updateRuntime)
     {
@@ -45,12 +47,19 @@ public partial class App : System.Windows.Application
             e.Args,
             Path.Combine(localData, "BaiduBatchTransfer"));
         host = AppBootstrap.CreateHost(dataRoot, e.Args, updateRuntime);
+        runLog = host.Services.GetService<IRunLog>();
+        runLog?.Write(RunLogSource, $"软件启动，版本 {ApplicationBuildInfo.Current.ProductVersion}。");
+        // 只记录，不接管：未处理异常原来怎么表现现在还怎么表现，日志里多一份现场。
+        DispatcherUnhandledException += (_, args) => LogUnhandled("界面线程出现未处理的异常", args.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+            LogUnhandled("出现未处理的异常，软件即将退出", args.ExceptionObject as Exception);
         try
         {
             var startup = await host.Services.GetRequiredService<AppStartupController>()
                 .StartAsync(token => host.StartAsync(token)).ConfigureAwait(true);
             if (!startup.CoordinatorMayStart)
             {
+                runLog?.Write(RunLogSource, $"启动未继续：{startup.StatusMessage}");
                 MessageBox.Show(startup.StatusMessage, "知道综合工具", MessageBoxButton.OK, MessageBoxImage.Information);
                 Shutdown();
                 return;
@@ -77,6 +86,7 @@ public partial class App : System.Windows.Application
                 CompleteApplicationExit);
             MainWindow.Closing += OnMainWindowClosing;
             MainWindow.Show();
+            runLog?.Write(RunLogSource, "主窗口已打开。");
             // 只有服务器明确说"这台机器需要卡密"时才弹激活窗。连不上服务器时弹窗
             // 等于告诉付费用户"你没激活"，而他什么都没做错——网络恢复后会自动通过。
             if (startup.ActivationInputRequired)
@@ -111,6 +121,7 @@ public partial class App : System.Windows.Application
             {
                 // Startup diagnostics must never hide the original failure prompt.
             }
+            LogUnhandled("启动失败", exception);
             MessageBox.Show(
                 "应用启动失败，本机数据没有被删除。请关闭后重试；如果问题持续，请导出诊断信息。",
                 "知道综合工具",
@@ -217,8 +228,14 @@ public partial class App : System.Windows.Application
         Shutdown(-1);
     }
 
+    private const string RunLogSource = "软件";
+
+    private void LogUnhandled(string what, Exception? exception) =>
+        runLog?.Write(RunLogSource, exception is null ? $"{what}。" : $"{what}：{exception}");
+
     protected override void OnExit(ExitEventArgs e)
     {
+        runLog?.Write(RunLogSource, $"软件关闭，退出码 {e.ApplicationExitCode}。");
         try
         {
             applicationStoppingShutdownCoordinator?.Dispose();

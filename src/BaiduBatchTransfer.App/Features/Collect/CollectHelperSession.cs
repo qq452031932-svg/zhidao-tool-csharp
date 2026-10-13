@@ -86,7 +86,7 @@ public sealed class WpfKeywordFileDialog : IKeywordFileDialog
         var dialog = new Microsoft.Win32.OpenFileDialog
         {
             Title = "选择关键词文件",
-            Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+            Filter = "关键词文件 (*.xlsx;*.csv;*.tsv;*.txt)|*.xlsx;*.csv;*.tsv;*.txt|Excel 表格 (*.xlsx)|*.xlsx|CSV/TSV 表格 (*.csv;*.tsv)|*.csv;*.tsv|文本文件 (*.txt)|*.txt",
             CheckFileExists = true,
             Multiselect = false,
         };
@@ -115,7 +115,12 @@ public sealed class CollectHelperSession : ICollectHelperSession
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (client is not null) return client;
+            if (client?.IsConnected == true) return client;
+            if (client is not null)
+            {
+                await client.DisposeAsync().ConfigureAwait(false);
+                client = null;
+            }
 
             var layout = resolveLayout();
             if (!File.Exists(layout.InterpreterPath))

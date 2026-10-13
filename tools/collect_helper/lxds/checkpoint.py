@@ -24,7 +24,11 @@ def _safe_kind(kind: str) -> str:
 
 
 def _source_key(source: str) -> str:
-    normalized = str(Path(source).resolve()).casefold()
+    try:
+        normalized = str(Path(source).resolve()).casefold()
+    except (OSError, ValueError):
+        # 来源可能是拼接的关键词而非路径，过长时无法解析，直接取原文。
+        normalized = source.casefold()
     return sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
