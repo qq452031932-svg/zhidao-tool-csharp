@@ -92,6 +92,24 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         }
     }
 
+    public async Task DeleteRowAsync(Guid rowId, CancellationToken cancellationToken = default)
+    {
+        // 先解除别的行对它的重复指向，否则自引用外键会拦住删除；这些行随后由重新归类决定去留。
+        await using (var detach = Command("UPDATE StagedImportRows SET DuplicateOfStagedRowId=NULL WHERE DuplicateOfStagedRowId=$id;"))
+        {
+            Add(detach,"$id",Id(rowId));
+            await detach.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await using (var payload = Command("DELETE FROM StagedImportRowPayloads WHERE StagedImportRowId=$id;"))
+        {
+            Add(payload,"$id",Id(rowId));
+            await payload.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await using var c = Command("DELETE FROM StagedImportRows WHERE Id=$id;");
+        Add(c,"$id",Id(rowId));
+        if (await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1) throw new InvalidOperationException("The staging row does not exist.");
+    }
+
     public async Task<StagedImportRowRecord?> GetFirstByNormalizedShareIdAsync(Guid sessionId, string normalizedShareId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(normalizedShareId);

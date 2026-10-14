@@ -15,6 +15,12 @@ public interface IImportRepository
         Task.FromResult<ImportSessionRecord?>(null);
     Task AddRowsAsync(IEnumerable<StagedImportRowRecord> rows, CancellationToken cancellationToken = default);
     Task UpdateRowsAsync(IEnumerable<StagedImportRowRecord> rows, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// 从草稿中彻底移除一行及其附带内容；指向它的重复标记一并解除，由调用方随后重新归类。
+    /// 已被任务引用的行不能删除。
+    /// </summary>
+    Task DeleteRowAsync(Guid rowId, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("This import repository cannot delete staged rows.");
     Task<StagedImportRowRecord?> GetRowByIdAsync(Guid rowId, CancellationToken cancellationToken = default);
     Task<StagedImportRowRecord?> GetFirstByNormalizedShareIdAsync(
         Guid sessionId,

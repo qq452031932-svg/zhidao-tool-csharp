@@ -51,6 +51,42 @@ public sealed class TransferPendingSelectionTests
         Assert.Equal("1", Assert.IsType<TextBlock>(grid.Columns[0].GetCellContent(model.Rows[0])).Text);
     });
 
+    [Fact]
+    public void RightClickMenuDeletesTheRowUnderThePointerAndPagingButtonsArePresent() => OnSta(() =>
+    {
+        using var model = CreateModel();
+        var view = LoadPendingTable(model);
+        var grid = Descendants(view).OfType<DataGrid>().Single();
+        var item = Assert.IsType<MenuItem>(Assert.Single(Assert.IsType<ContextMenu>(grid.ContextMenu).Items));
+        Assert.Equal("删除这条记录", item.Header);
+
+        var cell = grid.Columns[1].GetCellContent(model.Rows[1]);
+        var row = BaiduBatchTransfer.App.Features.Transfers.PendingRowContextMenu.RowUnder(cell);
+        Assert.Same(model.Rows[1], Assert.IsType<DataGridRow>(row).Item);
+        Assert.Null(BaiduBatchTransfer.App.Features.Transfers.PendingRowContextMenu.RowUnder(grid));
+        Assert.Null(BaiduBatchTransfer.App.Features.Transfers.PendingRowContextMenu.RowUnder(null));
+
+        var buttons = Descendants(view).OfType<Button>().ToArray();
+        var previous = Assert.Single(buttons, button => Equals(button.Content, "上一页"));
+        var next = Assert.Single(buttons, button => Equals(button.Content, "下一页"));
+        Assert.Same(model.LoadPreviousPageCommand, previous.Command);
+        Assert.False(previous.IsEnabled);
+        Assert.True(next.IsEnabled);
+        model.LoadNextPageAsync().GetAwaiter().GetResult();
+        view.Dispatcher.Invoke(() => { }, DispatcherPriority.ContextIdle);
+        Assert.True(previous.IsEnabled);
+        Assert.Contains(Descendants(view).OfType<TextBlock>(), text => text.Text == "第 2/2 页");
+        // 编辑与翻页分成两行：按钮都在可见宽度内，链接输入框留有足够的宽度（用户实机时曾被挤到只剩几十像素）。
+        Assert.All(buttons, button => Assert.True(
+            button.TranslatePoint(new Point(button.ActualWidth, 0), view).X <= 714.5, $"{button.Content} 超出可见宽度"));
+        Assert.True(Descendants(view).OfType<TextBox>().First().ActualWidth >= 300, "链接输入框过窄");
+        var filter = Assert.Single(Descendants(view).OfType<CheckBox>(), box => Equals(box.Content, "只看冲突"));
+        Assert.True(filter.IsEnabled);
+        Assert.False(filter.IsChecked);
+        Assert.True(filter.TranslatePoint(new Point(0, 0), view).Y > previous.TranslatePoint(new Point(0, 0), view).Y - 20, "筛选与翻页应在同一行");
+        Assert.True(grid.ActualHeight >= 250, "表格高度被底部两行挤占过多");
+    });
+
     private static ImportViewModel CreateModel()
     {
         var model = new ImportViewModel(new UnavailableImportWorkflow(), new Pages(), new Dialogs());
@@ -59,7 +95,7 @@ public sealed class TransferPendingSelectionTests
         return model;
     }
 
-    private static UserControl LoadPendingTable(ImportViewModel model)
+    internal static UserControl LoadPendingTable(ImportViewModel model)
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "BaiduBatchTransfer.sln"))) directory = directory.Parent;
@@ -83,7 +119,7 @@ public sealed class TransferPendingSelectionTests
         return view;
     }
 
-    private static IEnumerable<DependencyObject> Descendants(DependencyObject root)
+    internal static IEnumerable<DependencyObject> Descendants(DependencyObject root)
     {
         for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
         {
@@ -93,7 +129,7 @@ public sealed class TransferPendingSelectionTests
         }
     }
 
-    private static void OnSta(Action action)
+    internal static void OnSta(Action action)
     {
         Exception? failure = null;
         var thread = new Thread(() =>

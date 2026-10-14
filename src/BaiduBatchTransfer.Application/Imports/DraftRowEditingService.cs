@@ -176,6 +176,24 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
             UpdatedAt = DateTimeOffset.UtcNow,
         }, cancellationToken);
 
+    /// <summary>
+    /// 把一行从草稿里彻底删掉（排除只是留着不转存）。只对尚未生成任务的草稿有效；
+    /// 删掉的若是某组重复里的主记录，剩下的会重新归类。
+    /// </summary>
+    public Task<DraftMutationResult> DeleteAsync(
+        Guid sessionId,
+        Guid rowId,
+        TransferMode transferMode,
+        CancellationToken cancellationToken = default) =>
+        MutateAsync(sessionId, transferMode, async (unit, session) =>
+        {
+            var row = await unit.Imports.GetRowByIdAsync(rowId, cancellationToken).ConfigureAwait(false)
+                ?? throw new DraftWorkflowException("DRAFT_ROW_NOT_FOUND", "草稿记录不存在。");
+            if (row.ImportSessionId != sessionId)
+                throw new DraftWorkflowException("DRAFT_ROW_SESSION_MISMATCH", "草稿记录不属于当前导入。");
+            await unit.Imports.DeleteRowAsync(rowId, cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
+
     public Task<DraftMutationResult> RestoreAsync(
         Guid sessionId,
         Guid rowId,

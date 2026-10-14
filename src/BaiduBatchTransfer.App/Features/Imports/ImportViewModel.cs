@@ -73,6 +73,9 @@ public interface IImportWorkflow
     void DiscardReplaySource(Guid sessionId) { }
     Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken);
     Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken);
+    /// <summary>把一行从待处理列表里彻底删除；与排除不同，删除后不能恢复。</summary>
+    Task<ImportWorkflowResult> DeleteRowAsync(Guid rowId, CancellationToken cancellationToken) =>
+        Task.FromException<ImportWorkflowResult>(new ImportWorkflowException(ImportUiError.AdapterUnavailable));
 }
 
 public sealed class UnavailableImportWorkflow : IImportWorkflow
@@ -108,6 +111,12 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     private long totalRows;
     private long displayOrdinalOffset;
     private long? nextCursor;
+    // 当前页是从哪个游标读出来的；翻过的页按顺序记下，才能往回翻。
+    private long? currentCursor;
+    private readonly Stack<(long? Cursor, long OrdinalOffset)> previousPages = new();
+    private bool showConflictsOnly;
+    // 当前列表（可能经过筛选）的总条数，只用来算页码；TotalRows 始终是整批导入的条数。
+    private long listedRows;
     private ImportPreviewRow? selectedRow;
     private string selectedShareUrl = string.Empty;
     private string selectedExtractionCode = string.Empty;
@@ -136,6 +145,10 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         CancelCommand = new RelayCommand(Cancel, () => IsBusy);
         LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => CanEdit && sessionId is not null);
         LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => CanEdit && nextCursor is not null);
+        LoadPreviousPageCommand = new AsyncRelayCommand(
+            LoadPreviousPageAsync, () => CanEdit && sessionId is not null && previousPages.Count > 0);
+        DeleteSelectedRowCommand = new AsyncRelayCommand(
+            DeleteSelectedRowAsync, () => CanEdit && SelectedRow is not null && !CanResumeImport);
         SaveSelectedRowCommand = new AsyncRelayCommand(SaveSelectedRowAsync, () => CanEdit && SelectedRow is not null);
         ToggleSelectedExclusionCommand = new AsyncRelayCommand(ToggleSelectedExclusionAsync, () => CanEdit && SelectedRow is not null);
     }
@@ -148,6 +161,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     public IRelayCommand CancelCommand { get; }
     public IAsyncRelayCommand LoadFirstPageCommand { get; }
     public IAsyncRelayCommand LoadNextPageCommand { get; }
+    public IAsyncRelayCommand LoadPreviousPageCommand { get; }
+    public IAsyncRelayCommand DeleteSelectedRowCommand { get; }
     public IAsyncRelayCommand SaveSelectedRowCommand { get; }
     public IAsyncRelayCommand ToggleSelectedExclusionCommand { get; }
 
@@ -164,7 +179,44 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         : adapterAvailability.CanStartTransfers
             ? string.Empty
             : "可以先导入并整理数据；实际转存功能仍在验证中。";
-    public long TotalRows { get => totalRows; private set => SetProperty(ref totalRows, value); }
+    public long TotalRows
+    {
+        get => totalRows;
+        private set { if (SetProperty(ref totalRows, value)) OnPropertyChanged(nameof(PageText)); }
+    }
+    public int PageNumber => previousPages.Count + 1;
+    public string PageText
+    {
+        get
+        {
+            if (sessionId is null || listedRows <= 0) return string.Empty;
+            var pages = Math.Max(PageNumber, (listedRows + PageSize - 1) / PageSize);
+            return $"第 {PageNumber}/{pages} 页";
+        }
+    }
+
+    /// <summary>
+    /// 只列出「冲突待处理」的记录，方便在很长的表里把它们找出来处理。
+    /// 筛选时序号是在冲突记录里的顺序，原表行号仍可在序号的提示里看到。
+    /// </summary>
+    public bool ShowConflictsOnly
+    {
+        get => showConflictsOnly;
+        set
+        {
+            if (showConflictsOnly == value) return;
+            if (!CanEdit || sessionId is null)
+            {
+                // 正忙或还没有导入时不切换；通知一次让勾选框回到原状。
+                OnPropertyChanged();
+                return;
+            }
+            showConflictsOnly = value;
+            OnPropertyChanged();
+            _ = LoadFirstPageAsync();
+        }
+    }
+    public bool CanFilterConflicts => CanEdit && sessionId is not null;
     public bool IsClosed => isClosed;
     public Guid? SessionId => sessionId;
     public ImportPreviewRow? SelectedRow
@@ -179,6 +231,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
             OnPropertyChanged(nameof(SelectedExclusionActionText));
             SaveSelectedRowCommand.NotifyCanExecuteChanged();
             ToggleSelectedExclusionCommand.NotifyCanExecuteChanged();
+            DeleteSelectedRowCommand.NotifyCanExecuteChanged();
         }
     }
     public string SelectedShareUrl { get => selectedShareUrl; set => SetProperty(ref selectedShareUrl, value ?? string.Empty); }
@@ -189,6 +242,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     {
         if (value == Guid.Empty) throw new ArgumentException("导入会话不能为空。", nameof(value));
         durableSessionObserved = true;
+        if (sessionId != value) ClearConflictFilter();
         sessionId = value;
         pageGeneration++;
         OnPropertyChanged(nameof(SessionId));
@@ -222,6 +276,10 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         SelectedExtractionCode = string.Empty;
         selectedRowIsExcluded = false;
         nextCursor = null;
+        currentCursor = null;
+        previousPages.Clear();
+        listedRows = 0;
+        ClearConflictFilter();
         TotalRows = 0;
         StatisticsText = "尚未导入数据";
         CanResumeImport = false;
@@ -230,6 +288,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         workflow.DiscardReplaySource(expectedSessionId);
         OnPropertyChanged(nameof(SessionId));
         OnPropertyChanged(nameof(SelectedExclusionActionText));
+        NotifyPagePosition();
         RaiseCommands();
         return true;
     }
@@ -337,7 +396,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         using var activity = activityGate.TryEnterActivity();
         if (activity is null) return;
         nextCursor = null;
-        await LoadPageAsync(null, cancellationToken);
+        await LoadPageAsync(PageMove.First, cancellationToken);
     }
 
     public async Task LoadNextPageAsync(CancellationToken cancellationToken = default)
@@ -345,7 +404,64 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         if (isClosed || externalCleanupBusy || nextCursor is null) return;
         using var activity = activityGate.TryEnterActivity();
         if (activity is null) return;
-        await LoadPageAsync(nextCursor, cancellationToken);
+        await LoadPageAsync(PageMove.Next, cancellationToken);
+    }
+
+    public async Task LoadPreviousPageAsync(CancellationToken cancellationToken = default)
+    {
+        if (isClosed || externalCleanupBusy || previousPages.Count == 0) return;
+        using var activity = activityGate.TryEnterActivity();
+        if (activity is null) return;
+        await LoadPageAsync(PageMove.Previous, cancellationToken);
+    }
+
+    /// <summary>
+    /// 删除选中的那一行。排除只是留着不转存，删除则把它从列表里拿掉且不能恢复，所以先问一次。
+    /// 删完留在当前页；这一页删空了就退回上一页。
+    /// </summary>
+    public async Task DeleteSelectedRowAsync(CancellationToken cancellationToken = default)
+    {
+        if (!CanEdit || CanResumeImport || SelectedRow is not { } row) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        bool confirmed;
+        try
+        {
+            confirmed = await dialogService.ConfirmAsync(
+                "删除记录",
+                $"确定把第 {row.DisplayOrdinal} 条记录从待处理列表中删除吗？\n\n删除后不能恢复，需要时请重新导入。只想这次不转存，可以改用「排除所选记录」。",
+                linked.Token);
+        }
+        catch (OperationCanceledException) when (linked.IsCancellationRequested) { return; }
+        if (!confirmed || isClosed || !CanEdit || !ReferenceEquals(SelectedRow, row)) return;
+        _ = await RunMutationAsync(
+            token => workflow.DeleteRowAsync(row.RowId, token),
+            "已删除该记录。",
+            "无法删除记录，请刷新后重试。",
+            linked.Token,
+            stayOnPage: true,
+            describeFailure: DescribeDeleteFailure);
+    }
+
+    /// <summary>
+    /// 删除失败时说出真实原因，并带上错误代号：这句话会进运行日志，事后排查靠它。
+    /// 代号只取错误类别，不含链接、路径等内容。
+    /// </summary>
+    private static string DescribeDeleteFailure(Exception error)
+    {
+        var (reason, code) = error switch
+        {
+            DraftWorkflowException { Code: "DRAFT_NOT_MUTABLE" } draft =>
+                ("这批导入已经生成转存任务或正在处理，不能再删除", draft.Code),
+            DraftWorkflowException { Code: "DRAFT_ROW_NOT_FOUND" or "DRAFT_ROW_SESSION_MISMATCH" } draft =>
+                ("这条记录已不在当前导入中，请点「刷新」", draft.Code),
+            DraftWorkflowException draft => ("当前不能修改这批导入", draft.Code),
+            ImportWorkflowException { Error: ImportUiError.InvalidData } =>
+                ("这条记录已不在当前导入中，请点「刷新」", "ROW_MISSING"),
+            ImportWorkflowException workflowError => ("导入功能暂不可用", workflowError.Error.ToString()),
+            _ when error.GetType().Name == "SqliteException" => ("本机数据库正忙，请稍后再试", "SqliteException"),
+            _ => ("请刷新后重试", error.GetType().Name),
+        };
+        return $"无法删除记录：{reason}。（{code}）";
     }
 
     public async Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken = default)
@@ -417,7 +533,9 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         Func<CancellationToken, Task<ImportWorkflowResult>> mutation,
         string successMessage,
         string failureMessage,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool stayOnPage = false,
+        Func<Exception, string>? describeFailure = null)
     {
         if (isClosed || externalCleanupBusy) return false;
         using var activity = activityGate.TryEnterActivity();
@@ -433,13 +551,13 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
             var result = await mutation(linked.Token);
             if (!IsCurrentMutation(generation, linked)) return false;
             StatusMessage = successMessage;
-            await ApplyMutationAsync(result, generation, linked.Token);
+            await ApplyMutationAsync(result, generation, linked.Token, stayOnPage);
             return IsCurrentMutation(generation, linked);
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested) { return false; }
-        catch (Exception)
+        catch (Exception error)
         {
-            if (IsCurrentMutation(generation, linked)) StatusMessage = failureMessage;
+            if (IsCurrentMutation(generation, linked)) StatusMessage = describeFailure?.Invoke(error) ?? failureMessage;
             return false;
         }
         finally
@@ -452,15 +570,23 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     private async Task ApplyMutationAsync(
         ImportWorkflowResult result,
         long generation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool stayOnPage)
     {
         if (sessionId != result.SessionId)
             throw new InvalidOperationException("The import mutation returned a different session.");
         if (generation != Volatile.Read(ref mutationGeneration)) return;
         ApplyStatistics(result.Statistics);
+        // 筛选时分页查询给出的是筛选后的条数，整批的总数以这次修改的统计为准。
+        if (showConflictsOnly) TotalRows = result.Statistics.Total;
         DraftReady?.Invoke(this, new(result.SessionId, result.Statistics));
+        if (stayOnPage)
+        {
+            await LoadPageAsync(PageMove.Reload, cancellationToken, generation);
+            return;
+        }
         nextCursor = null;
-        await LoadPageAsync(null, cancellationToken, generation);
+        await LoadPageAsync(PageMove.First, cancellationToken, generation);
     }
 
     private async Task RunImportAsync(
@@ -521,20 +647,34 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         }
     }
 
+    private enum PageMove { First, Next, Previous, Reload }
+
     private async Task LoadPageAsync(
-        long? cursor,
+        PageMove move,
         CancellationToken cancellationToken,
         long? expectedMutationGeneration = null)
     {
         if (isClosed || sessionId is null) return;
+        if (move == PageMove.Previous && previousPages.Count == 0) move = PageMove.First;
         BeginPageRequest();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         var expectedSession = sessionId.Value;
         var generation = pageGeneration;
-        var requestedOrdinalOffset = cursor is null ? 0 : displayOrdinalOffset + Rows.Count;
+        var (cursor, requestedOrdinalOffset) = move switch
+        {
+            PageMove.Next => (nextCursor, displayOrdinalOffset + Rows.Count),
+            PageMove.Previous => previousPages.Peek(),
+            PageMove.Reload => (currentCursor, displayOrdinalOffset),
+            _ => ((long?)null, 0L),
+        };
+        var emptiedPage = false;
+        var conflictsOnly = showConflictsOnly;
+        var conflictsGone = false;
         try
         {
-            var page = await pageSource.LoadAsync(new(expectedSession, PageSize, cursor), linked.Token);
+            var page = await pageSource.LoadAsync(
+                new(expectedSession, PageSize, cursor, conflictsOnly ? "Conflict" : null), linked.Token);
+            if (conflictsOnly != showConflictsOnly) return;
             if (isClosed || linked.IsCancellationRequested || sessionId != expectedSession || generation != pageGeneration ||
                 expectedMutationGeneration is { } mutation && mutation != Volatile.Read(ref mutationGeneration)) return;
             var selectedRowId = SelectedRow?.RowId;
@@ -547,21 +687,66 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
                     item.DisplayOrdinal = ++ordinal;
                     Rows.Add(item);
                 }
+                // 翻页记录只在这一页真的换上来之后才改，读取失败时仍停在原来那页。
+                switch (move)
+                {
+                    case PageMove.First: previousPages.Clear(); break;
+                    case PageMove.Next: previousPages.Push((currentCursor, displayOrdinalOffset)); break;
+                    case PageMove.Previous: previousPages.Pop(); break;
+                }
+                currentCursor = cursor;
                 displayOrdinalOffset = requestedOrdinalOffset;
+                emptiedPage = move == PageMove.Reload && page.Items.Count == 0 && previousPages.Count > 0;
                 SelectedRow = selectedRowId is { } rowId
                     ? Rows.FirstOrDefault(x => x.RowId == rowId)
                     : null;
-                TotalRows = page.TotalCount;
+                // 原来选中的行不在新的一页里时（例如刚被删除），表格控件内部仍记着它，
+                // 之后再选别的行会被它顶回去。这里总是通知一次，让表格与这里的选中项对齐。
+                // 原来选中的行不在新的一页里时（例如刚被删除），表格控件内部仍记着它，之后再选别的行
+                // 会被它顶回去，结果操作落在一条已经不存在的记录上。先选中一条真实的行再清空，
+                // 表格才会真正放下旧行；只发一次「选中项为空」的通知不够。
+                if (SelectedRow is null && selectedRowId is not null && Rows.Count > 0)
+                {
+                    SelectedRow = Rows[0];
+                    SelectedRow = null;
+                }
+                listedRows = page.TotalCount;
+                if (!conflictsOnly) TotalRows = page.TotalCount;
+                conflictsGone = conflictsOnly && page.TotalCount == 0;
                 nextCursor = page.NextSourceRowNumber;
+                NotifyPagePosition();
                 LoadNextPageCommand.NotifyCanExecuteChanged();
+                LoadPreviousPageCommand.NotifyCanExecuteChanged();
             }
             var dispatcher = System.Windows.Application.Current?.Dispatcher;
             if (dispatcher is null || dispatcher.CheckAccess()) Apply();
             else await dispatcher.InvokeAsync(Apply);
+            // 删掉的是最后一页的最后一行：这一页空了，退回上一页，不让用户对着空表。
+            if (emptiedPage) await LoadPageAsync(PageMove.Previous, cancellationToken, expectedMutationGeneration);
+            if (conflictsGone)
+            {
+                // 冲突都处理完了（或本来就没有）：不让用户对着空表，回到全部记录。
+                ClearConflictFilter();
+                StatusMessage = "没有冲突记录了，已显示全部记录。";
+                await LoadPageAsync(PageMove.First, cancellationToken, expectedMutationGeneration);
+            }
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
         catch (Exception) { if (!isClosed) StatusMessage = "无法加载导入记录，请稍后重试。"; }
         finally { EndPageRequest(); }
+    }
+
+    private void ClearConflictFilter()
+    {
+        if (!showConflictsOnly) return;
+        showConflictsOnly = false;
+        OnPropertyChanged(nameof(ShowConflictsOnly));
+    }
+
+    private void NotifyPagePosition()
+    {
+        OnPropertyChanged(nameof(PageNumber));
+        OnPropertyChanged(nameof(PageText));
     }
 
     private void BeginPageRequest()
@@ -639,6 +824,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
 
     private void RaiseCommands()
     {
+        OnPropertyChanged(nameof(CanFilterConflicts));
         OnPropertyChanged(nameof(CanImport));
         OnPropertyChanged(nameof(CanImportText));
         ImportTextCommand.NotifyCanExecuteChanged();
@@ -647,8 +833,10 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         CancelCommand.NotifyCanExecuteChanged();
         LoadFirstPageCommand.NotifyCanExecuteChanged();
         LoadNextPageCommand.NotifyCanExecuteChanged();
+        LoadPreviousPageCommand.NotifyCanExecuteChanged();
         SaveSelectedRowCommand.NotifyCanExecuteChanged();
         ToggleSelectedExclusionCommand.NotifyCanExecuteChanged();
+        DeleteSelectedRowCommand.NotifyCanExecuteChanged();
     }
 
     private static string SafeError(ImportUiError error) => error switch

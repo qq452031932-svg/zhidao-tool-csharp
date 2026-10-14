@@ -68,7 +68,11 @@
                         <Button Content="保存所选修改" Command="{Binding SaveSelectedRowCommand}" />
                         <Button Content="{Binding SelectedExclusionActionText}" Command="{Binding ToggleSelectedExclusionCommand}" />
                         <Button Content="刷新第一页" Command="{Binding LoadFirstPageCommand}" />
+                        <Button Content="删除所选记录" Command="{Binding DeleteSelectedRowCommand}"
+                                ToolTip="从列表中彻底删除，不能恢复；只想这次不转存请用排除。" />
+                        <Button Content="上一页" Command="{Binding LoadPreviousPageCommand}" />
                         <Button Content="下一页" Command="{Binding LoadNextPageCommand}" />
+                        <TextBlock Text="{Binding PageText}" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="{StaticResource MutedBrush}" />
                         <TextBlock Text="{Binding TotalRows, StringFormat=共 {0:N0} 条}" VerticalAlignment="Center" Foreground="{StaticResource MutedBrush}" />
                     </WrapPanel>
                 </StackPanel>

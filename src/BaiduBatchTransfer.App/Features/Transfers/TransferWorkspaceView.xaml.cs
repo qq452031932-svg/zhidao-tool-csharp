@@ -15,7 +15,39 @@ public partial class TransferWorkspaceView : UserControl
         DataContext = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         ResultsHost.Content = new JobResultsView(viewModel.RunPanel.Results);
         _ = new WorkspaceLogAutoScroll(this, TransferLogsList, viewModel.Logs);
+        PendingRowContextMenu.Attach(PendingLinksGrid);
     }
+}
+
+/// <summary>
+/// 待处理列表的右键菜单只针对鼠标指着的那一行：右键先选中它，指在空白处则不弹菜单，
+/// 免得「删除这条记录」落到之前选中的另一行上。
+/// </summary>
+internal static class PendingRowContextMenu
+{
+    public static void Attach(DataGrid grid)
+    {
+        grid.PreviewMouseRightButtonDown += (_, e) =>
+        {
+            if (RowUnder(e.OriginalSource) is { } row) grid.SelectedItem = row.Item;
+        };
+        grid.ContextMenuOpening += (_, e) =>
+        {
+            if (RowUnder(e.OriginalSource) is null) e.Handled = true;
+        };
+    }
+
+    internal static DataGridRow? RowUnder(object? source)
+    {
+        for (var current = source as DependencyObject; current is not null; current = Parent(current))
+            if (current is DataGridRow row) return row;
+        return null;
+    }
+
+    private static DependencyObject? Parent(DependencyObject element) =>
+        element is System.Windows.Media.Visual or System.Windows.Media.Media3D.Visual3D
+            ? System.Windows.Media.VisualTreeHelper.GetParent(element)
+            : LogicalTreeHelper.GetParent(element);
 }
 
 internal sealed class TransferPasteInputAutoHeight

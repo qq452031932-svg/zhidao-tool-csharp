@@ -510,6 +510,99 @@ public sealed class DraftWorkflowServicesTests
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(15), $"Duplicate-aware reclassification took {watch.Elapsed}.");
     }
 
+    [Fact]
+    public async Task DeletingARowRemovesItForGoodAndPromotesItsDuplicate()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var primary = Row(sessionId, 1, "same");
+        var duplicate = Row(sessionId, 2, "same") with { Disposition = "Duplicate", DuplicateOfStagedRowId = primary.Id };
+        var other = Row(sessionId, 3, "other");
+        await database.SeedAsync([], Session(sessionId, 3, ready: 2, duplicate: 1), [primary, duplicate, other]);
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+
+        var result = await service.DeleteAsync(sessionId, primary.Id, TransferMode.Distribution);
+
+        Assert.Equal(2, result.TotalRows);
+        Assert.Equal(2, result.ReadyRows);
+        Assert.Equal(0, result.DuplicateRows);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Imports.GetRowByIdAsync(primary.Id));
+        var remaining = await AllRowsAsync(read.Imports, sessionId);
+        Assert.Equal([duplicate.Id, other.Id], remaining.Select(row => row.Id));
+        Assert.All(remaining, row =>
+        {
+            Assert.Equal("Ready", row.Disposition);
+            Assert.Null(row.DuplicateOfStagedRowId);
+        });
+        // 来源行号不重排：被删的那一行留下空号，其余行原样。
+        Assert.Equal([2, 3], remaining.Select(row => row.SourceRowNumber));
+        var session = await read.Imports.GetSessionAsync(sessionId);
+        Assert.Equal(2, session!.TotalRows);
+    }
+
+    [Fact]
+    public async Task DeletingADuplicateLeavesItsPrimaryUntouched()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var primary = Row(sessionId, 1, "same");
+        var duplicate = Row(sessionId, 2, "same") with { Disposition = "Duplicate", DuplicateOfStagedRowId = primary.Id };
+        await database.SeedAsync([], Session(sessionId, 2, ready: 1, duplicate: 1), [primary, duplicate]);
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+
+        var result = await service.DeleteAsync(sessionId, duplicate.Id, TransferMode.Distribution);
+
+        Assert.Equal((1L, 1L, 0L), (result.TotalRows, result.ReadyRows, result.DuplicateRows));
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Equal("Ready", (await read.Imports.GetRowByIdAsync(primary.Id))!.Disposition);
+    }
+
+    [Theory]
+    [InlineData("BatchCreated")]
+    [InlineData("Cancelled")]
+    public async Task RowsOfADraftThatAlreadyBecameATaskCannotBeDeleted(string status)
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var row = Row(sessionId, 1, "one");
+        await database.SeedAsync([], Session(sessionId, 1, ready: 1) with { Status = status }, [row]);
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+
+        var error = await Assert.ThrowsAsync<DraftWorkflowException>(() =>
+            service.DeleteAsync(sessionId, row.Id, TransferMode.Distribution));
+
+        Assert.Equal("DRAFT_NOT_MUTABLE", error.Code);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.NotNull(await read.Imports.GetRowByIdAsync(row.Id));
+    }
+
+    [Fact]
+    public async Task DeleteRefusesARowFromAnotherImportAndAMissingRow()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var row = Row(sessionId, 1, "one");
+        await database.SeedAsync([], Session(sessionId, 1, ready: 1), [row]);
+        var otherSession = Guid.NewGuid();
+        await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await seed.Imports.AddSessionAsync(Session(otherSession, 0, ready: 0));
+            await seed.CommitAsync();
+        }
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+
+        var mismatch = await Assert.ThrowsAsync<DraftWorkflowException>(() =>
+            service.DeleteAsync(otherSession, row.Id, TransferMode.Distribution));
+        var missing = await Assert.ThrowsAsync<DraftWorkflowException>(() =>
+            service.DeleteAsync(sessionId, Guid.NewGuid(), TransferMode.Distribution));
+
+        Assert.Equal("DRAFT_ROW_SESSION_MISMATCH", mismatch.Code);
+        Assert.Equal("DRAFT_ROW_NOT_FOUND", missing.Code);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.NotNull(await read.Imports.GetRowByIdAsync(row.Id));
+    }
+
     private static CreateBatchService CreateService(Jobs.BatchTestDatabase database) =>
         new(database.UnitOfWorkFactory, new BatchDraftValidator(), new ReplicationPreflightEstimator(new UnlimitedDisk(), database.DatabasePath));
 

@@ -111,6 +111,7 @@
                     <Button x:Name="StartTransferButton" Content="开始转存"
                             Command="{Binding StartCommand}" Style="{StaticResource PrimaryButton}"
                             ToolTip="{Binding ConfigurationMessage}"
+                            ToolTipService.ShowOnDisabled="True"
                             AutomationProperties.HelpText="{Binding Wizard.ValidationMessage}"
                             FontWeight="SemiBold" Padding="10,4" Margin="0,0,0,6" />
                 </WrapPanel>
@@ -205,9 +206,9 @@
                         <Grid Margin="4,8,4,4">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="*" />
-                                <RowDefinition Height="42" />
+                                <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
-                            <DataGrid ItemsSource="{Binding Import.Rows}"
+                            <DataGrid x:Name="PendingLinksGrid" ItemsSource="{Binding Import.Rows}"
                                       SelectedItem="{Binding Import.SelectedRow, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                       SelectionMode="Single" SelectionUnit="FullRow" IsSynchronizedWithCurrentItem="True"
                                       Style="{StaticResource DenseDataGridStyle}" RowHeight="34"
@@ -216,6 +217,13 @@
                                       VirtualizingPanel.IsVirtualizing="True"
                                       VirtualizingPanel.VirtualizationMode="Recycling"
                                       ScrollViewer.CanContentScroll="True">
+                                <DataGrid.ContextMenu>
+                                    <ContextMenu>
+                                        <MenuItem Header="删除这条记录"
+                                                  Command="{Binding PlacementTarget.DataContext.Import.DeleteSelectedRowCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                  ToolTip="从待处理列表中彻底删除，不能恢复；只想这次不转存请用「排除所选记录」。" />
+                                    </ContextMenu>
+                                </DataGrid.ContextMenu>
                                 <DataGrid.Columns>
                                     <DataGridTextColumn Header="序号" Binding="{Binding DisplayOrdinal}" Width="58">
                                         <DataGridTextColumn.ElementStyle>
@@ -231,7 +239,12 @@
                                     <DataGridTextColumn Header="处理状态" Binding="{Binding DisplayDispositionText}" Width="180" />
                                 </DataGrid.Columns>
                             </DataGrid>
+                            <!-- 两行：上一行编辑所选记录，下一行筛选与翻页。挤在一行时链接输入框只剩几十像素。 -->
                             <Grid Grid.Row="1" Margin="0,8,0,0">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="34" />
+                                    <RowDefinition Height="40" />
+                                </Grid.RowDefinitions>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="90" />
@@ -242,13 +255,24 @@
                                 <TextBox Grid.Column="1" Margin="8,0,0,0"
                                          Text="{Binding Import.SelectedExtractionCode, UpdateSourceTrigger=PropertyChanged}"
                                          ToolTip="修改所选记录的提取码" VerticalContentAlignment="Center" />
-                                <WrapPanel Grid.Column="2" Margin="8,0,0,0">
+                                <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="8,0,0,0">
                                     <Button Content="保存修改" Command="{Binding Import.SaveSelectedRowCommand}" />
                                     <Button Content="{Binding Import.SelectedExclusionActionText}"
-                                            Command="{Binding Import.ToggleSelectedExclusionCommand}" />
+                                            Command="{Binding Import.ToggleSelectedExclusionCommand}" Margin="0" />
+                                </StackPanel>
+                                <CheckBox x:Name="ConflictsOnlyCheckBox" Grid.Row="1" Content="只看冲突"
+                                          IsChecked="{Binding Import.ShowConflictsOnly, Mode=TwoWay}"
+                                          IsEnabled="{Binding Import.CanFilterConflicts}"
+                                          VerticalAlignment="Center" Margin="2,6,0,0"
+                                          ToolTip="只列出「冲突待处理」的记录：同一个链接出现多次且提取码等设置不一致。排除或删除多余的那几条后才能开始转存。" />
+                                <StackPanel Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal"
+                                            HorizontalAlignment="Right" Margin="0,6,0,0">
+                                    <TextBlock Text="{Binding Import.PageText}" VerticalAlignment="Center" Margin="0,0,10,0"
+                                               Foreground="{StaticResource MutedBrush}" FontSize="12" />
                                     <Button Content="刷新" Command="{Binding Import.LoadFirstPageCommand}" />
+                                    <Button Content="上一页" Command="{Binding Import.LoadPreviousPageCommand}" />
                                     <Button Content="下一页" Command="{Binding Import.LoadNextPageCommand}" Margin="0" />
-                                </WrapPanel>
+                                </StackPanel>
                             </Grid>
                         </Grid>
                     </TabItem>
