@@ -61,6 +61,9 @@ RISK_SILENT_COOLDOWN = ((60.0, 90.0), (90.0, 150.0), (120.0, 180.0))
 FILLER_EVERY_RANGE = (8, 12)
 OPEN_EVERY_RANGE = (8, 12)
 FIRST_STAGGER_RANGE = (3.0, 8.0)
+# 多个账号共用同一网络出口：任意两次请求之间至少隔这么久，避免几个账号挤在一起连发。
+# 单账号间隔 6–10 秒不受影响；10 个账号时整体约每 4 秒一次，约为单账号的两倍速度。
+GLOBAL_GAP_RANGE = (3.0, 5.0)
 
 
 def pick_profile() -> dict:
@@ -121,16 +124,19 @@ class HumanPacer:
             self.next_break_after = pick_every(self.break_after_range)
             long_break = True
         self.next_at = time.time() + gap
+        self.in_break = long_break
         return long_break, round(gap, 1)
 
     def cool_down(self, seconds: float) -> None:
         self.next_at = max(self.next_at, time.time() + float(seconds))
+        self.in_break = False
 
     def stagger(self, seconds: float) -> None:
         self.next_at = max(self.next_at, time.time() + float(seconds))
 
     def reset(self) -> None:
         self.next_at = 0.0
+        self.in_break = False
         self.count_since_break = 0
         self.next_break_after = pick_every(self.break_after_range) if self.break_after_range else None
         self.total = 0

@@ -4,7 +4,8 @@ using System.Text.Json;
 
 namespace BaiduBatchTransfer.App.Features.Collect;
 
-public sealed record ZhidaoCookieValidationResult(bool IsValid, string Message);
+/// <summary>DefinitelyExpired 只在百度明确表示未登录时为真；网络或接口异常不算失效。</summary>
+public sealed record ZhidaoCookieValidationResult(bool IsValid, string Message, bool DefinitelyExpired = false);
 
 public interface IZhidaoCookieValidator
 {
@@ -99,7 +100,7 @@ public sealed class ZhidaoCookieValidator : IZhidaoCookieValidator
     }
 
     private static ZhidaoCookieValidationResult Expired() =>
-        new(false, "Cookie 已失效或未登录，请登录百度知道后重新复制 Cookie。");
+        new(false, "Cookie 已失效或未登录，请登录百度知道后重新复制 Cookie。", DefinitelyExpired: true);
 
     private static ZhidaoCookieValidationResult Unconfirmed() =>
         new(false, "百度知道未返回可确认的账号信息，无法验证 Cookie；请在浏览器确认登录后重试。");

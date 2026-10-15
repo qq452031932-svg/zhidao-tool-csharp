@@ -15,7 +15,7 @@ import requests
 from urllib3.util.request import ACCEPT_ENCODING
 
 from lxds.behavior import (
-    COOLDOWN_RANGE, FIRST_STAGGER_RANGE, PAGE_RANGE, READ_RANGE,
+    COOLDOWN_RANGE, FIRST_STAGGER_RANGE, GLOBAL_GAP_RANGE, PAGE_RANGE, READ_RANGE,
     RISK_ESCALATE_HITS, RISK_SILENT_COOLDOWN, RISK_SILENT_ROUNDS,
     RISK_SOFT_COOLDOWN, HumanPacer, pick_common_question, pick_profile,
 )
@@ -29,6 +29,7 @@ _PROBE_URLS = ("https://zhidao.baidu.com/robots.txt", "http://www.gstatic.com/ge
                "https://www.google.com/generate_204")
 _RISK_MARKERS = ("百度安全验证", "安全验证", "wappass", "请输入验证码")
 REQUEST_TIMEOUT = 12
+MAX_ACCOUNTS = 50
 EXIT_DIRECT = "direct"
 EXIT_PROXY = "proxy"
 
@@ -202,11 +203,13 @@ class AccountSlot:
 
 class SlotPool:
     def __init__(self, accounts, pause_ask=None, on_log=None, stop_event=None, on_status=None) -> None:
-        self.accounts = list(accounts or [])[:2]
+        # 多账号全部直连、共用同一出口（2026-10-15 用户确认，不再要求第二个账号走代理）。
+        self.accounts = list(accounts or [])[:MAX_ACCOUNTS]
         self.slots = [AccountSlot(account.get("name") or account.get("remark") or account.get("id") or "",
-                                  account.get("cookie", ""), EXIT_DIRECT if index == 0 else EXIT_PROXY)
-                      for index, account in enumerate(self.accounts)]
+                                  account.get("cookie", ""), EXIT_DIRECT)
+                      for account in self.accounts]
         self.single = len(self.slots) == 1
+        self.next_global_at = 0.0
         self.pause_ask = pause_ask
         self.on_log = on_log
         self.stop_event = stop_event
@@ -232,6 +235,9 @@ class SlotPool:
         return bool(self.stop_event and self.stop_event.is_set())
 
     def state_text(self) -> str:
+        if len(self.slots) > 2:
+            cooling = sum(1 for slot in self.slots if slot.flagged)
+            return f"{len(self.slots)} 个账号均直连" + (f"（{cooling} 个风控冷却中）" if cooling else "")
         parts = []
         for slot in self.slots:
             text = f"{slot.name} {slot.exit_text(self)}"
@@ -250,24 +256,25 @@ class SlotPool:
             return
         if not self.slots:
             raise PoolError("没有可用的百度知道账号")
-        port, ok, why = probe_clash_detail(stop_event=self.stop_event)
-        _check_stop(self.stop_event)
-        self._set_proxy_port(port if ok else 0)
         if len(self.slots) >= 2:
-            if not ok:
-                raise PoolError(f"两个账号采集需要一个账号走代理：{why}")
+            # 打乱起始顺序并错开首次请求，几个账号不会在开始时连着发。
             order = list(self.slots)
             random.shuffle(order)
-            order[0].exit_kind = EXIT_DIRECT
-            order[1].exit_kind = EXIT_PROXY
-            order[1].pacer.stagger(random.uniform(*FIRST_STAGGER_RANGE))
-            self._log(f"出口分配：{order[0].name} 走直连、{order[1].name} 走代理 {port}")
+            delay = 0.0
+            for slot in order[1:]:
+                delay += random.uniform(*FIRST_STAGGER_RANGE)
+                slot.pacer.stagger(delay)
+            self._log(f"{len(self.slots)} 个账号轮换采集，全部直连；"
+                      f"每个账号各自保持请求间隔，账号之间至少间隔 {GLOBAL_GAP_RANGE[0]:.0f} 秒")
         else:
+            port, ok, why = probe_clash_detail(stop_event=self.stop_event)
+            _check_stop(self.stop_event)
+            self._set_proxy_port(port if ok else 0)
             self.slots[0].exit_kind = EXIT_DIRECT
         self._started = True
         self._log(f"网络出口：{self.state_text()}")
 
-    def _interruptible_wait(self, seconds: float) -> None:
+    def _interruptible_wait(self, seconds: float, reason: str = "等待请求间隔或账号冷却") -> None:
         deadline = time.monotonic() + max(0.0, float(seconds))
         last_bucket = None
         while True:
@@ -278,15 +285,32 @@ class SlotPool:
                 return
             bucket = math.ceil(remaining / 5)
             if bucket != last_bucket:
-                self._status(f"等待请求间隔或账号冷却，约 {math.ceil(remaining)} 秒后继续；可随时停止")
+                self._status(f"{reason}，约 {math.ceil(remaining)} 秒后继续；可随时停止")
                 last_bucket = bucket
             if self.stop_event:
                 self.stop_event.wait(min(0.2, remaining))
             else:
                 time.sleep(min(0.2, remaining))
 
-    def _sleep(self, seconds: float, chunk: float = 0.2) -> None:
-        self._interruptible_wait(seconds)
+    def _sleep(self, seconds: float, chunk: float = 0.2, reason: str | None = None) -> None:
+        if reason is None:
+            self._interruptible_wait(seconds)
+        else:
+            self._interruptible_wait(seconds, reason)
+
+    def _wait_reason(self, now: float) -> str:
+        '''多账号时说明为什么还在等：单个账号的状态不代表整体。'''
+        if all(slot.flagged for slot in self.slots):
+            return "所有账号都在风控冷却"
+        earliest = min(self.slots, key=lambda slot: slot.pacer.next_at)
+        if earliest.flagged:
+            return f"可用账号都在等待，最先就绪的「{earliest.name}」在风控冷却"
+        if earliest.pacer.in_break:
+            return f"可用账号都在等待，最先就绪的「{earliest.name}」在周期休息"
+        return f"可用账号都在正常请求间隔，下一个是「{earliest.name}」"
+
+    def usage_text(self) -> str:
+        return "；".join(f"{slot.name} {slot.pacer.total} 次" for slot in self.slots)
 
     def _resume_cooled(self, now: float) -> None:
         for slot in self.slots:
@@ -304,8 +328,13 @@ class SlotPool:
             now = time.time()
             self._resume_cooled(now)
             ready = [slot for slot in self.slots if now >= slot.pacer.next_at]
+            multi = len(self.slots) > 1
             if not ready:
-                self._sleep(min(slot.pacer.wait_time(now) for slot in self.slots))
+                self._sleep(min(slot.pacer.wait_time(now) for slot in self.slots),
+                            reason=self._wait_reason(now) if multi else None)
+                continue
+            if multi and now < self.next_global_at:
+                self._sleep(self.next_global_at - now, reason="账号之间保持整体请求节奏")
                 continue
             slot = min(ready, key=lambda candidate: candidate.pacer.next_at)
             wait = slot.pacer.wait_time(now)
@@ -317,6 +346,8 @@ class SlotPool:
         slot.risk_streak = 0
         self.silent_rounds = 0
         long_break, gap = slot.pacer.note_request(read_seconds)
+        if len(self.slots) > 1:
+            self.next_global_at = time.time() + random.uniform(*GLOBAL_GAP_RANGE)
         if long_break:
             self._log(f"账号「{slot.name}」长休息 {gap} 秒")
         return gap
@@ -440,9 +471,7 @@ class SlotPool:
         if any(self.probe_slot(candidate) for candidate in self.slots):
             self._log("有账号已经恢复，继续采集")
             return True
-        # The original executable reaches the single-slot handler here, despite
-        # its module-level prose describing a different path.
-        return self._single_risk(slot)
+        return self._all_direct_blocked(f"账号「{slot.name}」连续 {streak} 次安全验证页、其他账号复核也异常")
 
     def _single_risk(self, slot: AccountSlot) -> bool:
         self.silent_rounds = 0
@@ -462,6 +491,28 @@ class SlotPool:
         slot.risk_streak = 0
         slot.reroll_profile()
         slot.pacer.reset()
+        return True
+
+    def _all_direct_blocked(self, detail: str) -> bool:
+        '''多账号共用直连出口都被限制：先整体静默冷却几轮，仍不行再问用户；不要求开代理。'''
+        if self.silent_rounds < RISK_SILENT_ROUNDS:
+            limits = RISK_SILENT_COOLDOWN[min(self.silent_rounds, len(RISK_SILENT_COOLDOWN) - 1)]
+            self.silent_rounds += 1
+            delay = random.uniform(*limits)
+            for candidate in self.slots:
+                candidate.flagged = True
+                candidate.risk_streak = 0
+                candidate.pacer.cool_down(delay)
+            round_text = f"第 {self.silent_rounds}/{RISK_SILENT_ROUNDS} 轮"
+            self._log(f"{detail}；所有账号共用同一网络出口，{round_text}整体暂停 {delay:.0f} 秒后自动重试（已采结果保留）")
+            self._status(f"网络出口被临时限制，{round_text}整体暂停 {delay:.0f} 秒后自动重试…")
+            return True
+        message = ("百度持续返回安全验证页。所有账号用的是同一个网络出口，换账号解决不了，通常是这个出口被临时限制。"
+                   "可以等一会儿或换个网络后点继续；也可以停止任务，已采到的结果会保留。")
+        if not self._ask("risk", message):
+            raise CollectCancelled("用户选择停止采集")
+        self._reset_risk_state()
+        self._log(f"已重置账号状态，继续采集：{self.state_text()}")
         return True
 
     def _both_blocked(self) -> bool:
@@ -498,7 +549,7 @@ class SlotPool:
             slot.flagged = True
             slot.risk_streak = 0
             slot.pacer.cool_down(random.uniform(*COOLDOWN_RANGE))
-        return self._both_blocked()
+        return self._all_direct_blocked(f"{detail}，所有账号的健康探针都异常")
 
 
 class PooledFetcher:

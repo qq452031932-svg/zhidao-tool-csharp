@@ -3,6 +3,22 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <UserControl.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+        <!-- 有账号列表时显示账号表格，否则退回单个 Cookie 输入框 -->
+        <Style x:Key="SingleCookieOnly" TargetType="FrameworkElement">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding AccountList}" Value="{x:Null}">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="AccountListOnly" TargetType="FrameworkElement">
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding AccountList}" Value="{x:Null}">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
         <!-- 只对模糊模式有意义的控件，精准模式下淡化 -->
         <Style x:Key="FuzzyOnlyLabel" TargetType="TextBlock">
             <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
@@ -74,13 +90,14 @@
                         </TextBlock>
                     </Grid>
 
-                    <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,6">
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,6"
+                                Style="{StaticResource SingleCookieOnly}">
                         <TextBlock Text="知道账号 Cookie" Foreground="{StaticResource MutedBrush}" />
                         <TextBlock Text="仅在本机使用，不写入日志与结果文件。" Margin="8,0,0,0" FontSize="11"
                                    VerticalAlignment="Center" Opacity="0.75"
                                    Foreground="{StaticResource MutedBrush}" />
                     </StackPanel>
-                    <TextBox Grid.Row="1" Grid.Column="2"
+                    <TextBox Grid.Row="1" Grid.Column="2" Style="{StaticResource SingleCookieOnly}"
                              Text="{Binding CookieText, UpdateSourceTrigger=PropertyChanged}"
                              AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
                              VerticalContentAlignment="Top" Height="104" Padding="2,6"
@@ -93,7 +110,80 @@
                     <Button Grid.Row="2" Grid.Column="2" Content="验证 Cookie"
                             Command="{Binding ValidateCookieCommand}"
                             Padding="12,3" Margin="0,8,0,0" HorizontalAlignment="Left"
+                            Style="{StaticResource SingleCookieOnly}"
                             ToolTip="查询知道账号登录状态，无需填写关键词" />
+
+                    <!-- 知道账号列表：勾选的账号轮换采集，全部直连；Cookie 在本机加密保存，表格只显示脱敏后的样子 -->
+                    <DockPanel Grid.Column="2" Margin="0,0,0,6" LastChildFill="True"
+                               Style="{StaticResource AccountListOnly}">
+                        <TextBlock DockPanel.Dock="Left" Text="知道账号" Foreground="{StaticResource MutedBrush}" />
+                        <TextBlock Text="{Binding AccountList.Summary}" Margin="8,0,0,0" FontSize="11"
+                                   VerticalAlignment="Center" Opacity="0.75" TextTrimming="CharacterEllipsis"
+                                   Foreground="{StaticResource MutedBrush}" ToolTip="{Binding AccountList.Summary}" />
+                    </DockPanel>
+                    <Border Grid.Row="1" Grid.Column="2" Style="{StaticResource AccountListOnly}">
+                    <DataGrid x:Name="AccountsGrid" Height="104"
+                              Style="{StaticResource DenseDataGridStyle}"
+                              ItemsSource="{Binding AccountList.Accounts}"
+                              AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False"
+                              SelectionMode="Extended" SelectionUnit="FullRow" HeadersVisibility="Column">
+                        <DataGrid.Columns>
+                            <DataGridTemplateColumn Header="勾选" Width="52">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                  IsChecked="{Binding IsEnabled, UpdateSourceTrigger=PropertyChanged}"
+                                                  IsEnabled="{Binding DataContext.AccountList.CanEdit, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                                  ToolTip="勾选的账号参与采集；删除、验证也按勾选" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTextColumn Header="备注" Binding="{Binding Remark}" Width="*" MinWidth="70">
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="ToolTip" Value="{Binding Remark}" />
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Header="BDUSS" Binding="{Binding MaskedCookie}" Width="92">
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="ToolTip" Value="{Binding CookieDetail}" />
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Header="状态" Binding="{Binding StateText}" Width="72">
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="ToolTip" Value="{Binding StateDetail}" />
+                                        <Setter Property="Padding" Value="4,0" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding State}" Value="Valid">
+                                                <Setter Property="Background" Value="{StaticResource SuccessRowBrush}" />
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding State}" Value="Expired">
+                                                <Setter Property="Background" Value="{StaticResource FailureRowBrush}" />
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding State}" Value="Unconfirmed">
+                                                <Setter Property="Background" Value="{StaticResource WarningRowBrush}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    </Border>
+                    <WrapPanel Grid.Row="2" Grid.Column="2" Margin="0,8,0,0" Style="{StaticResource AccountListOnly}">
+                        <Button Content="导入TXT" Command="{Binding AccountList.ImportFileCommand}" Padding="8,3" Margin="0,0,6,0"
+                                ToolTip="每行一个账号，例如「备注----其他----Cookie」；只保存备注和 Cookie" />
+                        <Button Content="粘贴导入" Command="{Binding AccountList.PasteCommand}" Padding="8,3" Margin="0,0,6,0"
+                                ToolTip="先复制账号文本或一段 Cookie，再点这里" />
+                        <Button Content="{Binding AccountList.ValidateButtonText}" Command="{Binding AccountList.ValidateCommand}"
+                                Padding="8,3" Margin="0,0,6,0" ToolTip="查询登录状态；只勾了一部分时验证勾选的，否则验证全部" />
+                        <Button Content="{Binding AccountList.DeleteButtonText}" Command="{Binding AccountList.DeleteCommand}" Padding="8,3"
+                                ToolTip="删除勾选的账号；删除后本机不再保存它们的 Cookie" />
+                    </WrapPanel>
                 </Grid>
 
                 <!-- 模式与目标条数：目标条数只对模糊模式有意义，精准时置灰 -->

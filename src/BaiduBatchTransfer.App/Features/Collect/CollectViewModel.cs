@@ -129,8 +129,9 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         IKeywordFileDialog? keywordFileDialog = null, IZhidaoCookieValidator? cookieValidator = null,
         ICollectResultActions? resultActions = null, ICollectPauseStore? pauseStore = null,
         IRunLog? runLog = null, IShareLinkChecker? linkChecker = null, IShareLinkLauncher? linkLauncher = null,
-        Func<CancellationToken, Task>? linkCheckDelay = null)
+        Func<CancellationToken, Task>? linkCheckDelay = null, ZhidaoAccountListViewModel? accountList = null)
     {
+        AccountList = accountList;
         this.session = session ?? throw new ArgumentNullException(nameof(session));
         this.runLog = runLog;
         this.linkChecker = linkChecker;
@@ -182,6 +183,18 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
             RefreshCommands();
         };
         RestorePausedTask();
+        if (accountList is not null)
+        {
+            // 账号操作的结果（导入几个、验证结论、读不出保存的账号）显示在采集状态栏，不另占一行。
+            if (pausedTask is null)
+                statusMessage = !string.IsNullOrEmpty(accountList.Message) ? accountList.Message
+                    : "填入关键词并勾选知道账号，然后开始采集。";
+            accountList.PropertyChanged += (_, args) =>
+            {
+                if (args.PropertyName == nameof(ZhidaoAccountListViewModel.Message) && !string.IsNullOrEmpty(accountList.Message))
+                    StatusMessage = accountList.Message;
+            };
+        }
     }
 
     /// <summary>软件重新打开后，把上次暂停的任务摆回界面，等用户填好 Cookie 再继续。</summary>
@@ -197,8 +210,15 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         targetTotal = task.Target;
         isPaused = true;
         statusMessage = $"上次采集已暂停（暂停时已采 {task.Found}/{task.Target} 条）。" +
-            "填入 Cookie 后点「继续」接着采，已采结果会重新列出；点「停止」结束该任务。";
+            (AccountList is { Accounts.Count: > 0 } ? "点「继续」接着采" : "填入 Cookie 后点「继续」接着采") +
+            "，已采结果会重新列出；点「停止」结束该任务。";
     }
+
+    /// <summary>采集页上的知道账号列表；未提供时退回单个 Cookie 输入。</summary>
+    public ZhidaoAccountListViewModel? AccountList { get; }
+
+    // 本轮任务实际使用的账号；暂停后继续时重新按当前勾选取。
+    private IReadOnlyList<CollectAccount> currentAccounts = [];
 
     public AsyncRelayCommand CopyLinksCommand { get; }
     public AsyncRelayCommand ExportResultsCommand { get; }
@@ -512,15 +532,16 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(CookieText))
+        if (BuildAccounts(out var accountProblem) is not { } accounts)
         {
-            StatusMessage = "请先填入知道账号的 Cookie。";
+            StatusMessage = accountProblem!;
             return;
         }
 
         IsBusy = true;
         try
         {
+            currentAccounts = accounts;
             Resources.Clear();
             ResultActionMessage = string.Empty;
             Logs.Clear();
@@ -529,6 +550,7 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
             StatusMessage = "正在启动采集助手…";
             AppendLog(StatusMessage);
             AppendLog($"开始采集：{(IsPreciseMode ? "精准" : "模糊")}模式，关键词 {keywords.Count} 个，目标 {TargetTotal} 条。");
+            LogAccounts();
             currentTask = new CollectPausedTask(IsPreciseMode ? "precise" : "fuzzy", keywords,
                 IsPreciseMode ? 0 : Math.Max(1, TargetCount), 0, TargetTotal, keywordLineMode, DateTimeOffset.Now);
 
@@ -552,8 +574,51 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
     }
 
     private CollectRequest ToRequest(CollectPausedTask task, bool resume) => new(
-        task.Mode, task.Keywords, [new CollectAccount("知道账号", CookieText.Trim())],
-        Count: task.Count, Resume: resume);
+        task.Mode, task.Keywords, currentAccounts, Count: task.Count, Resume: resume);
+
+    /// <summary>
+    /// 本次采集的账号：有账号列表时取勾选且没被明确判为失效的；列表为空时退回单个 Cookie。
+    /// 名称用备注，重名时加序号，助手日志里能分清是哪个账号。
+    /// </summary>
+    private IReadOnlyList<CollectAccount>? BuildAccounts(out string? problem)
+    {
+        problem = null;
+        if (AccountList is { Accounts.Count: > 0 } list)
+        {
+            var rows = list.AccountsForCollecting(out var skipped);
+            skippedExpiredAccounts = skipped;
+            if (rows.Count == 0)
+            {
+                problem = skipped > 0
+                    ? "勾选的知道账号都已失效，请导入新的 Cookie 或重新验证。"
+                    : "请先在知道账号列表里勾选至少一个账号。";
+                return null;
+            }
+            var used = new HashSet<string>(StringComparer.Ordinal);
+            return rows.Select(row =>
+            {
+                var name = row.Remark.Length > 0 ? row.Remark : "知道账号";
+                for (var suffix = 2; !used.Add(name); suffix++) name = $"{row.Remark}#{suffix}";
+                return new CollectAccount(name, row.Cookie);
+            }).ToArray();
+        }
+        skippedExpiredAccounts = 0;
+        if (string.IsNullOrWhiteSpace(CookieText))
+        {
+            problem = AccountList is null ? "请先填入知道账号的 Cookie。" : "请先导入知道账号（导入 TXT 或粘贴导入）。";
+            return null;
+        }
+        return [new CollectAccount("知道账号", CookieText.Trim())];
+    }
+
+    private int skippedExpiredAccounts;
+
+    private void LogAccounts()
+    {
+        if (AccountList is not { Accounts.Count: > 0 }) return;
+        AppendLog($"本次使用 {currentAccounts.Count} 个知道账号：{string.Join("、", currentAccounts.Select(account => account.Name))}" +
+            (skippedExpiredAccounts > 0 ? $"；跳过已失效的 {skippedExpiredAccounts} 个。" : "。"));
+    }
 
     private async Task PauseAsync()
     {
@@ -577,11 +642,12 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
     private async Task ContinueAsync()
     {
         if (pausedTask is not { } task) return;
-        if (string.IsNullOrWhiteSpace(CookieText))
+        if (BuildAccounts(out var accountProblem) is not { } accounts)
         {
-            StatusMessage = "请先填入知道账号的 Cookie，再继续采集。";
+            StatusMessage = AccountList is null ? "请先填入知道账号的 Cookie，再继续采集。" : accountProblem!;
             return;
         }
+        currentAccounts = accounts;
 
         IsBusy = true;
         // 续采时列表以断点为准重建；没能发出去就把原来的行放回，不让已采结果从界面消失。
@@ -594,6 +660,7 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
             TargetTotal = task.Target;
             StatusMessage = "正在从断点继续采集…";
             AppendLog(StatusMessage);
+            LogAccounts();
             currentTask = task;
 
             var helper = await EnsureConnectedAsync().ConfigureAwait(true);
@@ -928,6 +995,8 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         SendToTransferCommand.NotifyCanExecuteChanged();
         CheckSelectedLinksCommand.NotifyCanExecuteChanged();
         StopLinkCheckCommand.NotifyCanExecuteChanged();
+        // 暂停时允许换账号：继续时按当时勾选的账号接着采。
+        AccountList?.SetLocked(IsBusy || IsCollecting);
     }
 
     public async ValueTask DisposeAsync()
@@ -935,6 +1004,7 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         disposed = true;
         cookieValidationLifetime?.Cancel();
         linkCheckLifetime?.Cancel();
+        AccountList?.CancelWork();
         lifetime?.Cancel();
         lifetime?.Dispose();
         lifetime = null;

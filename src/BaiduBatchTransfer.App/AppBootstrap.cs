@@ -138,6 +138,8 @@ public static class AppBootstrap
         services.AddSingleton<StartupNotices>();
         services.AddSingleton<ICollectPauseStore>(_ => new FileCollectPauseStore(
             Path.Combine(paths.RootDirectory, "collect", "paused-task.json")));
+        services.AddSingleton<IZhidaoAccountStore>(_ => new DpapiZhidaoAccountStore(
+            Path.Combine(paths.RootDirectory, "collect", "zhidao-accounts.dat")));
         services.AddSingleton(_ => new SqliteConnectionFactory(paths.DatabasePath));
         services.AddSingleton<IUnitOfWorkFactory, SqliteUnitOfWorkFactory>();
         services.AddSingleton<SqliteAccountCapacityStore>();
@@ -929,7 +931,8 @@ public sealed class AppShellFactory(
     ICollectPauseStore? collectPauseStore = null,
     IRunLog? runLog = null,
     EndBatchService? endBatchService = null,
-    StartupNotices? startupNotices = null) : IAppShellFactory
+    StartupNotices? startupNotices = null,
+    IZhidaoAccountStore? zhidaoAccountStore = null) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
@@ -1155,7 +1158,25 @@ public sealed class AppShellFactory(
             pauseStore: collectPauseStore,
             runLog: runLog,
             linkChecker: new ShareLinkChecker(),
-            linkLauncher: shareLinkLauncher);
+            linkLauncher: shareLinkLauncher,
+            accountList: new ZhidaoAccountListViewModel(
+                zhidaoAccountStore ?? new DpapiZhidaoAccountStore(Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "BaiduBatchTransfer", "collect", "zhidao-accounts.dat")),
+                new ZhidaoCookieValidator(), dialogService,
+                pickFile: () =>
+                {
+                    var dialog = new Microsoft.Win32.OpenFileDialog
+                    {
+                        Title = "选择知道账号文件",
+                        Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+                        CheckFileExists = true,
+                    };
+                    var owner = System.Windows.Application.Current?.MainWindow;
+                    return (owner is null ? dialog.ShowDialog() : dialog.ShowDialog(owner)) == true ? dialog.FileName : null;
+                },
+                readClipboard: () => System.Windows.Clipboard.ContainsText() ? System.Windows.Clipboard.GetText() : null,
+                runLog: runLog));
         var collectWorkspace = new CollectView { DataContext = collectViewModel };
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),

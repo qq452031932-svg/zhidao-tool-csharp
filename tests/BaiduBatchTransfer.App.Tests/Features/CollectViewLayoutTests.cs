@@ -83,7 +83,7 @@ public sealed class CollectViewLayoutTests
                         Assert.True(origin.X >= 0 && origin.X + action.ActualWidth <= width);
                         Assert.True(origin.Y + action.ActualHeight <= 650);
                     }
-                    var results = Assert.Single(Descendants(view).OfType<DataGrid>());
+                    var results = Assert.Single(Descendants(view).OfType<DataGrid>(), grid => grid.Name == "ResultsGrid");
                     Assert.Equal(DataGridSelectionMode.Extended, results.SelectionMode);
                     Assert.True(results.Columns[1].ActualWidth >= 140);
                     Assert.True(results.ActualHeight >= 100, $"Results height: {results.ActualHeight}");
@@ -101,6 +101,45 @@ public sealed class CollectViewLayoutTests
                     button.Command.Execute(null);
                     Assert.Contains("请先填入", model.StatusMessage);
                 }
+
+                // 有账号列表时：单个 Cookie 框隐藏，账号表格和四个按钮在窄窗口下也完整可见，结果区仍有足够高度。
+                var accountList = new ZhidaoAccountListViewModel(new LayoutAccountStore(), new LayoutValidator(),
+                    pickFile: () => null, readClipboard: () => null);
+                var withAccounts = new CollectViewModel(new FakeCollectHelperSession(
+                    CollectHelperClient.Create(new FakeCollectHelperProcess())), action => action(), accountList: accountList);
+                foreach (var row in model.Resources) withAccounts.Resources.Add(row);
+                view.DataContext = withAccounts;
+                foreach (var width in new[] { 640d, 714d, 1000d })
+                {
+                    view.Measure(new Size(width, 650));
+                    view.Arrange(new Rect(0, 0, width, 650));
+                    view.Dispatcher.Invoke(() => { }, DispatcherPriority.ContextIdle);
+                    view.UpdateLayout();
+                    var cookie = Assert.Single(Descendants(view).OfType<TextBox>(), item =>
+                        BindingOperations.GetBinding(item, TextBox.TextProperty)?.Path.Path == "CookieText");
+                    Assert.False(Shown(cookie, view));
+                    var accounts = Assert.Single(Descendants(view).OfType<DataGrid>(), grid => grid.Name == "AccountsGrid");
+                    Assert.True(Shown(accounts, view) && accounts.ActualHeight >= 100);
+                    Assert.Equal(2, accounts.Items.Count);
+                    foreach (var caption in new[] { "导入TXT", "粘贴导入", "验证 1 个", "删除 1 个" })
+                    {
+                        var action = Assert.Single(Descendants(view).OfType<Button>(), item => Equals(item.Content, caption) && Shown(item, view));
+                        var origin = action.TransformToAncestor(view).Transform(new Point());
+                        Assert.True(action.ActualWidth > 0 && origin.X >= 0 && origin.X + action.ActualWidth <= width, $"{caption} at {width}");
+                    }
+                    var results = Assert.Single(Descendants(view).OfType<DataGrid>(), grid => grid.Name == "ResultsGrid");
+                    Assert.True(results.ActualHeight >= 100, $"Results height with accounts: {results.ActualHeight}");
+                    if (width == 714)
+                    {
+                        var bitmap = new RenderTargetBitmap(714, 650, 96, 96, PixelFormats.Pbgra32);
+                        bitmap.Render(view);
+                        var encoder = new PngBitmapEncoder();
+                        encoder.Frames.Add(BitmapFrame.Create(bitmap));
+                        var artifact = Path.Combine(directory.FullName, ".artifacts", "collect-accounts-layout.png");
+                        using var output = File.Create(artifact);
+                        encoder.Save(output);
+                    }
+                }
             }
             catch (Exception error) { failure = error; }
             finally { Dispatcher.CurrentDispatcher.InvokeShutdown(); }
@@ -110,6 +149,30 @@ public sealed class CollectViewLayoutTests
         thread.Start();
         Assert.True(thread.Join(TimeSpan.FromSeconds(15)), "Collect page layout test timed out.");
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    private sealed class LayoutAccountStore : IZhidaoAccountStore
+    {
+        public ZhidaoAccountLoadResult Load() => new([
+            new(Guid.NewGuid(), "测试账号一", "BDUSS=fakebduss0001xyz; STOKEN=a", true, ZhidaoAccountState.Valid, "ok", DateTimeOffset.Now),
+            new(Guid.NewGuid(), "测试账号二", "BDUSS=fakebduss0002xyz; STOKEN=b", false, ZhidaoAccountState.Expired, "未登录", DateTimeOffset.Now),
+        ], null);
+
+        public void Save(IReadOnlyList<StoredZhidaoAccount> accounts) { }
+    }
+
+    private sealed class LayoutValidator : IZhidaoCookieValidator
+    {
+        public Task<ZhidaoCookieValidationResult> ValidateAsync(string cookie, CancellationToken cancellationToken) =>
+            Task.FromResult(new ZhidaoCookieValidationResult(true, "ok"));
+    }
+
+    /// <summary>离线渲染没有窗口，IsVisible 恒为假；改看自身和所有上级的 Visibility。</summary>
+    private static bool Shown(UIElement element, DependencyObject root)
+    {
+        for (DependencyObject? current = element; current is not null && current != root; current = VisualTreeHelper.GetParent(current))
+            if (current is UIElement { Visibility: not Visibility.Visible }) return false;
+        return true;
     }
 
     private static IEnumerable<DependencyObject> Descendants(DependencyObject root)

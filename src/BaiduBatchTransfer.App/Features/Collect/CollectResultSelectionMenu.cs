@@ -93,7 +93,10 @@ internal static class CollectResultSelectionMenu
         grid.SelectedItems.Add(row);
     }
 
-    internal static CollectedRow? RowAt(DependencyObject? source)
+    internal static CollectedRow? RowAt(DependencyObject? source) => RowItemAt(source) as CollectedRow;
+
+    /// <summary>右键位置所在表格行的数据项；落在表头或空白处时为 null。</summary>
+    internal static object? RowItemAt(DependencyObject? source)
     {
         while (source is not null and not DataGridRow)
         {
@@ -102,6 +105,6 @@ internal static class CollectResultSelectionMenu
                 ? VisualTreeHelper.GetParent(source)
                 : LogicalTreeHelper.GetParent(source);
         }
-        return (source as DataGridRow)?.Item as CollectedRow;
+        return (source as DataGridRow)?.Item;
     }
 }

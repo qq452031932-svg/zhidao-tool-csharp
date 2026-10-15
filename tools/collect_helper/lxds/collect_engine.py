@@ -10,7 +10,7 @@ from lxds.collection_rules import (
     FUZZY_BARREN_PAGES, FUZZY_IDLE_PAGES, FUZZY_MAX_BARREN_PAGES,
     FILLER_EVERY_RANGE, OPEN_EVERY_RANGE, SUPPLEMENT_MAX_BARREN,
 )
-from lxds.pool import CollectCancelled, PoolError, PinnedExitFetcher
+from lxds.pool import CollectCancelled, PoolError, PinnedExitFetcher, SlotPool
 from lxds.page_cache import CachedFetcher
 from lxds.fuzzy_coverage import FuzzyCoverage
 from lxds.zhidao_parse import (extract_collect_entries, extract_resource_name,
@@ -470,6 +470,8 @@ class CollectionEngine:
                     self._clear_checkpoint()
                 if self._page_cache.hits:
                     self.on_log(f"本轮复用已获取页面 {self._page_cache.hits} 次，减少相同次数的重复页面请求。")
+                if isinstance(self.pool, SlotPool) and len(self.pool.slots) > 1:
+                    self.on_log(f"各账号本轮请求次数：{self.pool.usage_text()}")
             finally:
                 self._page_cache.clear()
         return {"items": list(self.items), "found": len(self.items),

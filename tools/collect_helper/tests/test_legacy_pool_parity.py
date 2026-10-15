@@ -84,24 +84,29 @@ class LegacyPoolParityTests(unittest.TestCase):
             PooledFetcher(pool).get("https://example.test")
         pool.fetch.assert_called_once()
 
-    def test_start_caps_accounts_randomizes_two_exits_and_staggers_only_proxy(self):
+    # 2026-10-15 用户确认的多 Cookie 方案改变了原版「最多两个账号、第二个走代理」的规则：
+    # 所有账号都直连、不再截断，下面两项按新规则断言（单账号的原版行为不变）。
+    def test_start_keeps_every_account_direct_and_staggers_followers(self):
         with patch.object(module.random, "shuffle", side_effect=lambda slots: slots.reverse()), \
                 patch.object(module.random, "uniform", side_effect=lambda low, high: low), \
                 patch.object(module.time, "time", return_value=100):
-            pool = self.make_pool(3)
-        self.assertEqual(2, len(pool.slots))
-        self.assertEqual(["proxy", "direct"], [slot.exit_kind for slot in pool.slots])
-        self.assertEqual([3, 0], [slot.pacer.wait_time(100) for slot in pool.slots])
-        self.probe.assert_called_once()
+            pool = self.make_pool(4)
+        self.assertEqual(4, len(pool.slots))
+        self.assertEqual(["direct"] * 4, [slot.exit_kind for slot in pool.slots])
+        self.assertEqual([9, 6, 3, 0], [slot.pacer.wait_time(100) for slot in pool.slots])
+        self.probe.assert_not_called()
         pool.start()
-        self.probe.assert_called_once()
+        self.probe.assert_not_called()
 
-    def test_two_accounts_require_available_proxy_while_single_starts_direct(self):
+    def test_multiple_accounts_start_without_proxy_while_single_still_probes(self):
         self.probe.return_value = (0, False, "offline")
         single = self.make_pool()
         self.assertEqual("direct", single.slots[0].exit_kind)
-        with self.assertRaises(PoolError):
-            self.make_pool(2)
+        self.probe.assert_called_once()
+        pool = self.make_pool(10)
+        self.assertEqual(10, len(pool.slots))
+        self.assertEqual({"direct"}, {slot.exit_kind for slot in pool.slots})
+        self.probe.assert_called_once()
 
     def test_acquire_chooses_earliest_ready_not_round_robin_and_resumes_flags(self):
         pool = self.make_pool(2)
@@ -189,7 +194,8 @@ class LegacyPoolParityTests(unittest.TestCase):
         self.assertEqual(0, hit.risk_streak)
         self.assertTrue(hit.flagged)
 
-    def test_explicit_risk_multi_all_unhealthy_uses_single_risk_path(self):
+    # 多账号共用直连出口：都被限制时先整体静默冷却，不再走原版「切代理」的单账号路径（2026-10-15 新规则）。
+    def test_explicit_risk_multi_all_unhealthy_cools_everyone_without_proxy(self):
         pool = self.make_pool(2)
         hit = pool.slots[0]
         hit.risk_streak = 2
@@ -199,12 +205,15 @@ class LegacyPoolParityTests(unittest.TestCase):
         pool.probe_slot = Mock(return_value=False)
         pool._single_risk = Mock(return_value=True)
         self.assertTrue(pool.on_risk(hit, "安全验证页"))
-        pool._single_risk.assert_called_once_with(hit)
+        pool._single_risk.assert_not_called()
+        pool.pause_ask.assert_not_called()
         self.assertEqual(3, pool.probe_slot.call_count)
+        self.assertEqual(1, pool.silent_rounds)
+        self.assertEqual(["direct", "direct"], [slot.exit_kind for slot in pool.slots])
+        self.assertTrue(all(slot.flagged and slot.pacer.wait_time() >= 59 for slot in pool.slots))
 
-    def test_both_blocked_resets_states_pacers_and_preserves_exits(self):
+    def test_all_blocked_asks_after_silent_rounds_then_resets_and_stays_direct(self):
         pool = self.make_pool(2)
-        before = [slot.exit_kind for slot in pool.slots]
         pool.probe_slot = Mock(return_value=False)
         pool.silent_rounds = 2
         for slot in pool.slots:
@@ -213,10 +222,65 @@ class LegacyPoolParityTests(unittest.TestCase):
             slot.pacer.note_request(3)
         with patch.object(module.random, "uniform", side_effect=lambda low, high: low):
             self.assertTrue(pool.on_silent_risk(["term"], True))
-        self.assertEqual(before, [slot.exit_kind for slot in pool.slots])
+            pool.pause_ask.assert_not_called()
+            self.assertEqual(3, pool.silent_rounds)
+            self.assertTrue(pool.on_silent_risk(["term"], True))
+        pool.pause_ask.assert_called_once()
+        self.assertEqual("risk", pool.pause_ask.call_args.args[0]["kind"])
+        self.probe.assert_not_called()
+        self.assertEqual(["direct", "direct"], [slot.exit_kind for slot in pool.slots])
         self.assertEqual(0, pool.silent_rounds)
         self.assertEqual([(False, 0, 0, 0)] * 2,
                          [(s.flagged, s.flag_count, s.risk_streak, s.pacer.total) for s in pool.slots])
+
+    def test_all_blocked_stop_answer_cancels(self):
+        pool = self.make_pool(3)
+        pool.silent_rounds = module.RISK_SILENT_ROUNDS
+        pool.pause_ask.return_value = False
+        with self.assertRaises(CollectCancelled):
+            pool._all_direct_blocked("测试")
+
+    def test_global_gap_spaces_requests_from_different_ready_accounts(self):
+        pool = self.make_pool(3)
+        for slot in pool.slots:
+            slot.pacer.next_at = 0
+        waits = []
+        pool._sleep = Mock(side_effect=lambda seconds, chunk=0.2, reason=None: waits.append((round(seconds, 1), reason)))
+        with patch.object(module.random, "uniform", side_effect=lambda low, high: low), \
+                patch.object(module.time, "time", return_value=100):
+            first = pool.acquire()
+            pool.note_request(first)
+        self.assertEqual(103, pool.next_global_at)
+        clock = iter([101, 103])
+        with patch.object(module.time, "time", side_effect=lambda: next(clock)):
+            second = pool.acquire()
+        self.assertIsNot(first, second)
+        self.assertEqual([(2.0, "账号之间保持整体请求节奏")], waits)
+
+    def test_single_account_has_no_global_gap(self):
+        pool = self.make_pool(1)
+        with patch.object(module.time, "time", return_value=100):
+            pool.note_request(pool.slots[0])
+        self.assertEqual(0.0, pool.next_global_at)
+
+    def test_wait_reasons_distinguish_interval_break_and_cooldown(self):
+        pool = self.make_pool(2)
+        a, b = pool.slots
+        a.pacer.next_at, b.pacer.next_at = 110, 120
+        self.assertIn("正常请求间隔", pool._wait_reason(100))
+        a.pacer.in_break = True
+        self.assertIn("周期休息", pool._wait_reason(100))
+        a.flagged = True
+        self.assertIn("风控冷却", pool._wait_reason(100))
+        b.flagged = True
+        self.assertEqual("所有账号都在风控冷却", pool._wait_reason(100))
+
+    def test_usage_text_counts_requests_per_account(self):
+        pool = self.make_pool(2)
+        pool.note_request(pool.slots[0])
+        pool.note_request(pool.slots[0])
+        pool.note_request(pool.slots[1])
+        self.assertEqual("0 2 次；1 1 次", pool.usage_text())
 
     def test_healthy_probe_records_success_even_for_legitimate_empty_results(self):
         pool = self.make_pool()
