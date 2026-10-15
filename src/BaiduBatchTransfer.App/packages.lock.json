@@ -398,13 +398,13 @@
       "baidubatchtransfer.application": {
         "type": "Project",
         "dependencies": {
-          "BaiduBatchTransfer.Core": "[1.0.0, )"
+          "BaiduBatchTransfer.Core": "[1.1.13, )"
         }
       },
       "baidubatchtransfer.baiduadapter": {
         "type": "Project",
         "dependencies": {
-          "BaiduBatchTransfer.Core": "[1.0.0, )"
+          "BaiduBatchTransfer.Core": "[1.1.13, )"
         }
       },
       "baidubatchtransfer.core": {
@@ -413,8 +413,8 @@
       "baidubatchtransfer.infrastructure": {
         "type": "Project",
         "dependencies": {
-          "BaiduBatchTransfer.Application": "[1.0.0, )",
-          "BaiduBatchTransfer.Core": "[1.0.0, )",
+          "BaiduBatchTransfer.Application": "[1.1.13, )",
+          "BaiduBatchTransfer.Core": "[1.1.13, )",
           "DocumentFormat.OpenXml": "[3.5.1, )",
           "Microsoft.Data.Sqlite": "[10.0.11, )",
           "System.Security.Cryptography.ProtectedData": "[10.0.11, )"
@@ -461,6 +461,38 @@
         "requested": "[10.0.11, )",
         "resolved": "10.0.11",
         "contentHash": "PNoxCTPb+Tlux+GJyq4c89ddYdpioVSqfGx8pqOF6shCSKwUNNctXhQtRkCICjbJmGrJJsW8NY52kVYO/b8mlQ=="
+      }
+    },
+    "net8.0-windows7.0/win-x64": {
+      "Microsoft.Web.WebView2": {
+        "type": "Direct",
+        "requested": "[1.0.4129.50, )",
+        "resolved": "1.0.4129.50",
+        "contentHash": "BuJC70c7SCl8wlvojLZbc/E5ONmGyG3fhAMmpftCpKerxae//TxgKOTELRK2QRD7m7jigNFQRf6cfVT3ZiIQoQ=="
+      },
+      "SQLitePCLRaw.lib.e_sqlite3": {
+        "type": "Transitive",
+        "resolved": "2.1.12",
+        "contentHash": "fWi8Dbknuhgg72fWinIdjXVaqO1hHL4YBBwVLnr7e1c9TAZwJ0QE38j9syW1hwx6HaqEVTwI+O07WPdZn8Rp0w=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.11",
+        "contentHash": "QTXEoQBzz00SFWbo7nAg1Ogd4f99lwqcO9uAJ7MYSLEUR28f6As32QktrqG2Fr9cfAfd1GjLyGYspE7Ipj7P6w=="
+      },
+      "System.Text.Encodings.Web": {
+        "type": "Transitive",
+        "resolved": "10.0.11",
+        "contentHash": "R7H2/Oqr3onFff/JKDpfRjwxcQZlocF/eQ0ce8go/OTjqz+6LEp/fZK8j1YnDobtysChATEg7krVq4hQJ3IoeQ=="
+      },
+      "System.Management": {
+        "type": "CentralTransitive",
+        "requested": "[10.0.11, )",
+        "resolved": "10.0.11",
+        "contentHash": "xyNn8KGbWI88LoUwg3rB8qcpFFST6dr8Ro/qS8GBu2GOwR0v7J82kVFHTiiPtvEKS79VbMTxs/sIKQ+Cq1Zs1g==",
+        "dependencies": {
+          "System.CodeDom": "10.0.11"
+        }
       }
     }
   }
