@@ -71,7 +71,7 @@ public sealed class WorkspaceLogBuffer
         @"(?<![\w])(?:(?:[A-Za-z]:[\\/]|\\\\)[^,，;；。！？、）》】\r\n\""'“”‘’]+|/(?:Users|home|var|tmp|private)/[^\s,，;；。！？、）》】]+)",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private static readonly Regex TransferProgressPattern = new(
-        @"^进度 [\d,]+/[\d,]+：成功 [\d,]+，失败 (?<failures>[\d,]+)(?:，已取消 (?<cancelled>[\d,]+))?，剩余 [\d,]+。$",
+        @"^进度 [\d,]+/[\d,]+：成功 [\d,]+，失败 [\d,]+(?:，已取消 (?<cancelled>[\d,]+))?，剩余 [\d,]+。$",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly ObservableCollection<WorkspaceLogEntry> entries = [];
@@ -142,12 +142,11 @@ public sealed class WorkspaceLogBuffer
 
     internal static WorkspaceLogLevel Classify(string message)
     {
+        // 进度行里的失败是累计数：一条失败后后面每行都会带「失败 1」，不能每行都标红（用户 10-15 反馈）。
+        // 真正出错的那一刻由「第 N 条转存失败：原因」单独一行标红。
         var progressMatch = TransferProgressPattern.Match(message);
-        if (progressMatch.Success &&
-            long.TryParse(progressMatch.Groups["failures"].Value.Replace(",", string.Empty, StringComparison.Ordinal), out var failureCount))
-            return failureCount > 0 ? WorkspaceLogLevel.Error
-                : progressMatch.Groups["cancelled"].Success ? WorkspaceLogLevel.Warning
-                : WorkspaceLogLevel.Information;
+        if (progressMatch.Success)
+            return progressMatch.Groups["cancelled"].Success ? WorkspaceLogLevel.Warning : WorkspaceLogLevel.Information;
 
         if (ContainsAny(message, "失败", "错误", "无法", "未能", "不可用", "异常"))
             return WorkspaceLogLevel.Error;

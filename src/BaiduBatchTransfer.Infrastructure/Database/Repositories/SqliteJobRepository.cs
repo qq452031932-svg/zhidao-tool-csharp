@@ -360,7 +360,12 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository, 
         var statusFilter = query.Status is null ? string.Empty : " AND o.Status=$status";
         var fromFilter = query.UpdatedFrom is null ? string.Empty : " AND julianday(o.UpdatedAt)>=julianday($from)";
         var toFilter = query.UpdatedTo is null ? string.Empty : " AND julianday(o.UpdatedAt)<=julianday($to)";
-        var filter = accountFilter + statusFilter + fromFilter + toFilter;
+        // 与统计里的「失败」同一口径：转存失败，或开了分享的账号分享失败/取消；整条被停止取消的不算。
+        var failedFilter = !query.FailedOnly ? string.Empty :
+            " AND o.Status<>'Cancelled' AND (o.Status='Failed' OR EXISTS(SELECT 1 FROM ShareOperations fs " +
+            "JOIN BatchOutputAccounts fo ON fo.BatchJobId=o.BatchJobId AND fo.AccountId=o.AssignedAccountId " +
+            "WHERE fs.TransferOperationId=o.Id AND fo.ShareEnabled=1 AND fs.Status IN ('Failed','Cancelled')))";
+        var filter = accountFilter + statusFilter + fromFilter + toFilter + failedFilter;
         var pageIndex = query.AccountId is not null
             ? "IX_TransferOperations_Result_Account_Keyset"
             : query.Status is not null

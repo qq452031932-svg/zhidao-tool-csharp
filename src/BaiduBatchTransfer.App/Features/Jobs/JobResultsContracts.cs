@@ -28,7 +28,8 @@ public sealed record JobResultRow(
     string? TargetPath = null,
     Guid? StagedImportRowId = null,
     string? ShareStatus = null,
-    bool ShareEnabled = true)
+    bool ShareEnabled = true,
+    string? ShareDetailMessage = null)
 {
     public override string ToString() =>
         $"JobResultRow {{ TransferOperationId = {TransferOperationId}, CandidateSequence = {CandidateSequence}, TransferStatus = {TransferStatus}, ShareStatus = {ShareStatusText}, UserContent = [REDACTED] }}";
@@ -58,6 +59,13 @@ public interface IJobResultsWorkflow
         long? afterCursor,
         int pageSize,
         CancellationToken cancellationToken = default);
+    /// <summary>只读失败的记录（口径同统计里的「失败」），用于在运行日志里写出第几条、什么原因。</summary>
+    Task<JobResultsPage> LoadFailedPageAsync(
+        Guid batchJobId,
+        long? afterCursor,
+        int pageSize,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult(new JobResultsPage([], 0, null));
     Task<JobResultActionOutcome> RetryShareOnlyAsync(
         JobResultRow row,
         CancellationToken cancellationToken = default);

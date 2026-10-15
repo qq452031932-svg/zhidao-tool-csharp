@@ -23,7 +23,8 @@ public sealed record OperationPageRequest(
     DateTimeOffset? UpdatedFrom,
     DateTimeOffset? UpdatedTo,
     int PageSize,
-    long? AfterAllocationOrdinal = null);
+    long? AfterAllocationOrdinal = null,
+    bool FailedOnly = false);
 
 public sealed record OperationPageResult(
     IReadOnlyList<OperationPageItem> Items,
@@ -167,7 +168,8 @@ public sealed class JobPageQuery(IUnitOfWorkFactory unitOfWorkFactory)
             request.UpdatedFrom,
             request.UpdatedTo,
             request.PageSize,
-            request.AfterAllocationOrdinal ?? 0);
+            request.AfterAllocationOrdinal ?? 0,
+            FailedOnly: request.FailedOnly);
         persistenceQuery.Validate();
         await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
         var page = await unit.Jobs.GetOperationResultsKeysetPageAsync(persistenceQuery, cancellationToken)

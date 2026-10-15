@@ -69,7 +69,8 @@ public sealed record OperationResultKeysetQuery(
     DateTimeOffset? UpdatedTo,
     int PageSize,
     long AfterAllocationOrdinal = 0,
-    bool IncludeTotalCount = true)
+    bool IncludeTotalCount = true,
+    bool FailedOnly = false)
 {
     public void Validate()
     {

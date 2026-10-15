@@ -430,6 +430,23 @@ public sealed class ExcelColumnMappingTests : IDisposable
     }
 
     [Fact]
+    public async Task InspectorAcceptsCellHyperlinksToShareLinks()
+    {
+        // 用户 10-15：WPS 把链接列自动变成超链接，整表被报「Excel 文件包含异常内容」。
+        var path = WriteCellHyperlinkWorkbook(121);
+        await using var inspectStream = File.OpenRead(path);
+        var inspection = await new OpenXmlWorkbookInspector().InspectAsync(inspectStream);
+        var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
+        var mapping = new ConfirmedImportColumnMapping(suggestion.HeaderRowNumber, suggestion.Columns);
+        await using var readStream = File.OpenRead(path);
+
+        var imported = await ReadAllAsync(new OpenXmlImportReader().ReadAsync(readStream, mapping));
+
+        Assert.Equal(121, imported.Count);
+        Assert.Equal("https://pan.baidu.com/s/link121?pwd=ab1c", imported[^1].RawValues[1]);
+    }
+
+    [Fact]
     public async Task InspectorHonorsCancellation()
     {
         var path = WriteWorkbook(["链接"], [["https://pan.baidu.com/s/id"]]);
@@ -615,9 +632,30 @@ public sealed class ExcelColumnMappingTests : IDisposable
     {
         var path = WriteWorkbook(["链接"], [["https://pan.baidu.com/s/id"]]);
         using var document = SpreadsheetDocument.Open(path, true);
-        document.WorkbookPart!.WorksheetParts.Single().AddHyperlinkRelationship(
-            new Uri("https://evil.example/private"),
-            isExternal: true);
+        document.WorkbookPart!.WorksheetParts.Single().AddExternalRelationship(
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject",
+            new Uri("https://evil.example/private"));
+        return path;
+    }
+
+    private string WriteCellHyperlinkWorkbook(int rowCount)
+    {
+        // 与 WPS 保存的「知道采集」表同形：链接列每格一个指向 pan.baidu.com 的超链接。
+        var rows = Enumerable.Range(1, rowCount)
+            .Select(index => new[] { $"资源{index}", $"https://pan.baidu.com/s/link{index}?pwd=ab{index % 10}c" })
+            .ToArray();
+        var path = WriteWorkbook(["名称", "链接"], rows);
+        using var document = SpreadsheetDocument.Open(path, true);
+        var worksheetPart = document.WorkbookPart!.WorksheetParts.Single();
+        var hyperlinks = new Hyperlinks();
+        for (var index = 1; index <= rowCount; index++)
+        {
+            var relationship = worksheetPart.AddHyperlinkRelationship(new Uri(rows[index - 1][1]), isExternal: true);
+            hyperlinks.Append(new Hyperlink { Reference = $"B{index + 1}", Id = relationship.Id });
+        }
+        var worksheet = worksheetPart.Worksheet!;
+        worksheet.InsertAfter(hyperlinks, worksheet.GetFirstChild<SheetData>());
+        worksheet.Save();
         return path;
     }
 

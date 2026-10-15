@@ -30,15 +30,27 @@ public sealed class LocalJobResultsWorkflow(
             statistics.Accounts.Sum(account => account.CancelledCount));
     }
 
-    public async Task<JobResultsPage> LoadPageAsync(
+    public Task<JobResultsPage> LoadPageAsync(
         Guid batchJobId,
         long? afterCursor,
         int pageSize,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        LoadPageCoreAsync(new OperationPageRequest(batchJobId, null, null, null, null, pageSize, afterCursor), cancellationToken);
+
+    public Task<JobResultsPage> LoadFailedPageAsync(
+        Guid batchJobId,
+        long? afterCursor,
+        int pageSize,
+        CancellationToken cancellationToken = default) =>
+        LoadPageCoreAsync(
+            new OperationPageRequest(batchJobId, null, null, null, null, pageSize, afterCursor, FailedOnly: true),
+            cancellationToken);
+
+    private async Task<JobResultsPage> LoadPageCoreAsync(
+        OperationPageRequest request,
+        CancellationToken cancellationToken)
     {
-        var page = await pageQuery.GetOperationsAsync(
-            new OperationPageRequest(batchJobId, null, null, null, null, pageSize, afterCursor),
-            cancellationToken).ConfigureAwait(false);
+        var page = await pageQuery.GetOperationsAsync(request, cancellationToken).ConfigureAwait(false);
         return new(
             page.Items.Select(item => new JobResultRow(
                 item.OperationId,
@@ -68,7 +80,8 @@ public sealed class LocalJobResultsWorkflow(
                 item.TargetPath,
                 item.StagedImportRowId,
                 item.ShareStatus,
-                item.ShareEnabled)).ToArray(),
+                item.ShareEnabled,
+                item.ShareLastErrorMessage)).ToArray(),
             page.TotalCount,
             page.NextCursor);
     }

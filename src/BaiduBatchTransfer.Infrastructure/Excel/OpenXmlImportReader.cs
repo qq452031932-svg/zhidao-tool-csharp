@@ -345,9 +345,12 @@ public sealed class OpenXmlImportReader
     private static bool HasExternalRelationships(OpenXmlPartContainer container)
     {
         const int maximumRelationshipEdges = 8_192;
+        // 单元格超链接（WPS/Excel 自动把网盘链接变成可点的链接）只是存了一串地址，导入只读单元格文字、
+        // 从不打开它们，所以不拦；外部数据连接、OLE 链接等其他外部关系照旧拒绝。
+        // 用户 10-15：2805 行的「知道采集」表里 121 个 pan.baidu.com 超链接被当成异常内容整表拒绝。
         return HasUnsafeRelationshipGraph(
             container,
-            current => current.ExternalRelationships.Any() || current.HyperlinkRelationships.Any(),
+            current => current.ExternalRelationships.Any(),
             current => current.Parts.Select(pair => (OpenXmlPartContainer)pair.OpenXmlPart),
             maximumRelationshipEdges);
     }

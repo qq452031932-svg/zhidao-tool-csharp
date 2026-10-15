@@ -44,6 +44,44 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public async Task FailedOnlyReturnsTransferAndShareFailuresButNotStoppedOrSucceededRows()
+    {
+        // 运行日志写「第 N 条失败：原因」时用；口径与统计里的「失败」一致。
+        var graph = await CreateShareInsertGraphAsync(4, true, 4);
+        var first = graph.Operations[0];
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddAllocationsAsync([new(Guid.NewGuid(), first.BatchJobId, first.AccountId,
+                1, "/", "/", 4, 0, 0, 4, 4, 4, 0, 4, 0, 0, 0, 0, 0, 4)]);
+            await unit.Jobs.AddShareOperationsAsync(graph.Operations, graph.RemoteItems);
+            await unit.CommitAsync();
+        }
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE TransferOperations SET Status='Failed',LastErrorMessage='分享链接已失效' WHERE Id=$t1;
+                UPDATE ShareOperations SET Status='Failed' WHERE TransferOperationId=$t2;
+                UPDATE TransferOperations SET Status='Cancelled' WHERE Id=$t3;
+                UPDATE ShareOperations SET Status='Cancelled' WHERE TransferOperationId=$t3;
+                UPDATE ShareOperations SET Status='Succeeded' WHERE TransferOperationId=$t4;
+                """;
+            for (var index = 0; index < 4; index++)
+                command.Parameters.AddWithValue($"$t{index + 1}", graph.Operations[index].TransferOperationId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using var read = await SqliteUnitOfWork.BeginAsync(graph.Factory);
+        var page = await read.Jobs.GetOperationResultsKeysetPageAsync(
+            new(first.BatchJobId, null, null, null, null, 10, FailedOnly: true));
+
+        Assert.Equal(2, page.TotalCount);
+        Assert.Equal([1L, 2L], page.Items.Select(item => item.CandidateSequence).ToArray());
+        Assert.Equal("分享链接已失效", page.Items[0].LastErrorMessage);
+        Assert.Equal("Failed", page.Items[1].ShareStatus);
+    }
+
+    [Fact]
     public async Task UnitOfWorkCommitsAllRepositoriesAtomically()
     {
         var factory = await CreateFactoryAsync();

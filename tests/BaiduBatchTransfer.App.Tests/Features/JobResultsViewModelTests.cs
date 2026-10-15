@@ -409,6 +409,7 @@ public sealed class JobResultsViewModelTests
 
         Assert.Equal([
             "进度 0/25：成功 0，失败 0，剩余 25。",
+            "新增 2 条失败，第几条、什么原因请看「处理结果」。",
             "进度 8/25：成功 6，失败 2，剩余 17。",
         ], statuses);
         Assert.Contains(true, busyStates);
@@ -581,6 +582,122 @@ public sealed class JobResultsViewModelTests
 
         Assert.True(await vm.RefreshForLifecycleAsync());
         Assert.Equal("进度 9,526/9,526：成功 4，失败 1，已取消 9,521，剩余 0。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ANewFailureIsLoggedOnceWithItsSequenceAndReasonBeforeTheProgressLine()
+    {
+        // 用户 10-15 截图：一条失败后后面每行进度都标「错误」，看不出是哪条、什么原因。
+        var workflow = new ScriptedProgressWorkflow(
+            new(748, 748, 0, 0, 0, 0),
+            new(748, 748, 0, 0, 22, 0),
+            new(748, 748, 1, 0, 22, 1),
+            new(748, 748, 1, 0, 23, 1));
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+        var statuses = new List<string>();
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(vm.StatusMessage)) statuses.Add(vm.StatusMessage);
+        };
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        workflow.FailedRows.Add(Row(23, "转存失败", "转存未成功，未生成分享") with
+        {
+            ResolvedTitle = "某资源",
+            TransferStatus = "Failed",
+            TransferErrorCode = "SHARE_EXPIRED",
+            TransferDetailMessage = "分享链接已失效。",
+        });
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+
+        Assert.Equal([
+            "进度 22/748：成功 22，失败 0，剩余 726。",
+            "第 23 条「某资源」转存失败：分享链接已失效（代码 SHARE_EXPIRED）。",
+            "进度 23/748：成功 22，失败 1，剩余 725。",
+            "进度 24/748：成功 23，失败 1，剩余 724。",
+        ], statuses);
+    }
+
+    [Fact]
+    public async Task AShareFailureNamesTheShareReasonAndAnAlreadyKnownFailureIsNotRepeated()
+    {
+        var workflow = new ScriptedProgressWorkflow(
+            new(10, 10, 0, 0, 0, 0),
+            new(10, 10, 1, 0, 0, 1),
+            new(10, 10, 1, 0, 2, 1),
+            new(10, 10, 2, 0, 2, 2));
+        var known = Row(1, "转存失败") with { TransferStatus = "Failed", TransferDetailMessage = "网盘空间不足" };
+        workflow.FailedRows.Add(known);
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+        var statuses = new List<string>();
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(vm.StatusMessage)) statuses.Add(vm.StatusMessage);
+        };
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        workflow.FailedRows.Add(Row(5, "转存成功", "分享失败") with
+        {
+            ResolvedTitle = "",
+            TransferStatus = "Succeeded",
+            ShareErrorCode = "ShareFailed",
+            ShareDetailMessage = "分享被百度拒绝",
+        });
+        Assert.True(await vm.RefreshForLifecycleAsync());
+
+        Assert.Equal([
+            "第 1 条「标题」转存失败：网盘空间不足。",
+            "进度 1/10：成功 0，失败 1，剩余 9。",
+            "进度 3/10：成功 2，失败 1，剩余 7。",
+            "第 5 条分享失败：分享被百度拒绝（代码 ShareFailed）。",
+            "进度 4/10：成功 2，失败 2，剩余 6。",
+        ], statuses);
+    }
+
+    [Fact]
+    public async Task OpeningABatchThatAlreadyHasFailuresDoesNotReplayThemIntoTheLog()
+    {
+        var workflow = new ScriptedProgressWorkflow(
+            new(10, 10, 3, 0, 7, 3),
+            new(10, 10, 3, 0, 7, 3));
+        workflow.FailedRows.AddRange([Row(1, "转存失败"), Row(2, "转存失败"), Row(3, "转存失败")]);
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+
+        Assert.Equal("进度 10/10：成功 7，失败 3，剩余 0。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ManyNewFailuresAtOnceAreCappedWithAPointerToTheResultsTab()
+    {
+        var workflow = new ScriptedProgressWorkflow(
+            new(20, 20, 0, 0, 0, 0),
+            new(20, 20, 0, 0, 0, 0),
+            new(20, 20, 7, 0, 0, 7));
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        for (var sequence = 7; sequence >= 1; sequence--)
+            workflow.FailedRows.Add(Row(sequence, "转存失败") with { TransferStatus = "Failed", TransferDetailMessage = "失败" + sequence });
+        var statuses = new List<string>();
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(vm.StatusMessage)) statuses.Add(vm.StatusMessage);
+        };
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+
+        Assert.Equal(7, statuses.Count);
+        Assert.StartsWith("第 1 条", statuses[0], StringComparison.Ordinal);
+        Assert.StartsWith("第 5 条", statuses[4], StringComparison.Ordinal);
+        Assert.Equal("另有 2 条失败，第几条、什么原因请看「处理结果」。", statuses[5]);
+        Assert.StartsWith("进度 7/20", statuses[6], StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1089,9 +1206,12 @@ public sealed class JobResultsViewModelTests
             this.summaries = new Queue<Func<Task<JobResultsSummary>>>(summaries);
 
         public JobResultsPage Page { get; init; } = new([], 25, null);
+        public List<JobResultRow> FailedRows { get; } = [];
 
         public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
             summaries.Dequeue()();
+        public Task<JobResultsPage> LoadFailedPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new JobResultsPage(FailedRows.ToArray(), FailedRows.Count, null));
         public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) =>
             Task.FromResult(Page);
         public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();

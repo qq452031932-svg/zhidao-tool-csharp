@@ -178,18 +178,22 @@ public sealed class WorkspaceLogBufferTests
     }
 
     [Fact]
-    public void ClassifiesProgressWithFailuresAsError()
+    public void ProgressWithEarlierFailuresIsInformationAndTheFailureLineItselfIsError()
     {
+        // 用户 10-15：失败数是累计的，一条失败后每行进度都标「错误」，看起来像一直在出错。
         var buffer = new WorkspaceLogBuffer();
 
+        buffer.AppendSafe("第 23 条「某资源」转存失败：分享链接已失效（代码 SHARE_EXPIRED）。");
         buffer.AppendSafe("进度 25/25：成功 24，失败 1，剩余 0。");
 
-        Assert.Equal(WorkspaceLogLevel.Error, Assert.Single(buffer.Entries).Level);
+        Assert.Equal(
+            [WorkspaceLogLevel.Error, WorkspaceLogLevel.Information],
+            buffer.Entries.Select(entry => entry.Level).ToArray());
     }
 
     [Theory]
     [InlineData("进度 9,525/9,526：成功 4，失败 0，已取消 9,521，剩余 1。", WorkspaceLogLevel.Warning)]
-    [InlineData("进度 9,526/9,526：成功 4，失败 1，已取消 9,521，剩余 0。", WorkspaceLogLevel.Error)]
+    [InlineData("进度 9,526/9,526：成功 4，失败 1，已取消 9,521，剩余 0。", WorkspaceLogLevel.Warning)]
     public void ClassifiesStoppedProgressByRealFailuresNotCancellations(string message, WorkspaceLogLevel expected)
     {
         // 用户 10-14：停止一批后显示一行红色「错误」，其实 9,521 条只是没开始被取消。

@@ -9,6 +9,9 @@ namespace BaiduBatchTransfer.App.Features.Jobs;
 public sealed class JobResultsViewModel : ObservableObject
 {
     public const int PageSize = 100;
+    private const int FailurePageSize = 1_000;
+    private const int MaxFailurePages = 20;
+    private const int MaxFailureLinesPerUpdate = 5;
     private readonly IJobResultsWorkflow workflow;
     private readonly IResultSaveDialog saveDialog;
     private readonly IJobResultCapabilityAvailability capabilities;
@@ -39,6 +42,9 @@ public sealed class JobResultsViewModel : ObservableObject
     private bool refreshFailureActive;
     private readonly HashSet<Guid> loadedOperationIds = [];
     private readonly HashSet<Guid> selectedFailedOperationIds = [];
+    private readonly HashSet<Guid> reportedFailureIds = [];
+    private Guid reportedFailureBatch;
+    private long? failureBaseline;
     private readonly HashSet<Guid> autoPromptedExistingShareBatches = [];
     private readonly HashSet<Guid> finalizedLifecycleBatches = [];
 
@@ -176,8 +182,11 @@ public sealed class JobResultsViewModel : ObservableObject
         completeSuccessCount = terminalProblemCount = cancelledCount = exportedRows = 0;
         progressBatchJobId = Guid.Empty;
         lastProgressSnapshot = null;
+        failureBaseline = null;
         refreshFailureActive = false;
         loadedOperationIds.Clear();
+        reportedFailureIds.Clear();
+        reportedFailureBatch = Guid.Empty;
         autoPromptedExistingShareBatches.Clear();
         finalizedLifecycleBatches.Clear();
         statusMessage = "请选择一个任务查看结果。";
@@ -205,6 +214,7 @@ public sealed class JobResultsViewModel : ObservableObject
         {
             progressBatchJobId = requestedBatchJobId;
             lastProgressSnapshot = null;
+            failureBaseline = null;
             refreshFailureActive = false;
         }
         var previousSave = saveCancellation;
@@ -229,6 +239,8 @@ public sealed class JobResultsViewModel : ObservableObject
             await Task.WhenAll(summaryTask, pageTask).ConfigureAwait(true);
             if (capturedGeneration != generation || requestedBatchJobId != batchJobId) return;
             ApplySummary(await summaryTask.ConfigureAwait(true));
+            if (lastProgressSnapshot is null && failureBaseline is null)
+                failureBaseline = TerminalProblemCount - CancelledCount;
             ApplyPage(await pageTask.ConfigureAwait(true), replace: true);
             StatusMessage = $"已读取 {Items.Count:N0} / {TotalCount:N0} 条操作结果。";
         }
@@ -640,14 +652,27 @@ public sealed class JobResultsViewModel : ObservableObject
         CancelledCount = Math.Min(summary.CancelledCount, summary.TerminalProblemCount);
     }
 
-    private void PublishProgress(Guid requestedBatch)
+    private async Task PublishProgressAsync(Guid requestedBatch, CancellationToken cancellationToken)
     {
         var snapshot = new ProgressSnapshot(OperationCount, CompleteSuccessCount, TerminalProblemCount, CancelledCount);
+        var previous = requestedBatch == progressBatchJobId ? lastProgressSnapshot : null;
         var mustPublish = requestedBatch != progressBatchJobId || lastProgressSnapshot != snapshot || refreshFailureActive;
         progressBatchJobId = requestedBatch;
         lastProgressSnapshot = snapshot;
         refreshFailureActive = false;
         if (!mustPublish) return;
+
+        // 失败数增加时先单独写出第几条、什么原因（红色），进度行本身不再标红。
+        // 用户 10-15：进度是累计数，一条失败后后面每行都显示「错误」，看起来像一直在出错。
+        // 比较基准：上一行进度；这一批还没发过进度时，用打开这一批时的失败数（打开历史批次不重放旧失败）。
+        var failed = snapshot.Failed - snapshot.Cancelled;
+        var previousFailed = previous is { } before ? before.Failed - before.Cancelled : failureBaseline ?? failed;
+        if (failed > previousFailed)
+        {
+            var capturedGeneration = generation;
+            await ReportNewFailuresAsync(requestedBatch, failed - previousFailed, cancellationToken).ConfigureAwait(true);
+            if (capturedGeneration != generation || requestedBatch != progressBatchJobId) return;
+        }
 
         var processed = snapshot.Success + snapshot.Failed;
         var remaining = Math.Max(0, snapshot.Total - processed);
@@ -655,6 +680,65 @@ public sealed class JobResultsViewModel : ObservableObject
         var cancelled = snapshot.Cancelled > 0 ? $"，已取消 {snapshot.Cancelled:N0}" : string.Empty;
         StatusMessage = $"进度 {processed:N0}/{snapshot.Total:N0}：成功 {snapshot.Success:N0}，" +
             $"失败 {snapshot.Failed - snapshot.Cancelled:N0}{cancelled}，剩余 {remaining:N0}。";
+    }
+
+    private async Task ReportNewFailuresAsync(Guid requestedBatch, long increase, CancellationToken cancellationToken)
+    {
+        if (reportedFailureBatch != requestedBatch)
+        {
+            reportedFailureBatch = requestedBatch;
+            reportedFailureIds.Clear();
+        }
+        var fresh = new List<JobResultRow>();
+        try
+        {
+            var unreported = new List<JobResultRow>();
+            long? cursor = null;
+            var pages = 0;
+            do
+            {
+                var page = await workflow.LoadFailedPageAsync(requestedBatch, cursor, FailurePageSize, cancellationToken)
+                    .ConfigureAwait(true);
+                unreported.AddRange(page.Items.Where(row => !reportedFailureIds.Contains(row.TransferOperationId)));
+                cursor = page.NextCursor;
+            }
+            while (cursor is not null && ++pages < MaxFailurePages);
+            // 新增几条就取最近更新的几条：打开批次时已有的失败没写过日志，也不算新失败。
+            fresh.AddRange(unreported.OrderByDescending(LastUpdatedAt).Take((int)Math.Min(increase, int.MaxValue)));
+            foreach (var row in unreported) reportedFailureIds.Add(row.TransferOperationId);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            fresh.Clear();
+        }
+
+        foreach (var row in fresh.OrderBy(row => row.CandidateSequence).Take(MaxFailureLinesPerUpdate))
+            StatusMessage = DescribeFailure(row);
+        if (fresh.Count > MaxFailureLinesPerUpdate)
+            StatusMessage = $"另有 {fresh.Count - MaxFailureLinesPerUpdate:N0} 条失败，第几条、什么原因请看「处理结果」。";
+        else if (fresh.Count == 0)
+            StatusMessage = $"新增 {increase:N0} 条失败，第几条、什么原因请看「处理结果」。";
+    }
+
+    private static DateTimeOffset LastUpdatedAt(JobResultRow row) =>
+        row.ShareUpdatedAt is { } shareUpdatedAt && shareUpdatedAt > row.TransferUpdatedAt ? shareUpdatedAt : row.TransferUpdatedAt;
+
+    internal static string DescribeFailure(JobResultRow row)
+    {
+        var transferFailed = !IsSuccessStatus(row.TransferStatus) &&
+            !string.Equals(row.TransferStatus, "Cancelled", StringComparison.Ordinal);
+        var (kind, detail, statusText, code) = transferFailed
+            ? ("转存失败", row.TransferDetailMessage, row.TransferStatusText, row.TransferErrorCode)
+            : ("分享失败", row.ShareDetailMessage, row.ShareStatusText, row.ShareErrorCode);
+        var reason = (SafeDetail(detail) ?? SafeStatus(statusText)).TrimEnd('。', '.', '；', ';', ' ');
+        if (reason.Length > 120) reason = reason[..120] + "…";
+        var codeText = string.IsNullOrWhiteSpace(code) || reason.Contains(code, StringComparison.OrdinalIgnoreCase)
+            ? string.Empty
+            : $"（代码 {code.Trim()}）";
+        var title = string.IsNullOrWhiteSpace(row.ResolvedTitle) ? string.Empty
+            : row.ResolvedTitle.Trim().Length > 40 ? $"「{row.ResolvedTitle.Trim()[..40]}…」"
+            : $"「{row.ResolvedTitle.Trim()}」";
+        return $"第 {row.CandidateSequence:N0} 条{title}{kind}：{reason}{codeText}。";
     }
 
     private async Task<bool> RefreshSnapshotCoreAsync(
@@ -669,7 +753,7 @@ public sealed class JobResultsViewModel : ObservableObject
             await ReloadSnapshotAsync(capturedBatch, capturedGeneration, cancellationToken).ConfigureAwait(true);
             if (capturedGeneration != generation || capturedBatch != batchJobId || cancellationToken.IsCancellationRequested)
                 return false;
-            PublishProgress(capturedBatch);
+            await PublishProgressAsync(capturedBatch, cancellationToken).ConfigureAwait(true);
             if (finalize) FinalizeLifecycle(capturedBatch);
             return true;
         }
@@ -732,11 +816,12 @@ public sealed class JobResultsViewModel : ObservableObject
             {
                 progressBatchJobId = requestedBatch;
                 lastProgressSnapshot = null;
+                failureBaseline = null;
                 refreshFailureActive = false;
             }
             ApplySummary(await summaryTask.ConfigureAwait(true));
             ApplyPage(await pageTask.ConfigureAwait(true), replace: true);
-            PublishProgress(requestedBatch);
+            await PublishProgressAsync(requestedBatch, cancellationToken).ConfigureAwait(true);
             FinalizeLifecycle(requestedBatch);
             return true;
         }
