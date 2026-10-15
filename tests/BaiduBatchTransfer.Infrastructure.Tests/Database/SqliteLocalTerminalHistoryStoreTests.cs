@@ -409,8 +409,10 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
     [Theory]
     [InlineData("Unknown")]
     [InlineData("DefinitelyNotAccepted")]
-    public async Task GenuinelyRetryableShareFailureBlocksCleanup(string submissionAcceptance)
+    public async Task RetryableShareFailureNoLongerBlocksCleanupButIsCountedForTheWarning(string submissionAcceptance)
     {
+        // 与可重试的失败转存同样处理（2026-10-14）：它曾经把整批历史永久挡住，用户清不掉。
+        // 现在照常可清，但确认框会写明「其中 N 条失败项仍可重试，清空后将无法再重试」。
         var (f, store) = await CreateAsync();
         await SeedAsync(f, LocalHistoryKind.Transfer, "target", "CompletedWithShortfall");
         await ExecuteAsync(f, """
@@ -419,13 +421,14 @@ public sealed class SqliteLocalTerminalHistoryStoreTests : IDisposable
             UPDATE ShareOperations SET Status='Failed',SubmissionAcceptance=$acceptance WHERE Id='target-share';
             """, ("$acceptance", submissionAcceptance));
         var preview = await store.PreviewAsync(LocalHistoryKind.Transfer);
-        Assert.True(preview.HasConflicts);
+        Assert.False(preview.HasConflicts);
+        Assert.Equal(1, preview.RetryableFailureCount);
         var result = await store.DeleteAsync(preview);
-        Assert.Equal(LocalHistoryCleanupDisposition.Conflict, result.Disposition);
-        Assert.Equal(0, result.DeletedBatchCount);
-        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM ShareOperations WHERE Status='Failed'"));
-        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM ShareOperationGenerations"));
-        Assert.Equal(1, await CountAsync(f, "SELECT count(*) FROM ShareOperationRemoteItems"));
+        Assert.Equal(LocalHistoryCleanupDisposition.Deleted, result.Disposition);
+        Assert.Equal(1, result.DeletedBatchCount);
+        Assert.Equal(0, await CountAsync(f, "SELECT count(*) FROM ShareOperations"));
+        Assert.Equal(0, await CountAsync(f, "SELECT count(*) FROM ShareOperationGenerations"));
+        Assert.Equal(0, await CountAsync(f, "SELECT count(*) FROM ShareOperationRemoteItems"));
     }
 
     [Theory]

@@ -26,7 +26,8 @@ public sealed class LocalJobResultsWorkflow(
             statistics.Accounts.Sum(account => account.FailedCount),
             statistics.Accounts.Sum(account => account.PausedCount),
             statistics.Accounts.Sum(account => account.CompleteSuccessCount),
-            statistics.Accounts.Sum(account => account.TerminalProblemCount));
+            statistics.Accounts.Sum(account => account.TerminalProblemCount),
+            statistics.Accounts.Sum(account => account.CancelledCount));
     }
 
     public async Task<JobResultsPage> LoadPageAsync(

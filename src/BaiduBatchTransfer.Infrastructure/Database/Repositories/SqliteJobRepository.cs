@@ -461,7 +461,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository, 
             "COALESCE(SUM(CASE WHEN o.Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending') THEN 1 ELSE 0 END),0)," +
             "COALESCE(SUM(CASE WHEN o.Status='Paused' THEN 1 ELSE 0 END),0)," +
             "COALESCE(SUM(CASE WHEN o.Status='Succeeded' AND (COALESCE(output.ShareEnabled,0)=0 OR s.Status IN ('Succeeded','ReusedExisting')) THEN 1 ELSE 0 END),0)," +
-            "COALESCE(SUM(CASE WHEN o.Status IN ('Failed','Cancelled') OR (output.ShareEnabled=1 AND s.Status IN ('Failed','Cancelled')) THEN 1 ELSE 0 END),0) " +
+            "COALESCE(SUM(CASE WHEN o.Status IN ('Failed','Cancelled') OR (output.ShareEnabled=1 AND s.Status IN ('Failed','Cancelled')) THEN 1 ELSE 0 END),0)," +
+            "COALESCE(SUM(CASE WHEN o.Status='Cancelled' THEN 1 ELSE 0 END),0) " +
             "FROM AccountAllocations al JOIN Accounts a ON a.Id=al.AccountId " +
             "LEFT JOIN TransferOperations o ON o.BatchJobId=al.BatchJobId AND o.AssignedAccountId=al.AccountId " +
             "LEFT JOIN BatchOutputAccounts output ON output.BatchJobId=o.BatchJobId AND output.AccountId=o.AssignedAccountId " +
@@ -476,7 +477,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository, 
             accounts.Add(new(
                 Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetInt32(2),
                 reader.GetInt64(3), reader.GetInt64(4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7),
-                reader.GetInt64(8), reader.GetInt64(9)));
+                reader.GetInt64(8), reader.GetInt64(9), reader.GetInt64(10)));
         }
         return new(batchJobId, resourceCount, operationCount, accounts);
     }

@@ -29,6 +29,7 @@ public sealed class JobResultsViewModel : ObservableObject
     private long pausedCount;
     private long completeSuccessCount;
     private long terminalProblemCount;
+    private long cancelledCount;
     private long exportedRows;
     private JobResultRow? selectedItem;
     private string statusMessage = "请选择一个任务查看结果。";
@@ -84,6 +85,8 @@ public sealed class JobResultsViewModel : ObservableObject
     public long PausedCount { get => pausedCount; private set => SetProperty(ref pausedCount, value); }
     public long CompleteSuccessCount { get => completeSuccessCount; private set => SetProperty(ref completeSuccessCount, value); }
     public long TerminalProblemCount { get => terminalProblemCount; private set => SetProperty(ref terminalProblemCount, value); }
+    /// <summary>批次停止时取消、从未开始的转存数；它们也算在 <see cref="TerminalProblemCount"/> 里。</summary>
+    public long CancelledCount { get => cancelledCount; private set => SetProperty(ref cancelledCount, value); }
     public long ExportedRows { get => exportedRows; private set => SetProperty(ref exportedRows, value); }
     public IReadOnlyCollection<Guid> SelectedFailedOperationIds => selectedFailedOperationIds;
     public int SelectedFailedCount => selectedFailedOperationIds.Count;
@@ -170,7 +173,7 @@ public sealed class JobResultsViewModel : ObservableObject
         isBusy = false;
         isSaving = false;
         totalCount = resourceCount = operationCount = failedCount = pausedCount = 0;
-        completeSuccessCount = terminalProblemCount = exportedRows = 0;
+        completeSuccessCount = terminalProblemCount = cancelledCount = exportedRows = 0;
         progressBatchJobId = Guid.Empty;
         lastProgressSnapshot = null;
         refreshFailureActive = false;
@@ -634,11 +637,12 @@ public sealed class JobResultsViewModel : ObservableObject
         PausedCount = summary.PausedCount;
         CompleteSuccessCount = summary.CompleteSuccessCount;
         TerminalProblemCount = summary.TerminalProblemCount;
+        CancelledCount = Math.Min(summary.CancelledCount, summary.TerminalProblemCount);
     }
 
     private void PublishProgress(Guid requestedBatch)
     {
-        var snapshot = new ProgressSnapshot(OperationCount, CompleteSuccessCount, TerminalProblemCount);
+        var snapshot = new ProgressSnapshot(OperationCount, CompleteSuccessCount, TerminalProblemCount, CancelledCount);
         var mustPublish = requestedBatch != progressBatchJobId || lastProgressSnapshot != snapshot || refreshFailureActive;
         progressBatchJobId = requestedBatch;
         lastProgressSnapshot = snapshot;
@@ -647,7 +651,10 @@ public sealed class JobResultsViewModel : ObservableObject
 
         var processed = snapshot.Success + snapshot.Failed;
         var remaining = Math.Max(0, snapshot.Total - processed);
-        StatusMessage = $"进度 {processed:N0}/{snapshot.Total:N0}：成功 {snapshot.Success:N0}，失败 {snapshot.Failed:N0}，剩余 {remaining:N0}。";
+        // 停止时取消的不是失败，分开写；否则停掉一批就是一行红字「失败 9,521」（用户 10-14 实测）。
+        var cancelled = snapshot.Cancelled > 0 ? $"，已取消 {snapshot.Cancelled:N0}" : string.Empty;
+        StatusMessage = $"进度 {processed:N0}/{snapshot.Total:N0}：成功 {snapshot.Success:N0}，" +
+            $"失败 {snapshot.Failed - snapshot.Cancelled:N0}{cancelled}，剩余 {remaining:N0}。";
     }
 
     private async Task<bool> RefreshSnapshotCoreAsync(
@@ -877,5 +884,5 @@ public sealed class JobResultsViewModel : ObservableObject
         ClearSelectionCommand.NotifyCanExecuteChanged();
     }
 
-    private readonly record struct ProgressSnapshot(long Total, long Success, long Failed);
+    private readonly record struct ProgressSnapshot(long Total, long Success, long Failed, long Cancelled);
 }

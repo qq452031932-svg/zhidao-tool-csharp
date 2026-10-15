@@ -71,7 +71,7 @@ public sealed class WorkspaceLogBuffer
         @"(?<![\w])(?:(?:[A-Za-z]:[\\/]|\\\\)[^,，;；。！？、）》】\r\n\""'“”‘’]+|/(?:Users|home|var|tmp|private)/[^\s,，;；。！？、）》】]+)",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private static readonly Regex TransferProgressPattern = new(
-        @"^进度 [\d,]+/[\d,]+：成功 [\d,]+，失败 (?<failures>[\d,]+)，剩余 [\d,]+。$",
+        @"^进度 [\d,]+/[\d,]+：成功 [\d,]+，失败 (?<failures>[\d,]+)(?:，已取消 (?<cancelled>[\d,]+))?，剩余 [\d,]+。$",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly ObservableCollection<WorkspaceLogEntry> entries = [];
@@ -95,10 +95,12 @@ public sealed class WorkspaceLogBuffer
         lastAppendedEntry = null;
     }
 
+    /// <param name="persist">false 时只显示在界面上，不通知落盘（发出方已经自己写过运行日志）。</param>
     public void AppendSafe(
         string? message,
         WorkspaceLogLevel? level = null,
-        DateTimeOffset? timestamp = null)
+        DateTimeOffset? timestamp = null,
+        bool persist = true)
     {
         if (string.IsNullOrWhiteSpace(message)) return;
         var entry = new WorkspaceLogEntry(
@@ -121,7 +123,7 @@ public sealed class WorkspaceLogBuffer
             entries.RemoveAt(0);
             if (ReferenceEquals(removed, lastAppendedEntry)) lastAppendedEntry = null;
         }
-        appended?.Invoke(entry);
+        if (persist) appended?.Invoke(entry);
     }
 
     internal static string SanitizeForEntry(string message)
@@ -143,7 +145,9 @@ public sealed class WorkspaceLogBuffer
         var progressMatch = TransferProgressPattern.Match(message);
         if (progressMatch.Success &&
             long.TryParse(progressMatch.Groups["failures"].Value.Replace(",", string.Empty, StringComparison.Ordinal), out var failureCount))
-            return failureCount == 0 ? WorkspaceLogLevel.Information : WorkspaceLogLevel.Error;
+            return failureCount > 0 ? WorkspaceLogLevel.Error
+                : progressMatch.Groups["cancelled"].Success ? WorkspaceLogLevel.Warning
+                : WorkspaceLogLevel.Information;
 
         if (ContainsAny(message, "失败", "错误", "无法", "未能", "不可用", "异常"))
             return WorkspaceLogLevel.Error;

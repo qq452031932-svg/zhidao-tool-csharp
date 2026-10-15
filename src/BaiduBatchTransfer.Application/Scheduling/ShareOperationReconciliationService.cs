@@ -45,14 +45,26 @@ public readonly record struct ShareReconciliationFailureSnapshot(
     DateTimeOffset UpdatedAt,
     DateTimeOffset? NextReconcileAt);
 
+/// <param name="GiveUpAfter">
+/// 分享列表能正常读取、却一直找不到这次创建的分享时，从提交起最多等这么久，之后按「未创建」处理。
+/// 不设上限时，这一条会每分钟核对一次、永远待确认，同一账号被它占着，整批乃至后面排队的批次都停住
+/// （用户 2026-10-13 晚的批次就这样卡在 79 条，之后新建的批次一直「等待」）。
+/// </param>
+/// <param name="GiveUpAfterBatchStopped">
+/// 同上，但批次已被用户停止时用的较短上限。停止的批次不会再重试这条分享，多等也换不来不同的结果，
+/// 只会让这一批迟迟收不了尾、清不掉（用户 10-14 实测：关软件前 1 秒刚提交的分享让停止的批次卡了半小时）。
+/// </param>
 public sealed record ShareReconciliationOptions(
     int MaximumPolls,
     int MaximumPagesPerPoll,
     TimeSpan PollDelay,
-    TimeSpan RetryDelay)
+    TimeSpan RetryDelay,
+    TimeSpan? GiveUpAfter = null,
+    TimeSpan? GiveUpAfterBatchStopped = null)
 {
     public static ShareReconciliationOptions Default { get; } =
-        new(3, 10_000, TimeSpan.FromSeconds(10), TimeSpan.FromMinutes(1));
+        new(3, 10_000, TimeSpan.FromSeconds(10), TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(30),
+            TimeSpan.FromMinutes(2));
 
     public void Validate()
     {
@@ -60,6 +72,9 @@ public sealed record ShareReconciliationOptions(
         if (MaximumPagesPerPoll is < 1 or > 100_000) throw new ArgumentOutOfRangeException(nameof(MaximumPagesPerPoll));
         if (PollDelay < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(PollDelay));
         if (RetryDelay <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(RetryDelay));
+        if (GiveUpAfter is { } giveUp && giveUp <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(GiveUpAfter));
+        if (GiveUpAfterBatchStopped is { } stopped && stopped <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(GiveUpAfterBatchStopped));
     }
 }
 
@@ -79,6 +94,10 @@ public interface IShareReconciliationStore
     Task<bool> TryFailDefinitelyNotAcceptedAsync(
         Guid operationId, int generation, long leaseGeneration, ShareReconciliationFailureSnapshot expected,
         DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
+
+    /// <summary>批次是否已被用户停止：有被取消的转存，且没有还在进行的转存。</summary>
+    Task<bool> IsBatchStoppedAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+        Task.FromResult(false);
 }
 
 public interface IShareResultReconciler
@@ -240,8 +259,20 @@ public sealed class ShareOperationReconciliationService : IShareResultReconciler
                 return await AcceptAsync(context, candidates.Values.Single(), cancellationToken).ConfigureAwait(false);
         }
 
+        // 每一轮都完整读到了分享列表，只是里面没有这次的分享。提交已经过去足够久仍然如此，
+        // 说明网盘并没有创建它：按未被接受处理，可以安全重试分享，也不再占着账号。
+        if (await ShouldGiveUpAsync(context, cancellationToken).ConfigureAwait(false))
+            return await FailDefinitelyNotAcceptedAsync(context, cancellationToken).ConfigureAwait(false);
         return await KeepPendingAsync(context, ShareReconciliationIssue.ReconcileTimeout,
             ShareReconciliationDisposition.ResultPending, "分享结果待确认", cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<bool> ShouldGiveUpAsync(ShareExecutionContext context, CancellationToken cancellationToken)
+    {
+        var elapsed = timeProvider.GetUtcNow() - context.Operation.SubmitStartedAt!.Value;
+        if (options.GiveUpAfter is { } giveUp && elapsed >= giveUp) return true;
+        return options.GiveUpAfterBatchStopped is { } stopped && elapsed >= stopped &&
+               await store.IsBatchStoppedAsync(context.Operation.BatchJobId, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<ShareReconciliationResult> ReconcileExecutionBoundAsync(

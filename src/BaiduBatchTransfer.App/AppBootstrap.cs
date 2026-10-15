@@ -135,6 +135,7 @@ public static class AppBootstrap
             sp.GetRequiredService<ApplicationUpdateService>());
         services.AddSingleton(paths);
         services.AddSingleton<IRunLog>(_ => new FileRunLog(Path.Combine(paths.RootDirectory, "logs")));
+        services.AddSingleton<StartupNotices>();
         services.AddSingleton<ICollectPauseStore>(_ => new FileCollectPauseStore(
             Path.Combine(paths.RootDirectory, "collect", "paused-task.json")));
         services.AddSingleton(_ => new SqliteConnectionFactory(paths.DatabasePath));
@@ -259,6 +260,7 @@ public static class AppBootstrap
             sp.GetRequiredService<SqliteLocalResultExportStore>());
         services.AddSingleton<PauseBatchService>();
         services.AddSingleton<ResumeBatchService>();
+        services.AddSingleton<EndBatchService>();
         services.AddSingleton<RetryFailedTransferService>();
         services.AddSingleton<SqliteBatchResultProjectionRepository>();
         services.AddSingleton<IBatchResultProjectionRepository>(sp =>
@@ -675,7 +677,9 @@ public static class AppBootstrap
             sp.GetRequiredService<StartupRecoveryService>(),
             sp.GetRequiredService<IRemoteSelectionSessionStore>(),
             sp.GetRequiredService<ILocalResultExportCoordinator>(),
-            TimeProvider.System));
+            TimeProvider.System,
+            sp.GetService<IRunLog>(),
+            sp.GetRequiredService<StartupNotices>()));
         services.AddSingleton<IAppRecoveryRunner>(sp =>
             sp.GetRequiredService<StartupRecoveryRunner>());
         services.AddSingleton<AppStartupController>();
@@ -923,7 +927,9 @@ public sealed class AppShellFactory(
     ICurrentImportCleanupInteraction currentImportCleanupInteraction,
     ILicenseActivationPresenter? licenseActivationPresenter = null,
     ICollectPauseStore? collectPauseStore = null,
-    IRunLog? runLog = null) : IAppShellFactory
+    IRunLog? runLog = null,
+    EndBatchService? endBatchService = null,
+    StartupNotices? startupNotices = null) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
@@ -969,7 +975,9 @@ public sealed class AppShellFactory(
             retryFailedTransferService,
             transferOptions.MaximumRecentBatches,
             batchHistorySource,
-            licenseGate: licenseGate);
+            licenseGate: licenseGate,
+            endService: endBatchService,
+            dialogService: dialogService);
 
         async Task DispatchOnUiAsync(Action action)
         {
@@ -1051,7 +1059,9 @@ public sealed class AppShellFactory(
             licenseActivationPresenter is null
                 ? null
                 : token => licenseActivationPresenter.PresentAsync(token),
-            runLog);
+            runLog,
+            endBatchService,
+            startupNotices);
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
         // 首页在 ReadLicenseSettings 之后才能装配，因为它要显示授权状态。
         object homeWorkspace = new DeferredWorkspaceView(

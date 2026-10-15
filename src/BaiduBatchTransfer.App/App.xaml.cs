@@ -4,7 +4,9 @@ using System.ComponentModel;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Features.Licensing;
+using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.App.Updates;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -136,6 +138,17 @@ public partial class App : System.Windows.Application
         if (allowShutdown || updateShutdownOrchestrator is null) return;
         e.Cancel = true;
         if (Interlocked.Exchange(ref shutdownRequested, 1) != 0) return;
+
+        var closeConfirmed = await TransferCloseReminder.ConfirmAsync(
+                host?.Services.GetService<EndBatchService>(),
+                message => TransferCloseReminder.AskWithMessageBox(MainWindow, message),
+                runLog)
+            .ConfigureAwait(true);
+        if (!closeConfirmed)
+        {
+            Interlocked.Exchange(ref shutdownRequested, 0);
+            return;
+        }
 
         if (MainWindow is not null) MainWindow.IsEnabled = false;
         var completed = await updateShutdownOrchestrator

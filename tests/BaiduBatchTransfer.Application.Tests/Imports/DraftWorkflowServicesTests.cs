@@ -603,6 +603,46 @@ public sealed class DraftWorkflowServicesTests
         Assert.NotNull(await read.Imports.GetRowByIdAsync(row.Id));
     }
 
+    [Fact]
+    public async Task DeletingSeveralRowsTogetherRemovesThemAllAndReclassifiesTheRest()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var primary = Row(sessionId, 1, "same");
+        var duplicate = Row(sessionId, 2, "same") with { Disposition = "Duplicate", DuplicateOfStagedRowId = primary.Id };
+        var second = Row(sessionId, 3, "two");
+        var keep = Row(sessionId, 4, "four");
+        await database.SeedAsync([], Session(sessionId, 4, ready: 3, duplicate: 1), [primary, duplicate, second, keep]);
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+
+        var result = await service.DeleteManyAsync(sessionId, [primary.Id, second.Id, primary.Id], TransferMode.Distribution);
+
+        Assert.Equal((2L, 2L, 0L), (result.TotalRows, result.ReadyRows, result.DuplicateRows));
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var remaining = await AllRowsAsync(read.Imports, sessionId);
+        Assert.Equal([duplicate.Id, keep.Id], remaining.Select(row => row.Id));
+        Assert.All(remaining, row => Assert.Equal("Ready", row.Disposition));
+    }
+
+    [Fact]
+    public async Task DeletingSeveralRowsIsAllOrNothingWhenOneOfThemIsGone()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var first = Row(sessionId, 1, "one");
+        var second = Row(sessionId, 2, "two");
+        await database.SeedAsync([], Session(sessionId, 2, ready: 2), [first, second]);
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+
+        var error = await Assert.ThrowsAsync<DraftWorkflowException>(() =>
+            service.DeleteManyAsync(sessionId, [first.Id, Guid.NewGuid()], TransferMode.Distribution));
+
+        Assert.Equal("DRAFT_ROW_NOT_FOUND", error.Code);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.NotNull(await read.Imports.GetRowByIdAsync(first.Id));
+        Assert.NotNull(await read.Imports.GetRowByIdAsync(second.Id));
+    }
+
     private static CreateBatchService CreateService(Jobs.BatchTestDatabase database) =>
         new(database.UnitOfWorkFactory, new BatchDraftValidator(), new ReplicationPreflightEstimator(new UnlimitedDisk(), database.DatabasePath));
 

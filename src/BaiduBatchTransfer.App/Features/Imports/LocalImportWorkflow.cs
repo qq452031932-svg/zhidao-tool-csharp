@@ -291,6 +291,19 @@ public sealed class LocalImportWorkflow(
         return await LoadResultAsync(row.ImportSessionId, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<ImportWorkflowResult> DeleteRowsAsync(IReadOnlyList<Guid> rowIds, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(rowIds);
+        if (rowIds.Count == 0) throw new ImportWorkflowException(ImportUiError.InvalidData);
+        await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
+        var row = await unit.Imports.GetRowByIdAsync(rowIds[0], cancellationToken).ConfigureAwait(false)
+            ?? throw new ImportWorkflowException(ImportUiError.InvalidData);
+        await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        await editingService.DeleteManyAsync(
+            row.ImportSessionId, rowIds, TransferMode.Distribution, cancellationToken).ConfigureAwait(false);
+        return await LoadResultAsync(row.ImportSessionId, cancellationToken).ConfigureAwait(false);
+    }
+
     private IAsyncEnumerable<ImportSourceRow> ReadTextAsync(string text, CancellationToken cancellationToken) =>
         textParser.ParseAsync(new StringReader(text), cancellationToken);
 

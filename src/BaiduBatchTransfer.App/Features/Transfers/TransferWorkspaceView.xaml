@@ -210,7 +210,7 @@
                             </Grid.RowDefinitions>
                             <DataGrid x:Name="PendingLinksGrid" ItemsSource="{Binding Import.Rows}"
                                       SelectedItem="{Binding Import.SelectedRow, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                      SelectionMode="Single" SelectionUnit="FullRow" IsSynchronizedWithCurrentItem="True"
+                                      SelectionMode="Extended" SelectionUnit="FullRow" IsSynchronizedWithCurrentItem="True"
                                       Style="{StaticResource DenseDataGridStyle}" RowHeight="34"
                                       IsReadOnly="True" EnableRowVirtualization="True"
                                       EnableColumnVirtualization="True"
@@ -219,9 +219,9 @@
                                       ScrollViewer.CanContentScroll="True">
                                 <DataGrid.ContextMenu>
                                     <ContextMenu>
-                                        <MenuItem Header="删除这条记录"
+                                        <MenuItem Header="{Binding PlacementTarget.DataContext.Import.DeleteMenuText, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                   Command="{Binding PlacementTarget.DataContext.Import.DeleteSelectedRowCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
-                                                  ToolTip="从待处理列表中彻底删除，不能恢复；只想这次不转存请用「排除所选记录」。" />
+                                                  ToolTip="从待处理列表中彻底删除，不能恢复；只想这次不转存请用「排除所选记录」。按住 Ctrl 或 Shift 可多选后一起删除。" />
                                     </ContextMenu>
                                 </DataGrid.ContextMenu>
                                 <DataGrid.Columns>
@@ -251,9 +251,11 @@
                                     <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
                                 <TextBox Text="{Binding Import.SelectedShareUrl, UpdateSourceTrigger=PropertyChanged}"
+                                         IsEnabled="{Binding Import.CanEditSelectedRow}"
                                          ToolTip="修改所选记录的分享链接" VerticalContentAlignment="Center" />
                                 <TextBox Grid.Column="1" Margin="8,0,0,0"
                                          Text="{Binding Import.SelectedExtractionCode, UpdateSourceTrigger=PropertyChanged}"
+                                         IsEnabled="{Binding Import.CanEditSelectedRow}"
                                          ToolTip="修改所选记录的提取码" VerticalContentAlignment="Center" />
                                 <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="8,0,0,0">
                                     <Button Content="保存修改" Command="{Binding Import.SaveSelectedRowCommand}" />
@@ -264,7 +266,7 @@
                                           IsChecked="{Binding Import.ShowConflictsOnly, Mode=TwoWay}"
                                           IsEnabled="{Binding Import.CanFilterConflicts}"
                                           VerticalAlignment="Center" Margin="2,6,0,0"
-                                          ToolTip="只列出「冲突待处理」的记录：同一个链接出现多次且提取码等设置不一致。排除或删除多余的那几条后才能开始转存。" />
+                                          ToolTip="只列出「冲突待处理」的记录：同一个链接出现多次且提取码等设置不一致。排除或删除多余的那几条后才能开始转存。按住 Ctrl 或 Shift 可多选，Ctrl+A 选中本页全部，再右键一起删除。" />
                                 <StackPanel Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal"
                                             HorizontalAlignment="Right" Margin="0,6,0,0">
                                     <TextBlock Text="{Binding Import.PageText}" VerticalAlignment="Center" Margin="0,0,10,0"
@@ -282,6 +284,23 @@
                                  却没有任何地方能点到，失败项因此既重试不了、又会挡住清空历史。 -->
                             <StackPanel DockPanel.Dock="Top" Orientation="Horizontal"
                                         HorizontalAlignment="Right" Margin="4,8,4,0">
+                                <!-- 暂停：不再领取新的操作，正在提交的几条会做完；继续：接着跑。
+                                     停止：这一批不要了，没开始的取消，正在提交的等它收尾，之后可清空历史。
+                                     与采集一致：只有暂停的批次关掉软件后还能继续，没暂停直接关软件等同停止。 -->
+                                <Button x:Name="PauseResumeTransferButton"
+                                        Content="{Binding RunPanel.PauseResumeText}"
+                                        Command="{Binding RunPanel.PauseResumeCommand}"
+                                        AutomationProperties.Name="暂停或继续转存"
+                                        Margin="0,0,10,0" Padding="12,4"
+                                        ToolTip="暂停：不再开始新的转存，正在提交的几条会做完再停；之后点「继续」接着转存。暂停后关掉软件，下次打开还能继续；没有暂停直接关掉软件，这一批会按停止处理。"
+                                        ToolTipService.ShowOnDisabled="True" />
+                                <Button x:Name="EndTransferBatchButton"
+                                        Content="停止"
+                                        Command="{Binding RunPanel.EndBatchCommand}"
+                                        AutomationProperties.Name="停止转存"
+                                        Margin="0,0,10,0" Padding="12,4"
+                                        ToolTip="这一批不要了（例如导入错了）：没开始的记录标为已取消，已转存成功的不受影响。停止后不能再继续，可以用「清空转存历史」删除。"
+                                        ToolTipService.ShowOnDisabled="True" />
                                 <Button x:Name="RetryFailedTransferButton"
                                         Content="重试所选失败项"
                                         Command="{Binding RunPanel.RetryFailedTransferCommand}"

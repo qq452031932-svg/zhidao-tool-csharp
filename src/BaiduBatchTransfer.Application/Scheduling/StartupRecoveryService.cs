@@ -1,3 +1,4 @@
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 
 namespace BaiduBatchTransfer.Application.Scheduling;
@@ -31,7 +32,8 @@ public sealed record StartupRecoveryResult(
     LeaseRecoveryResult OperationRecovery,
     AllocationCounterRebuildResult CounterRebuild,
     bool CoordinatorMayStart,
-    ShareLeaseRecoveryResult? ShareRecovery = null);
+    ShareLeaseRecoveryResult? ShareRecovery = null,
+    EndAllResult? StoppedLeftRunning = null);
 
 public sealed class SingleInstanceUnavailableException : InvalidOperationException
 {
@@ -48,6 +50,7 @@ public sealed class StartupRecoveryService
     private readonly IInterruptedOperationRecoveryStore operationRecovery;
     private readonly AllocationCounterRebuilder counterRebuilder;
     private readonly IInterruptedShareOperationRecoveryStore? shareRecovery;
+    private readonly EndBatchService? leftRunningBatches;
     private readonly TimeProvider timeProvider;
     private readonly SemaphoreSlim preparationLock = new(1, 1);
     private bool localPrepared;
@@ -58,13 +61,15 @@ public sealed class StartupRecoveryService
         IInterruptedOperationRecoveryStore operationRecovery,
         AllocationCounterRebuilder counterRebuilder,
         TimeProvider? timeProvider = null,
-        IInterruptedShareOperationRecoveryStore? shareRecovery = null)
+        IInterruptedShareOperationRecoveryStore? shareRecovery = null,
+        EndBatchService? leftRunningBatches = null)
     {
         this.instanceGuard = instanceGuard ?? throw new ArgumentNullException(nameof(instanceGuard));
         this.databaseMaintenance = databaseMaintenance ?? throw new ArgumentNullException(nameof(databaseMaintenance));
         this.operationRecovery = operationRecovery ?? throw new ArgumentNullException(nameof(operationRecovery));
         this.counterRebuilder = counterRebuilder ?? throw new ArgumentNullException(nameof(counterRebuilder));
         this.shareRecovery = shareRecovery;
+        this.leftRunningBatches = leftRunningBatches;
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
@@ -102,9 +107,14 @@ public sealed class StartupRecoveryService
         var shares = shareRecovery is null
             ? null
             : await shareRecovery.RecoverInterruptedShareOperationsAsync(recoveredAt, cancellationToken).ConfigureAwait(false);
+        // 上次关闭时没有暂停的批次按停止处理：中断的操作刚被放回队列，在调度器启动之前把它们取消，
+        // 只留已经提交、需要核对结果的那几条收尾。
+        var stopped = leftRunningBatches is null
+            ? null
+            : await leftRunningBatches.EndAllLeftRunningAsync(cancellationToken).ConfigureAwait(false);
         var counters = await counterRebuilder.RebuildAsync(cancellationToken).ConfigureAwait(false);
         CoordinatorMayStart = true;
-        return new StartupRecoveryResult(operations, counters, true, shares);
+        return new StartupRecoveryResult(operations, counters, true, shares, stopped);
     }
 
     public async Task<StartupRecoveryResult> RecoverAsync(CancellationToken cancellationToken = default)

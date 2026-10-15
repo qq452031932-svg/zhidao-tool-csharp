@@ -129,6 +129,124 @@ public sealed partial class ShareReconciliationTests
     }
 
     [Fact]
+    public async Task ZeroMatchesLongAfterSubmissionIsTreatedAsNotCreatedAndFreesTheAccount()
+    {
+        // 用户 10-13 晚的批次：一条分享提交后一直核对不到，每分钟重试、永远待确认，
+        // 占着唯一的账号，整批和后面排队的批次都停住。列表读得到、就是没有它，过了上限按未创建处理。
+        var harness = Harness([Page(Old()), Page(Old())], maximumPolls: 2,
+            submittedAgo: TimeSpan.FromMinutes(31), giveUpAfter: TimeSpan.FromMinutes(30));
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.DefinitelyNotAccepted, result.Disposition);
+        Assert.True(harness.Store.FailedDefinitelyNotAccepted);
+        Assert.Null(harness.Store.PendingIssue);
+        Assert.Null(harness.Store.Accepted);
+        Assert.Equal(0, harness.Adapter.CreateCalls);
+    }
+
+    [Fact]
+    public async Task ZeroMatchesBeforeTheLimitStaysPending()
+    {
+        var harness = Harness([Page(Old())], submittedAgo: TimeSpan.FromMinutes(29), giveUpAfter: TimeSpan.FromMinutes(30));
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.ResultPending, result.Disposition);
+        Assert.False(harness.Store.FailedDefinitelyNotAccepted);
+        Assert.Equal(ShareReconciliationIssue.ReconcileTimeout, harness.Store.PendingIssue);
+    }
+
+    [Fact]
+    public async Task AnUnreadableShareListNeverCountsAsNotCreatedHoweverLongItTakes()
+    {
+        var harness = Harness([Page(Old())], listFailure: BaiduErrorKind.TransientService,
+            submittedAgo: TimeSpan.FromDays(2), giveUpAfter: TimeSpan.FromMinutes(30));
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.ResultPending, result.Disposition);
+        Assert.False(harness.Store.FailedDefinitelyNotAccepted);
+        Assert.Equal(ShareReconciliationIssue.ListingUnavailable, harness.Store.PendingIssue);
+    }
+
+    [Fact]
+    public void TheDefaultGivesUpAfterThirtyMinutes() =>
+        Assert.Equal(TimeSpan.FromMinutes(30), ShareReconciliationOptions.Default.GiveUpAfter);
+
+    [Fact]
+    public async Task AStoppedBatchGivesUpOnAMissingShareAfterTwoMinutesInsteadOfThirty()
+    {
+        // 用户 10-14：关软件前 1 秒刚提交的分享，重开后批次按停止处理，却还要等 30 分钟才收得了尾、清得掉。
+        // 停止的批次不会再重试这条分享，多等没有意义。
+        var harness = Harness([Page(Old())], submittedAgo: TimeSpan.FromMinutes(3),
+            giveUpAfter: TimeSpan.FromMinutes(30), giveUpAfterBatchStopped: TimeSpan.FromMinutes(2), batchStopped: true);
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.DefinitelyNotAccepted, result.Disposition);
+        Assert.True(harness.Store.FailedDefinitelyNotAccepted);
+        Assert.Equal([harness.Operation.BatchJobId], harness.Store.StoppedQueries);
+        Assert.Equal(0, harness.Adapter.CreateCalls);
+    }
+
+    [Fact]
+    public async Task AStoppedBatchStillWaitsForTheShortLimitRightAfterSubmission()
+    {
+        var harness = Harness([Page(Old())], submittedAgo: TimeSpan.FromSeconds(30),
+            giveUpAfter: TimeSpan.FromMinutes(30), giveUpAfterBatchStopped: TimeSpan.FromMinutes(2), batchStopped: true);
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.ResultPending, result.Disposition);
+        Assert.False(harness.Store.FailedDefinitelyNotAccepted);
+        Assert.Empty(harness.Store.StoppedQueries);
+    }
+
+    [Fact]
+    public async Task ARunningBatchKeepsTheThirtyMinuteLimit()
+    {
+        var harness = Harness([Page(Old())], submittedAgo: TimeSpan.FromMinutes(3),
+            giveUpAfter: TimeSpan.FromMinutes(30), giveUpAfterBatchStopped: TimeSpan.FromMinutes(2), batchStopped: false);
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.ResultPending, result.Disposition);
+        Assert.False(harness.Store.FailedDefinitelyNotAccepted);
+        Assert.Equal(ShareReconciliationIssue.ReconcileTimeout, harness.Store.PendingIssue);
+    }
+
+    [Fact]
+    public async Task AStoppedBatchStillAcceptsAShareThatShowsUp()
+    {
+        var harness = Harness([Page(Old(), New())], submittedAgo: TimeSpan.FromMinutes(3),
+            giveUpAfter: TimeSpan.FromMinutes(30), giveUpAfterBatchStopped: TimeSpan.FromMinutes(2), batchStopped: true);
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.Accepted, result.Disposition);
+        Assert.False(harness.Store.FailedDefinitelyNotAccepted);
+    }
+
+    [Fact]
+    public async Task AStoppedBatchNeverCountsAnUnreadableShareListAsNotCreated()
+    {
+        var harness = Harness([Page(Old())], listFailure: BaiduErrorKind.TransientService,
+            submittedAgo: TimeSpan.FromMinutes(10), giveUpAfter: TimeSpan.FromMinutes(30),
+            giveUpAfterBatchStopped: TimeSpan.FromMinutes(2), batchStopped: true);
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.ResultPending, result.Disposition);
+        Assert.False(harness.Store.FailedDefinitelyNotAccepted);
+        Assert.Equal(ShareReconciliationIssue.ListingUnavailable, harness.Store.PendingIssue);
+    }
+
+    [Fact]
+    public void TheDefaultGivesUpOnStoppedBatchesAfterTwoMinutes() =>
+        Assert.Equal(TimeSpan.FromMinutes(2), ShareReconciliationOptions.Default.GiveUpAfterBatchStopped);
+
+    [Fact]
     public async Task MultipleNewCompatibleSharesRemainAmbiguous()
     {
         var harness = Harness([Page(New("new-1"), New("new-2"))]);
@@ -216,26 +334,31 @@ public sealed partial class ShareReconciliationTests
         IEnumerable<BaiduSharePage> pages,
         int maximumPolls = 1,
         int maximumPages = 10,
-        BaiduErrorKind? listFailure = null)
+        BaiduErrorKind? listFailure = null,
+        TimeSpan? submittedAgo = null,
+        TimeSpan? giveUpAfter = null,
+        TimeSpan? giveUpAfterBatchStopped = null,
+        bool batchStopped = false)
     {
         var exact = new RemoteItemIdentitySet([new("remote-1", "display")]);
         var operation = new ShareOperationRecord(
             Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1,
             "ResultPending", exact.Fingerprint,
             ShareSettingsFingerprint.Compute(true, true, ShareExtractionCodeBehavior.Random, null),
-            1, "{}", "request", "Unknown", 1, null, Now.AddMinutes(-1), Now,
+            1, "{}", "request", "Unknown", 1, null, Now - (submittedAgo ?? TimeSpan.FromMinutes(1)), Now,
             null, null, Now.AddMinutes(-2), Now, 4);
         var settings = new BatchShareSettingsRecord(
             operation.BatchJobId, true, true, "Random", null, "Regenerate", Now,
             operation.SettingsFingerprint);
         var store = new RecordingStore(new(
-            operation, settings, true, true, exact, ExistingShareDecision.Regenerate));
+            operation, settings, true, true, exact, ExistingShareDecision.Regenerate)) { BatchStopped = batchStopped };
         store.Baseline.Add(new(operation.Id, "old-share", 1));
         var adapter = new RecordingAdapter(pages, listFailure);
         var delay = new RecordingDelay();
         var service = new ShareOperationReconciliationService(
             adapter, new MemorySessionStore(operation.AccountId), store, delay,
-            new ShareReconciliationOptions(maximumPolls, maximumPages, TimeSpan.FromSeconds(1), TimeSpan.FromMinutes(1)),
+            new ShareReconciliationOptions(maximumPolls, maximumPages, TimeSpan.FromSeconds(1), TimeSpan.FromMinutes(1), giveUpAfter,
+                giveUpAfterBatchStopped),
             new FrozenTimeProvider(Now));
         return new(service, operation, store, adapter, delay);
     }
@@ -277,6 +400,14 @@ public sealed partial class ShareReconciliationTests
         public BaiduShareResultRecord? Accepted { get; private set; }
         public ShareReconciliationIssue? PendingIssue { get; private set; }
         public bool FailedDefinitelyNotAccepted { get; private set; }
+        public bool BatchStopped { get; init; }
+        public List<Guid> StoppedQueries { get; } = [];
+
+        public Task<bool> IsBatchStoppedAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+        {
+            StoppedQueries.Add(batchJobId);
+            return Task.FromResult(BatchStopped);
+        }
 
         public Task<ShareExecutionContext?> LoadPendingAsync(Guid operationId, CancellationToken cancellationToken = default) =>
             Task.FromResult<ShareExecutionContext?>(context);

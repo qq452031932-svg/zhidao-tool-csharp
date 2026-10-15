@@ -79,7 +79,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         LocalImportDraftCleanupService? importDraftCleanupService = null,
         ICurrentImportCleanupInteraction? currentImportCleanupInteraction = null,
         Func<CancellationToken, Task<bool>>? presentActivationAsync = null,
-        IRunLog? runLog = null)
+        IRunLog? runLog = null,
+        EndBatchService? endBatchService = null,
+        StartupNotices? startupNotices = null)
     {
         logBuffer = new(appended: runLog.ForWorkspace("转存"));
         Import = import ?? throw new ArgumentNullException(nameof(import));
@@ -105,7 +107,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         historyCleanup = new(historyCleanupService, historyCleanupInteraction, LocalHistoryKind.Transfer,
             () => !isClosed && !IsStarting && !Import.IsBusy && !Wizard.IsBusy &&
                 !RunPanel.IsClosed && !RunPanel.IsBusy && !RunPanel.Results.IsBusy && !RunPanel.Results.IsSaving,
-            RunPanel.ReloadHistoryAsync, text => StatusMessage = text);
+            RunPanel.ReloadHistoryAsync, text => StatusMessage = text, unfinishedBatches: endBatchService);
         StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
         ClearLogsCommand = new RelayCommand(ClearLogs, () => CanClearLogs);
         SelectSingleAccountCommand = new AsyncRelayCommand(
@@ -141,6 +143,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         AppendPresentationLog(Import.StatusMessage);
         AppendPresentationLog(RunPanel.StatusMessage);
         AppendPresentationLog(RunPanel.Results.StatusMessage);
+        AttachStartupNotices(startupNotices);
         if (IsSimplifiedDirectMode)
         {
             ConfigureSimplifiedDirectMode();
@@ -174,7 +177,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             LocalImportDraftCleanupService? importDraftCleanupService = null,
             ICurrentImportCleanupInteraction? currentImportCleanupInteraction = null,
             Func<CancellationToken, Task<bool>>? presentActivationAsync = null,
-            IRunLog? runLog = null)
+            IRunLog? runLog = null,
+            EndBatchService? endBatchService = null,
+            StartupNotices? startupNotices = null)
         : this(
             import,
             wizard,
@@ -199,7 +204,9 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             importDraftCleanupService,
             currentImportCleanupInteraction,
             presentActivationAsync,
-            runLog)
+            runLog,
+            endBatchService,
+            startupNotices)
     {
     }
 
@@ -1175,6 +1182,24 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         if (!isClosed) SelectedDataTabIndex = ResultsTabIndex;
     }
 
+    // 启动恢复的提示已经由发出方写进运行日志文件，这里只显示，不再落盘一次。
+    private void AttachStartupNotices(StartupNotices? notices)
+    {
+        if (notices is null) return;
+        void Show(string notice)
+        {
+            if (!isClosed) logBuffer.AppendSafe(notice, WorkspaceLogLevel.Warning, persist: false);
+        }
+        // 激活后才做的恢复在后台线程发提示，日志集合只能在界面线程改。
+        foreach (var notice in notices.Attach(notice =>
+                 {
+                     var dispatcher = System.Windows.Application.Current?.Dispatcher;
+                     if (dispatcher is null || dispatcher.CheckAccess()) Show(notice);
+                     else dispatcher.BeginInvoke(() => Show(notice));
+                 }))
+            Show(notice);
+    }
+
     private void OnBatchTerminal(object? sender, WorkspaceBatchTerminalEvent terminal)
     {
         if (isClosed) return;
@@ -1184,25 +1209,32 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             createdBatchIsTerminal = true;
             UpdatePendingRuntimeStatuses();
         }
+        // 用户停止的批次不是「完成」，取消的也不是失败：分开说清楚。停止后还有收尾的批次
+        // 最后按正常完成落地，所以也看有没有取消的记录。
+        var cancelled = terminal.CancelledCount ?? 0;
+        var ended = terminal.BatchStatus == "Cancelled" || cancelled > 0;
         var message = terminal is { CompleteSuccessCount: { } succeeded, TerminalProblemCount: { } problems }
-            ? $"转存任务已完成：完成 {succeeded:N0} 条，失败 {problems:N0} 条。"
-            : "转存任务已完成：统计暂未读取。";
-        var level = terminal switch
+            ? ended
+                ? $"转存批次已停止：成功 {succeeded:N0} 条，失败 {Math.Max(0, problems - cancelled):N0} 条，" +
+                  $"未开始已取消 {cancelled:N0} 条。"
+                : $"转存任务已完成：完成 {succeeded:N0} 条，失败 {problems:N0} 条。"
+            : ended ? "转存批次已停止：统计暂未读取。" : "转存任务已完成：统计暂未读取。";
+        var level = ended ? WorkspaceLogLevel.Warning : terminal switch
         {
             { CompleteSuccessCount: not null, TerminalProblemCount: > 0 } => WorkspaceLogLevel.Error,
             { CompleteSuccessCount: not null, TerminalProblemCount: 0 } => WorkspaceLogLevel.Success,
             _ => WorkspaceLogLevel.Warning,
         };
         logBuffer.AppendSafe(message, level);
-        _ = ShowTerminalMessageAsync(message);
+        _ = ShowTerminalMessageAsync(ended ? "转存批次已停止" : "转存任务已完成", message);
     }
 
-    private async Task ShowTerminalMessageAsync(string message)
+    private async Task ShowTerminalMessageAsync(string title, string message)
     {
         if (isClosed || dialogService is null) return;
         try
         {
-            await dialogService.ShowMessageAsync("转存任务已完成", message, lifetime.Token).ConfigureAwait(true);
+            await dialogService.ShowMessageAsync(title, message, lifetime.Token).ConfigureAwait(true);
         }
         catch (OperationCanceledException) when (isClosed || lifetime.IsCancellationRequested) { }
         catch (Exception)

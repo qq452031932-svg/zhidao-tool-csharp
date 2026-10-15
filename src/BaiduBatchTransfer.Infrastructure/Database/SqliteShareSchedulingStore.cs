@@ -1603,6 +1603,19 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
             baselineMustContainShare: false, updatedAt, cancellationToken, expected);
     }
 
+    public async Task<bool> IsBatchStoppedAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+    {
+        // 停止（EndBatch 或启动时按停止处理）把所有没提交过的转存标为 Cancelled；
+        // 之后批次里不再有在跑的转存，只剩分享收尾。
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = Command(connection, null!, """
+            SELECT EXISTS(SELECT 1 FROM TransferOperations WHERE BatchJobId=$batch AND Status='Cancelled' AND OutcomeKind='Cancelled')
+               AND NOT EXISTS(SELECT 1 FROM TransferOperations WHERE BatchJobId=$batch AND Status NOT IN ('Succeeded','Failed','Cancelled'));
+            """);
+        Add(command, "$batch", Id(batchJobId));
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != 0;
+    }
+
     public async Task<bool> TryKeepPendingAsync(
         Guid operationId,
         int generation,

@@ -76,6 +76,9 @@ public interface IImportWorkflow
     /// <summary>把一行从待处理列表里彻底删除；与排除不同，删除后不能恢复。</summary>
     Task<ImportWorkflowResult> DeleteRowAsync(Guid rowId, CancellationToken cancellationToken) =>
         Task.FromException<ImportWorkflowResult>(new ImportWorkflowException(ImportUiError.AdapterUnavailable));
+    /// <summary>一次删除多行；要么全部删掉，要么一行都不删。</summary>
+    Task<ImportWorkflowResult> DeleteRowsAsync(IReadOnlyList<Guid> rowIds, CancellationToken cancellationToken) =>
+        Task.FromException<ImportWorkflowResult>(new ImportWorkflowException(ImportUiError.AdapterUnavailable));
 }
 
 public sealed class UnavailableImportWorkflow : IImportWorkflow
@@ -118,6 +121,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     // 当前列表（可能经过筛选）的总条数，只用来算页码；TotalRows 始终是整批导入的条数。
     private long listedRows;
     private ImportPreviewRow? selectedRow;
+    // 表格里同时选中的行（按住 Ctrl/Shift 或 Ctrl+A）。只用于批量删除；编辑仍针对单独一行。
+    private IReadOnlyList<ImportPreviewRow> selectedRows = [];
     private string selectedShareUrl = string.Empty;
     private string selectedExtractionCode = string.Empty;
     private bool selectedRowIsExcluded;
@@ -148,9 +153,11 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         LoadPreviousPageCommand = new AsyncRelayCommand(
             LoadPreviousPageAsync, () => CanEdit && sessionId is not null && previousPages.Count > 0);
         DeleteSelectedRowCommand = new AsyncRelayCommand(
-            DeleteSelectedRowAsync, () => CanEdit && SelectedRow is not null && !CanResumeImport);
-        SaveSelectedRowCommand = new AsyncRelayCommand(SaveSelectedRowAsync, () => CanEdit && SelectedRow is not null);
-        ToggleSelectedExclusionCommand = new AsyncRelayCommand(ToggleSelectedExclusionAsync, () => CanEdit && SelectedRow is not null);
+            DeleteSelectedRowAsync, () => CanEdit && RowsToDelete().Count > 0 && !CanResumeImport);
+        SaveSelectedRowCommand = new AsyncRelayCommand(
+            SaveSelectedRowAsync, () => CanEdit && SelectedRow is not null && !HasMultipleSelection);
+        ToggleSelectedExclusionCommand = new AsyncRelayCommand(
+            ToggleSelectedExclusionAsync, () => CanEdit && SelectedRow is not null && !HasMultipleSelection);
     }
 
     public ObservableCollection<ImportPreviewRow> Rows { get; }
@@ -237,6 +244,34 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     public string SelectedShareUrl { get => selectedShareUrl; set => SetProperty(ref selectedShareUrl, value ?? string.Empty); }
     public string SelectedExtractionCode { get => selectedExtractionCode; set => SetProperty(ref selectedExtractionCode, value ?? string.Empty); }
     public string SelectedExclusionActionText => selectedRowIsExcluded ? "恢复所选记录" : "排除所选记录";
+    public IReadOnlyList<ImportPreviewRow> SelectedRows => selectedRows;
+    public bool HasMultipleSelection => selectedRows.Count > 1;
+    /// <summary>选中多行时，下面的链接/提取码编辑框不知道该改哪一行，所以只在选中一行时可用。</summary>
+    public bool CanEditSelectedRow => !HasMultipleSelection;
+    public string DeleteMenuText => HasMultipleSelection ? $"删除所选 {selectedRows.Count} 条记录" : "删除这条记录";
+
+    /// <summary>由表格在选中项变化时调用。只认当前这一页里的行。</summary>
+    public void SetSelectedRows(IEnumerable<ImportPreviewRow> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        var onPage = rows.Where(row => Rows.Contains(row)).Distinct().ToArray();
+        if (onPage.SequenceEqual(selectedRows)) return;
+        var wasMultiple = HasMultipleSelection;
+        selectedRows = onPage;
+        OnPropertyChanged(nameof(SelectedRows));
+        OnPropertyChanged(nameof(DeleteMenuText));
+        if (wasMultiple != HasMultipleSelection)
+        {
+            OnPropertyChanged(nameof(HasMultipleSelection));
+            OnPropertyChanged(nameof(CanEditSelectedRow));
+        }
+        DeleteSelectedRowCommand.NotifyCanExecuteChanged();
+        SaveSelectedRowCommand.NotifyCanExecuteChanged();
+        ToggleSelectedExclusionCommand.NotifyCanExecuteChanged();
+    }
+
+    private IReadOnlyList<ImportPreviewRow> RowsToDelete() =>
+        selectedRows.Count > 0 ? selectedRows : SelectedRow is { } row ? [row] : [];
 
     public void AttachSession(Guid value)
     {
@@ -272,6 +307,7 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
         Interlocked.Increment(ref mutationGeneration);
         Rows.Clear();
         SelectedRow = null;
+        SetSelectedRows([]);
         SelectedShareUrl = string.Empty;
         SelectedExtractionCode = string.Empty;
         selectedRowIsExcluded = false;
@@ -416,26 +452,33 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// 删除选中的那一行。排除只是留着不转存，删除则把它从列表里拿掉且不能恢复，所以先问一次。
-    /// 删完留在当前页；这一页删空了就退回上一页。
+    /// 删除选中的记录（一行或多行）。排除只是留着不转存，删除则把它从列表里拿掉且不能恢复，所以先问一次。
+    /// 多行一起删时要么全部删掉，要么一行都不删。删完留在当前页；这一页删空了就退回上一页。
     /// </summary>
     public async Task DeleteSelectedRowAsync(CancellationToken cancellationToken = default)
     {
-        if (!CanEdit || CanResumeImport || SelectedRow is not { } row) return;
+        var targets = RowsToDelete();
+        if (!CanEdit || CanResumeImport || targets.Count == 0) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        var single = targets.Count == 1;
         bool confirmed;
         try
         {
             confirmed = await dialogService.ConfirmAsync(
                 "删除记录",
-                $"确定把第 {row.DisplayOrdinal} 条记录从待处理列表中删除吗？\n\n删除后不能恢复，需要时请重新导入。只想这次不转存，可以改用「排除所选记录」。",
+                (single
+                    ? $"确定把第 {targets[0].DisplayOrdinal} 条记录从待处理列表中删除吗？"
+                    : $"确定把选中的 {targets.Count} 条记录从待处理列表中删除吗？") +
+                "\n\n删除后不能恢复，需要时请重新导入。只想这次不转存，可以改用「排除所选记录」。",
                 linked.Token);
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested) { return; }
-        if (!confirmed || isClosed || !CanEdit || !ReferenceEquals(SelectedRow, row)) return;
+        // 确认框开着的时候选中项变了，就不按旧的选择删。
+        if (!confirmed || isClosed || !CanEdit || !RowsToDelete().SequenceEqual(targets)) return;
+        var rowIds = targets.Select(row => row.RowId).ToArray();
         _ = await RunMutationAsync(
-            token => workflow.DeleteRowAsync(row.RowId, token),
-            "已删除该记录。",
+            token => single ? workflow.DeleteRowAsync(rowIds[0], token) : workflow.DeleteRowsAsync(rowIds, token),
+            single ? "已删除该记录。" : $"已删除 {rowIds.Length} 条记录。",
             "无法删除记录，请刷新后重试。",
             linked.Token,
             stayOnPage: true,
@@ -700,8 +743,8 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
                 SelectedRow = selectedRowId is { } rowId
                     ? Rows.FirstOrDefault(x => x.RowId == rowId)
                     : null;
-                // 原来选中的行不在新的一页里时（例如刚被删除），表格控件内部仍记着它，
-                // 之后再选别的行会被它顶回去。这里总是通知一次，让表格与这里的选中项对齐。
+                // 换页或删除后，多选只保留仍在这一页上的行；表格随后会再报一次真实的选中项。
+                SetSelectedRows(selectedRows.Where(row => Rows.Contains(row)).ToArray());
                 // 原来选中的行不在新的一页里时（例如刚被删除），表格控件内部仍记着它，之后再选别的行
                 // 会被它顶回去，结果操作落在一条已经不存在的记录上。先选中一条真实的行再清空，
                 // 表格才会真正放下旧行；只发一次「选中项为空」的通知不够。

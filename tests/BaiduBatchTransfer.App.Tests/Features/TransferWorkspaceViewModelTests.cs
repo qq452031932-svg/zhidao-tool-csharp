@@ -487,6 +487,21 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.False(fixture.ViewModel.ClearTransferHistoryCommand.CanExecute(null));
     }
     [Fact]
+    public void StartupRecoveryNoticesShowInTheRunLogEvenWhenPostedBeforeThePageExists()
+    {
+        // 用户 10-14：「已按停止处理」只写进了日志文件，界面上看不到。
+        var notices = new StartupNotices();
+        notices.Post("上次关闭软件时有 1 个转存批次没有暂停，已按停止处理。");
+        using var fixture = Fixture.Create(startupNotices: notices);
+
+        var startup = Assert.Single(fixture.ViewModel.Logs, entry => entry.Message.Contains("已按停止处理", StringComparison.Ordinal));
+        Assert.Equal(WorkspaceLogLevel.Warning, startup.Level);
+
+        notices.Post("激活后才恢复的批次也已按停止处理。");
+        Assert.Contains(fixture.ViewModel.Logs, entry => entry.Message == "激活后才恢复的批次也已按停止处理。");
+    }
+
+    [Fact]
     public async Task LicenseFailureStopsBeforeTransferJobCreationOrRemotePrecheck()
     {
         var gate = new RecordingLicenseGate(isAuthorized: false);
@@ -3537,7 +3552,8 @@ public sealed class TransferWorkspaceViewModelTests
             ILocalHistoryCleanupInteraction? cleanupInteraction,
             ILocalImportDraftCleanupStore? importCleanupStore,
             ICurrentImportCleanupInteraction? importCleanupInteraction,
-            Func<CancellationToken, Task<bool>>? presentActivationAsync = null)
+            Func<CancellationToken, Task<bool>>? presentActivationAsync = null,
+            StartupNotices? startupNotices = null)
         {
             Ready = ready;
             Events = [];
@@ -3581,7 +3597,7 @@ public sealed class TransferWorkspaceViewModelTests
                 targetDirectoryPicker, Dialog, licenseGate,
                 historyCleanupStore is null ? null : new LocalTerminalHistoryService(historyCleanupStore), cleanupInteraction,
                 importCleanupStore is null ? null : new LocalImportDraftCleanupService(importCleanupStore), importCleanupInteraction,
-                presentActivationAsync);
+                presentActivationAsync, startupNotices: startupNotices);
         }
 
         public int Ready { get; }
@@ -3621,12 +3637,13 @@ public sealed class TransferWorkspaceViewModelTests
             ILocalHistoryCleanupInteraction? cleanupInteraction = null,
             ILocalImportDraftCleanupStore? importCleanupStore = null,
             ICurrentImportCleanupInteraction? importCleanupInteraction = null,
-            Func<CancellationToken, Task<bool>>? presentActivationAsync = null) =>
+            Func<CancellationToken, Task<bool>>? presentActivationAsync = null,
+            StartupNotices? startupNotices = null) =>
             new(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff, adapterAvailability,
                 remoteWriteMode, managedAccount, acceptanceRunAsync, resultDirectoryPreparer, historySource,
                 refreshDelay, resultsWorkflow, resultsSaveDialog, targetDirectoryPicker, licenseGate,
                 historyCleanupStore, cleanupInteraction, importCleanupStore, importCleanupInteraction,
-                presentActivationAsync);
+                presentActivationAsync, startupNotices);
 
         public static Fixture Valid(
             int accountCount = 1,

@@ -45,7 +45,8 @@ public sealed record JobResultsSummary(
     long FailedCount,
     long PausedCount,
     long CompleteSuccessCount = 0,
-    long TerminalProblemCount = 0);
+    long TerminalProblemCount = 0,
+    long CancelledCount = 0);
 
 public sealed record JobResultActionOutcome(bool Accepted, bool IsStale, string StatusText);
 

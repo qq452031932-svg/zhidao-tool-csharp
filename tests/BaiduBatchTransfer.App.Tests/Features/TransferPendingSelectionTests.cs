@@ -18,7 +18,8 @@ public sealed class TransferPendingSelectionTests
         using var model = CreateModel();
         var view = LoadPendingTable(model);
         var grid = Descendants(view).OfType<DataGrid>().Single();
-        Assert.Equal(DataGridSelectionMode.Single, grid.SelectionMode);
+        // 允许多选（批量删除），但单击仍只选中一行，编辑区跟着它走。
+        Assert.Equal(DataGridSelectionMode.Extended, grid.SelectionMode);
         foreach (var row in new[] { model.Rows[1], model.Rows[0], model.Rows[1] })
         {
             grid.SelectedItem = row;
@@ -58,7 +59,10 @@ public sealed class TransferPendingSelectionTests
         var view = LoadPendingTable(model);
         var grid = Descendants(view).OfType<DataGrid>().Single();
         var item = Assert.IsType<MenuItem>(Assert.Single(Assert.IsType<ContextMenu>(grid.ContextMenu).Items));
-        Assert.Equal("删除这条记录", item.Header);
+        // 菜单文字随选中条数变化（「删除这条记录」/「删除所选 N 条记录」）。
+        Assert.Equal("PlacementTarget.DataContext.Import.DeleteMenuText",
+            System.Windows.Data.BindingOperations.GetBinding(item, MenuItem.HeaderProperty)!.Path.Path);
+        Assert.Equal("删除这条记录", model.DeleteMenuText);
 
         var cell = grid.Columns[1].GetCellContent(model.Rows[1]);
         var row = BaiduBatchTransfer.App.Features.Transfers.PendingRowContextMenu.RowUnder(cell);

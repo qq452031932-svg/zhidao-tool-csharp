@@ -565,6 +565,25 @@ public sealed class JobResultsViewModelTests
     }
 
     [Fact]
+    public async Task ProgressOfAStoppedBatchShowsCancelledSeparatelyFromFailed()
+    {
+        // 用户 10-14 截图：停止后显示「失败 9,521」，其实是没开始就取消的。
+        var workflow = new ScriptedProgressWorkflow(
+            new(9_526, 9_526, 9_521, 0, 4, 9_521, 9_521),
+            new(9_526, 9_526, 9_521, 0, 4, 9_521, 9_521),
+            new(9_526, 9_526, 9_522, 0, 4, 9_522, 9_521));
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        Assert.Equal("进度 9,525/9,526：成功 4，失败 0，已取消 9,521，剩余 1。", vm.StatusMessage);
+        Assert.Equal(9_521, vm.CancelledCount);
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        Assert.Equal("进度 9,526/9,526：成功 4，失败 1，已取消 9,521，剩余 0。", vm.StatusMessage);
+    }
+
+    [Fact]
     public async Task DuplicateOperationFromNextPageIsRejectedWithoutAppending()
     {
         var row = Row(1);

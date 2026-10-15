@@ -887,6 +887,289 @@ public sealed class BatchRunControlServiceTests
         Assert.False(snapshot.IsAutomationRecovery);
     }
 
+    [Fact]
+    public async Task EndingAWaitingBatchCancelsEverythingAndTheHistoryCanThenBeCleared()
+    {
+        // 其他用户截图里的情况：一整批都停在「等待」，清空历史清不掉。
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resources = Enumerable.Range(1, 3).Select(index => Resource(batchId, index)).ToArray();
+        var operations = resources.Select((resource, index) => Operation(resource, accountId, index + 1)).ToArray();
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Queued", 3, 3) with { ShareOperationCount = 1 },
+            resources: resources, operations: operations,
+            allocations: [Allocation(batchId, accountId, 1, targetItems: 3, assigned: 3, effectiveTarget: 3, targetSuccesses: 3)]);
+        await ConfigureOutputAsync(db, batchId, accountId, shareEnabled: true);
+        await InsertWaitingShareAsync(db, batchId, accountId, resources[0].Id, operations[0].Id);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var result = await new EndBatchService(store, new FixedTimeProvider(Now.AddMinutes(1))).EndAsync(batchId);
+
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.Ended, 3, 0), result);
+        Assert.Equal("Cancelled", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs WHERE Id=$id", batchId));
+        Assert.NotNull(await ScalarNullableStringAsync(db, "SELECT CompletedAt FROM BatchJobs WHERE Id=$id", batchId));
+        Assert.Equal(3, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$id AND Status='Cancelled' AND OutcomeKind='Cancelled'", batchId));
+        // 等着转存的分享随转存取消一并移除（数据库触发器），批次的分享计数同步减掉。
+        Assert.Equal(0, await ScalarLongAsync(db, "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$id", batchId));
+        Assert.Equal(0, await ScalarLongAsync(db, "SELECT ShareOperationCount FROM BatchJobs WHERE Id=$id", batchId));
+        Assert.Null(await store.TryActivateNextBatchAsync(Now.AddMinutes(2)));
+
+        var history = new SqliteLocalTerminalHistoryStore(db.ConnectionFactory);
+        var preview = await history.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.Equal(1, preview.TerminalBatchCount);
+        Assert.False(preview.HasConflicts);
+        Assert.Equal(LocalHistoryCleanupDisposition.Deleted, (await history.DeleteAsync(preview)).Disposition);
+        Assert.Equal(0, await ScalarLongAsync(db, "SELECT COUNT(*) FROM BatchJobs WHERE Id=$id", batchId));
+    }
+
+    [Fact]
+    public async Task EndingDoesNotInterruptASubmissionAndFinishesOnceItIsDone()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var submittedAccount = Guid.NewGuid();
+        var waitingAccount = Guid.NewGuid();
+        var submittedResource = Resource(batchId, 1);
+        var waitingResource = Resource(batchId, 2);
+        var submitted = Operation(submittedResource, submittedAccount, 1,
+            status: "Submitting", submitState: "Submitting", slotState: "Reserved", attemptCount: 1,
+            descriptor: "{\"operation\":\"submitted\"}", dailyCountedAt: Now, submitStartedAt: Now);
+        var waiting = Operation(waitingResource, waitingAccount, 2);
+        await db.SeedAsync([Account(submittedAccount), Account(waitingAccount)],
+            job: Job(batchId, "Active", 2, 2),
+            resources: [submittedResource, waitingResource], operations: [submitted, waiting],
+            allocations: [Allocation(batchId, submittedAccount, 1, reserved: 1), Allocation(batchId, waitingAccount, 2)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new EndBatchService(store, new FixedTimeProvider(Now.AddMinutes(1)));
+
+        var first = await service.EndAsync(batchId);
+
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.Stopping, 1, 1), first);
+        // 批次不停在「暂停」：只剩收尾，但要保持运行，提交中的那条才能收尾、核对。
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs WHERE Id=$id", batchId));
+        Assert.Equal("Submitting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id=$id", submitted.Id));
+        Assert.Equal("Cancelled", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id=$id", waiting.Id));
+        Assert.Null(await store.TryReserveNextAsync(batchId, Now.AddMinutes(2), Now.AddMinutes(7)));
+
+        await store.MarkSucceededAsync(submitted.Id, Now.AddMinutes(3), expectedAttemptCount: 1);
+        var second = await service.EndAsync(batchId);
+
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.Ended, 0, 0), second);
+        Assert.Equal("Cancelled", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs WHERE Id=$id", batchId));
+        Assert.Equal("Succeeded", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id=$id", submitted.Id));
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.AlreadyEnded, 0, 0), await service.EndAsync(batchId));
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.NotFound, 0, 0), await service.EndAsync(Guid.NewGuid()));
+    }
+
+    [Fact]
+    public async Task AShareKnowsItsBatchWasStoppedOnceNoTransferIsStillRunning()
+    {
+        // 分享核对靠它决定用 2 分钟还是 30 分钟的上限：停止后还有转存在提交时不算，
+        // 那条收尾完、只剩分享时才算；从没停止过的批次永远不算。
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var submittedResource = Resource(batchId, 1);
+        var waitingResource = Resource(batchId, 2);
+        var submitted = Operation(submittedResource, accountId, 1,
+            status: "Submitting", submitState: "Submitting", slotState: "Reserved", attemptCount: 1,
+            descriptor: "{\"operation\":\"submitted\"}", dailyCountedAt: Now, submitStartedAt: Now);
+        var waiting = Operation(waitingResource, accountId, 2);
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 2, 2),
+            resources: [submittedResource, waitingResource], operations: [submitted, waiting],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1, targetItems: 2, assigned: 2)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        IShareReconciliationStore shares = new SqliteShareSchedulingStore(db.ConnectionFactory);
+
+        Assert.False(await shares.IsBatchStoppedAsync(batchId));
+        await new EndBatchService(store, new FixedTimeProvider(Now.AddMinutes(1))).EndAsync(batchId);
+        Assert.False(await shares.IsBatchStoppedAsync(batchId));
+
+        await store.MarkSucceededAsync(submitted.Id, Now.AddMinutes(2), expectedAttemptCount: 1);
+        Assert.True(await shares.IsBatchStoppedAsync(batchId));
+        Assert.False(await shares.IsBatchStoppedAsync(Guid.NewGuid()));
+    }
+
+    [Fact]
+    public async Task AFinishedBatchThatWasNeverStoppedDoesNotCountAsStopped()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1);
+        var submitted = Operation(resource, accountId, 1,
+            status: "Submitting", submitState: "Submitting", slotState: "Reserved", attemptCount: 1,
+            descriptor: "{\"operation\":\"submitted\"}", dailyCountedAt: Now, submitStartedAt: Now);
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 1, 1),
+            resources: [resource], operations: [submitted],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        await store.MarkSucceededAsync(submitted.Id, Now.AddMinutes(1), expectedAttemptCount: 1);
+
+        Assert.False(await new SqliteShareSchedulingStore(db.ConnectionFactory).IsBatchStoppedAsync(batchId));
+    }
+
+    [Fact]
+    public async Task EndingReleasesTheSlotHeldByWorkPausedForAnAccountProblem()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1) with { CandidateStatus = "Reserved", ReservedAccountId = accountId };
+        var paused = Operation(resource, accountId, 1, status: "Paused", submitState: "NotPrepared",
+            slotState: "Reserved", attemptCount: 1, errorCode: "ExpiredLogin", errorMessage: "The account session has expired.");
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Paused", 1, 1),
+            resources: [resource], operations: [paused],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var result = await new EndBatchService(store).EndAsync(batchId);
+
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.Ended, 1, 0), result);
+        Assert.Equal("Released", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations WHERE Id=$id", paused.Id));
+        Assert.Equal(0, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE BatchJobId=$id", batchId));
+        Assert.Equal("Expanded", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems WHERE Id=$id", resource.Id));
+        Assert.Null(await ScalarNullableStringAsync(db, "SELECT ReservedAccountId FROM ResourceItems WHERE Id=$id", resource.Id));
+        var preview = await new SqliteLocalTerminalHistoryStore(db.ConnectionFactory).PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.False(preview.HasConflicts);
+    }
+
+    [Fact]
+    public async Task EndingKeepsWorkThatMayAlreadyHaveReachedTheServiceForConfirmation()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1);
+        var pending = Operation(resource, accountId, 1, status: "ResultPending", submitState: "PendingConfirmation",
+            slotState: "Reserved", attemptCount: 1, descriptor: "{\"operation\":\"pending\"}",
+            dailyCountedAt: Now, submitStartedAt: Now, errorCode: "UnknownResponse",
+            errorMessage: "The service returned an unrecognized response.");
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 1, 1),
+            resources: [resource], operations: [pending],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var result = await new EndBatchService(store).EndAsync(batchId);
+
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.Stopping, 0, 1), result);
+        Assert.Equal("ResultPending", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id=$id", pending.Id));
+        Assert.Equal(1, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE BatchJobId=$id", batchId));
+    }
+
+    [Fact]
+    public async Task EndingAPausedBatchStuckOnAnUnconfirmedResultRequeuesItSoItCanBeSettled()
+    {
+        // 用户 10-14 实机：批次停在「暂停」，一条结果待确认；结束后一直清不掉，
+        // 因为待确认的记录只在批次运行时才会被核对。现在结束会把它重新排队，只剩收尾。
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var pendingResource = Resource(batchId, 1);
+        var waitingResource = Resource(batchId, 2);
+        var pending = Operation(pendingResource, accountId, 1, status: "ResultPending", submitState: "PendingConfirmation",
+            slotState: "Reserved", attemptCount: 1, descriptor: "{\"operation\":\"pending\"}",
+            dailyCountedAt: Now, submitStartedAt: Now, errorCode: "UnknownResponse",
+            errorMessage: "The service returned an unrecognized response.");
+        var waiting = Operation(waitingResource, accountId, 2);
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Paused", 2, 2),
+            resources: [pendingResource, waitingResource], operations: [pending, waiting],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1, targetItems: 2, assigned: 2)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new EndBatchService(store, new FixedTimeProvider(Now.AddMinutes(1)));
+
+        var result = await service.EndAsync(batchId);
+
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.Stopping, 1, 1), result);
+        Assert.Equal("Queued", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs WHERE Id=$id", batchId));
+        Assert.Equal(batchId, await store.TryActivateNextBatchAsync(Now.AddMinutes(2)));
+        // 运行起来后没有新的转存可领取，只剩那一条等核对。
+        Assert.Null(await store.TryReserveNextAsync(batchId, Now.AddMinutes(2), Now.AddMinutes(7)));
+        Assert.Equal([batchId], await store.ListUnfinishedBatchIdsAsync());
+
+        // 核对得出结论之后，再结束一次就结束了，历史可以清空。
+        await store.MarkSucceededAsync(pending.Id, Now.AddMinutes(3), expectedAttemptCount: 1);
+        Assert.Equal(new EndBatchResult(EndBatchDisposition.Ended, 0, 0), await service.EndAsync(batchId));
+        Assert.Empty(await store.ListUnfinishedBatchIdsAsync());
+        var history = new SqliteLocalTerminalHistoryStore(db.ConnectionFactory);
+        var preview = await history.PreviewAsync(LocalHistoryKind.Transfer);
+        Assert.False(preview.HasConflicts);
+        Assert.Equal(LocalHistoryCleanupDisposition.Deleted, (await history.DeleteAsync(preview)).Disposition);
+    }
+
+    [Fact]
+    public async Task EndingASuccessTargetBatchStopsItFromPickingUpMoreCandidates()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var submittedResource = Resource(batchId, 1) with { CandidateStatus = "Reserved", ReservedAccountId = accountId };
+        var spare = Resource(batchId, 2) with { CandidateStatus = "Unallocated" };
+        var submitted = Operation(submittedResource, accountId, 1,
+            status: "Submitting", submitState: "Submitting", slotState: "Reserved", attemptCount: 1,
+            descriptor: "{\"operation\":\"submitted\"}", dailyCountedAt: Now, submitStartedAt: Now);
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 2, 1, quotaBasis: "SuccessTarget"),
+            resources: [submittedResource, spare], operations: [submitted],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1, effectiveTarget: 2, targetSuccesses: 2, targetItems: 2)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var result = await new EndBatchService(store).EndAsync(batchId);
+
+        Assert.Equal(EndBatchDisposition.Stopping, result.Disposition);
+        Assert.Equal(1, await ScalarLongAsync(db, "SELECT EffectiveTargetSuccessCount FROM AccountAllocations WHERE BatchJobId=$id", batchId));
+        Assert.Equal("Unused", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems WHERE Id=$id", spare.Id));
+        Assert.Null(await store.TryReserveNextAsync(batchId, Now.AddMinutes(1), Now.AddMinutes(6)));
+    }
+
+    [Fact]
+    public async Task ReopeningTheAppStopsBatchesThatWereNotPausedAndKeepsPausedOnes()
+    {
+        // 用户 10-14 定的规则（与采集一致）：暂停后关软件，下次还能继续；
+        // 没暂停直接关软件（或软件被强制结束），这一批就是不要了，打开后不能自己接着跑。
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var accountId = Guid.NewGuid();
+        var leftRunning = Guid.NewGuid();
+        var paused = Guid.NewGuid();
+        var runningResources = new[] { Resource(leftRunning, 1), Resource(leftRunning, 2) };
+        var interrupted = Operation(runningResources[0], accountId, 1, status: "Reserved", slotState: "Reserved", attemptCount: 1);
+        var queued = Operation(runningResources[1], accountId, 2);
+        var pausedResource = Resource(paused, 1);
+        var pausedWork = Operation(pausedResource, accountId, 1);
+        await db.SeedAsync([Account(accountId)], job: Job(leftRunning, "Active", 2, 2),
+            resources: runningResources, operations: [interrupted, queued],
+            allocations: [Allocation(leftRunning, accountId, 1, reserved: 1, targetItems: 2, assigned: 2)]);
+        await AddJobGraphAsync(db, Job(paused, "Paused", 1, 1), pausedResource, pausedWork, Allocation(paused, accountId, 1));
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var startup = new StartupRecoveryService(new AlwaysAcquired(), new NoMaintenance(), store,
+            new AllocationCounterRebuilder(store), new FixedTimeProvider(Now.AddMinutes(10)),
+            leftRunningBatches: new EndBatchService(store, new FixedTimeProvider(Now.AddMinutes(10))));
+
+        var result = await startup.RecoverAsync();
+
+        Assert.True(result.CoordinatorMayStart);
+        Assert.Equal(new EndAllResult(1, 0, 2), result.StoppedLeftRunning);
+        Assert.Equal("Cancelled", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs WHERE Id=$id", leftRunning));
+        Assert.Equal(2, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$id AND Status='Cancelled'", leftRunning));
+        Assert.Equal(0, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE BatchJobId=$id", leftRunning));
+        // 暂停的那一批原样保留，点「继续」还能接着跑。
+        Assert.Equal("Paused", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs WHERE Id=$id", paused));
+        Assert.Equal("Waiting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id=$id", pausedWork.Id));
+        Assert.Equal([paused], await store.ListUnfinishedBatchIdsAsync());
+        Assert.Empty(await store.ListRunningBatchIdsAsync());
+    }
+
+    private sealed class AlwaysAcquired : ISingleInstanceGuard
+    {
+        public Task<bool> TryAcquireAsync(CancellationToken cancellationToken = default) => Task.FromResult(true);
+    }
+
+    private sealed class NoMaintenance : IStartupDatabaseMaintenance
+    {
+        public Task PrepareAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+    }
+
     private static AccountRecord Account(Guid id) =>
         AccountRecord.Create(id, $"baidu-{id:N}", "Account") with { DailyCountDateKey = "2026-08-19" };
 

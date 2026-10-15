@@ -649,6 +649,237 @@ public sealed class WorkspaceRunPanelViewModelTests
         Assert.Equal(["进度 5/5：成功 3，失败 2，剩余 0。"], progressStatuses);
     }
 
+    [Theory]
+    [InlineData("Queued", "暂停", true, true)]
+    [InlineData("Active", "暂停", true, true)]
+    [InlineData("Paused", "继续", true, true)]
+    [InlineData("Completed", "暂停", false, false)]
+    [InlineData("CompletedWithShortfall", "暂停", false, false)]
+    [InlineData("Cancelled", "暂停", false, false)]
+    public void OnePauseResumeButtonAndEndFollowTheBatchStatus(string status, string text, bool canToggle, bool canEnd)
+    {
+        using var vm = CreateWithEnd(CreateResults(new FakeResultsWorkflow()), new FakeRunControlStore(), new ConfirmDialog());
+        vm.PresentBatch(Guid.NewGuid(), batchStatus: status);
+
+        Assert.Equal(text, vm.PauseResumeText);
+        Assert.Equal(canToggle, vm.PauseResumeCommand.CanExecute(null));
+        Assert.Equal(canEnd, vm.EndBatchCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task TheToggleButtonPausesThenResumesTheSelectedBatch()
+    {
+        var store = new FakeRunControlStore();
+        using var vm = CreateWithEnd(CreateResults(new FakeResultsWorkflow()), store, new ConfirmDialog());
+        var batch = Guid.NewGuid();
+        vm.PresentBatch(batch, batchStatus: "Active");
+
+        await vm.PauseResumeCommand.ExecuteAsync(null);
+        Assert.Equal("继续", vm.PauseResumeText);
+        await vm.PauseResumeCommand.ExecuteAsync(null);
+
+        Assert.Equal([batch], store.PausedBatches);
+        Assert.Equal([batch], store.ResumedBatches);
+        Assert.Equal("暂停", vm.PauseResumeText);
+    }
+
+    [Fact]
+    public void WithoutTheEndServiceTheEndButtonIsUnavailable()
+    {
+        using var vm = Create(CreateResults(new FakeResultsWorkflow()), new FakeRunControlStore());
+        vm.PresentBatch(Guid.NewGuid(), batchStatus: "Active");
+
+        Assert.False(vm.EndBatchCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task EndingAsksFirstThenEndsTheSelectedBatchAndReportsItOnce()
+    {
+        var store = new FakeRunControlStore();
+        store.EndResults.Enqueue(new(EndBatchDisposition.Ended, 1355, 0));
+        var dialog = new ConfirmDialog();
+        var results = CreateResults(new FakeResultsWorkflow());
+        using var vm = CreateWithEnd(results, store, dialog);
+        var batch = Guid.NewGuid();
+        await vm.ActivateBatchAsync(batch);
+        var terminals = new List<WorkspaceBatchTerminalEvent>();
+        vm.BatchTerminal += (_, e) => terminals.Add(e);
+
+        await vm.EndBatchCommand.ExecuteAsync(null);
+
+        Assert.Contains("已经转存成功的不受影响", Assert.Single(dialog.Messages));
+        Assert.Equal([batch], store.EndedBatches);
+        Assert.Equal("Cancelled", vm.SelectedBatch!.BatchStatus);
+        Assert.Contains("1,355 条未开始的记录已取消", vm.StatusMessage);
+        Assert.Contains("清空转存历史", vm.StatusMessage);
+        var terminal = Assert.Single(terminals);
+        Assert.Equal((batch, "Cancelled"), (terminal.BatchJobId, terminal.BatchStatus));
+        Assert.False(vm.EndBatchCommand.CanExecute(null));
+        Assert.False(vm.PauseResumeCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task DecliningTheEndConfirmationChangesNothing()
+    {
+        var store = new FakeRunControlStore();
+        using var vm = CreateWithEnd(CreateResults(new FakeResultsWorkflow()), store, new ConfirmDialog { Answer = false });
+        vm.PresentBatch(Guid.NewGuid(), batchStatus: "Active");
+
+        await vm.EndBatchCommand.ExecuteAsync(null);
+
+        Assert.Empty(store.EndedBatches);
+        Assert.Equal("Active", vm.SelectedBatch!.BatchStatus);
+    }
+
+    [Fact]
+    public async Task WorkStillSubmittingIsLeftToFinishAndTheBatchEndsByItselfAfterwards()
+    {
+        var store = new FakeRunControlStore();
+        store.EndResults.Enqueue(new(EndBatchDisposition.Stopping, 10, 2));
+        store.EndResults.Enqueue(new(EndBatchDisposition.Stopping, 0, 1));
+        store.EndResults.Enqueue(new(EndBatchDisposition.Ended, 0, 0));
+        var delay = new ControlledDelay();
+        using var vm = CreateWithEnd(CreateResults(new FakeResultsWorkflow()), store, new ConfirmDialog(), delay);
+        var batch = Guid.NewGuid();
+        vm.PresentBatch(batch, batchStatus: "Active");
+        var terminals = new List<WorkspaceBatchTerminalEvent>();
+        vm.BatchTerminal += (_, e) => terminals.Add(e);
+
+        await vm.EndBatchCommand.ExecuteAsync(null);
+
+        Assert.True(vm.IsEndingBatch);
+        // 只剩收尾，批次照常运行，进度继续自动刷新。
+        Assert.Equal("Active", vm.SelectedBatch!.BatchStatus);
+        Assert.Contains("还有 2 条已经提交", vm.StatusMessage);
+        Assert.Contains("2 分钟", vm.StatusMessage);
+        Assert.Empty(terminals);
+
+        delay.Release();
+        await WaitUntilAsync(() => !vm.IsEndingBatch);
+
+        Assert.Equal([batch, batch, batch], store.EndedBatches);
+        Assert.Equal("Cancelled", vm.SelectedBatch!.BatchStatus);
+        Assert.Equal("Cancelled", Assert.Single(terminals).BatchStatus);
+    }
+
+    [Fact]
+    public async Task PausingWhileWaitingToEndStopsTheAutomaticEnd()
+    {
+        var store = new FakeRunControlStore();
+        store.EndResults.Enqueue(new(EndBatchDisposition.Stopping, 10, 2));
+        var delay = new ControlledDelay();
+        using var vm = CreateWithEnd(CreateResults(new FakeResultsWorkflow()), store, new ConfirmDialog(), delay);
+        var batch = Guid.NewGuid();
+        vm.PresentBatch(batch, batchStatus: "Active");
+        await vm.EndBatchCommand.ExecuteAsync(null);
+        Assert.True(vm.IsEndingBatch);
+
+        await vm.PauseResumeCommand.ExecuteAsync(null);
+        delay.Release();
+        await Task.Yield();
+
+        Assert.False(vm.IsEndingBatch);
+        Assert.Equal([batch], store.PausedBatches);
+        Assert.Equal([batch], store.EndedBatches);
+        Assert.Equal("Paused", vm.SelectedBatch!.BatchStatus);
+    }
+
+    [Fact]
+    public async Task ResumingBehindAnotherRunningBatchSaysItIsQueued()
+    {
+        var store = new FakeRunControlStore();
+        var running = new WorkspaceBatchItem(Guid.NewGuid(), "批次 昨晚那批", "Active");
+        var paused = new WorkspaceBatchItem(Guid.NewGuid(), "批次 今天这批", "Paused");
+        using var vm = new WorkspaceRunPanelViewModel(
+            CreateResults(new FakeResultsWorkflow()), new PauseBatchService(store), new ResumeBatchService(store),
+            new RetryFailedTransferService(store), historySource: new FakeHistorySource([paused, running]));
+        await vm.InitializeAsync();
+        Assert.Equal(paused.BatchJobId, vm.SelectedBatch!.BatchJobId);
+
+        await vm.PauseResumeCommand.ExecuteAsync(null);
+
+        Assert.Equal([paused.BatchJobId], store.ResumedBatches);
+        Assert.Contains("正在排队", vm.StatusMessage);
+        Assert.Contains("批次 昨晚那批", vm.StatusMessage);
+        Assert.Contains("「停止」", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ResumingWithNothingElseRunningKeepsTheUsualMessage()
+    {
+        var store = new FakeRunControlStore();
+        using var vm = Create(CreateResults(new FakeResultsWorkflow()), store);
+        vm.PresentBatch(Guid.NewGuid(), batchStatus: "Paused");
+
+        await vm.PauseResumeCommand.ExecuteAsync(null);
+
+        Assert.Equal("批次已恢复并重新进入队列。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public void TransferResultsTabOffersPauseResumeAndEndNextToTheOtherBatchActions()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !Directory.Exists(Path.Combine(root.FullName, "src"))) root = root.Parent;
+        Assert.NotNull(root);
+        var document = System.Xml.Linq.XDocument.Load(Path.Combine(
+            root.FullName, "src", "BaiduBatchTransfer.App", "Features", "Transfers", "TransferWorkspaceView.xaml"));
+        var x = System.Xml.Linq.XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml");
+        System.Xml.Linq.XElement Button(string name) => Assert.Single(document.Descendants(),
+            node => node.Name.LocalName == "Button" && (string?)node.Attribute(x + "Name") == name);
+
+        var toggle = Button("PauseResumeTransferButton");
+        var end = Button("EndTransferBatchButton");
+        Assert.Equal("{Binding RunPanel.PauseResumeText}", (string?)toggle.Attribute("Content"));
+        Assert.Equal("{Binding RunPanel.PauseResumeCommand}", (string?)toggle.Attribute("Command"));
+        Assert.Equal("{Binding RunPanel.EndBatchCommand}", (string?)end.Attribute("Command"));
+        foreach (var button in new[] { toggle, end })
+        {
+            Assert.Contains(button.Ancestors(), node => node.Name.LocalName == "TabItem" && (string?)node.Attribute("Header") == "处理结果");
+            Assert.NotNull(button.Attribute("ToolTip"));
+            Assert.Equal("True", (string?)button.Attribute("ToolTipService.ShowOnDisabled"));
+        }
+        Assert.Equal("停止", (string?)end.Attribute("Content"));
+        // 与重试、清空历史在同一行，顺序：暂停/继续、停止、重试所选失败项、清空转存历史。
+        var row = toggle.Parent!.Elements().Where(node => node.Name.LocalName == "Button").ToArray();
+        Assert.Equal(["PauseResumeTransferButton", "EndTransferBatchButton", "RetryFailedTransferButton"],
+            row.Take(3).Select(node => (string?)node.Attribute(x + "Name")));
+        Assert.Equal("清空转存历史", (string?)row[3].Attribute("Content"));
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        for (var attempt = 0; attempt < 200 && !condition(); attempt++) await Task.Delay(10);
+        Assert.True(condition());
+    }
+
+    private static WorkspaceRunPanelViewModel CreateWithEnd(
+        JobResultsViewModel results,
+        IBatchRunControlStore store,
+        IDialogService dialog,
+        IAsyncDelay? delay = null) =>
+        new(
+            results,
+            new PauseBatchService(store),
+            new ResumeBatchService(store),
+            new RetryFailedTransferService(store),
+            automaticRefreshDelay: delay,
+            endService: new EndBatchService(store),
+            dialogService: dialog);
+
+    private sealed class ConfirmDialog : IDialogService
+    {
+        public bool Answer { get; init; } = true;
+        public List<string> Messages { get; } = [];
+        public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
+        {
+            Messages.Add(message);
+            return Task.FromResult(Answer);
+        }
+        public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default) => Task.FromResult<string?>(null);
+    }
+
     private static WorkspaceRunPanelViewModel Create(
         JobResultsViewModel results,
         IBatchRunControlStore store,
@@ -796,6 +1027,13 @@ public sealed class WorkspaceRunPanelViewModelTests
         public List<Guid> PausedBatches { get; } = [];
         public List<Guid> ResumedBatches { get; } = [];
         public List<Guid> RetriedOperations { get; } = [];
+        public List<Guid> EndedBatches { get; } = [];
+        public Queue<EndBatchResult> EndResults { get; } = new();
+        public Task<EndBatchResult> TryEndBatchAsync(Guid batchJobId, DateTimeOffset endedAt, CancellationToken cancellationToken = default)
+        {
+            EndedBatches.Add(batchJobId);
+            return Task.FromResult(EndResults.Count > 0 ? EndResults.Dequeue() : new EndBatchResult(EndBatchDisposition.Ended, 0, 0));
+        }
         public virtual Task<PauseBatchDisposition> TryPauseBatchAsync(Guid batchJobId, CancellationToken cancellationToken = default)
         {
             PausedBatches.Add(batchJobId);

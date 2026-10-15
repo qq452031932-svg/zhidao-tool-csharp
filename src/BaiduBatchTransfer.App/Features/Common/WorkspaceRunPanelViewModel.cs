@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -22,7 +23,8 @@ public sealed record WorkspaceBatchTerminalEvent(
     Guid BatchJobId,
     string BatchStatus,
     long? CompleteSuccessCount,
-    long? TerminalProblemCount);
+    long? TerminalProblemCount,
+    long? CancelledCount = null);
 
 public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
 {
@@ -34,8 +36,11 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     private readonly IAsyncDelay automaticRefreshDelay;
     private readonly TimeSpan automaticRefreshInterval;
     private readonly ILicenseAuthorizationGate? licenseGate;
+    private readonly EndBatchService? endService;
+    private readonly IDialogService? dialogService;
     private readonly CancellationTokenSource lifetime = new();
     private CancellationTokenSource? automaticRefresh;
+    private CancellationTokenSource? endWatch;
     private CancellationTokenSource historyLifetime = new();
     private CancellationTokenSource? currentOperation;
     private WorkspaceBatchItem? selectedBatch;
@@ -54,7 +59,9 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         IWorkspaceBatchHistorySource? historySource = null,
         IAsyncDelay? automaticRefreshDelay = null,
         TimeSpan? automaticRefreshInterval = null,
-        ILicenseAuthorizationGate? licenseGate = null)
+        ILicenseAuthorizationGate? licenseGate = null,
+        EndBatchService? endService = null,
+        IDialogService? dialogService = null)
     {
         if (maximumRecentBatches is < 1 or > 100)
             throw new ArgumentOutOfRangeException(nameof(maximumRecentBatches));
@@ -67,12 +74,17 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         this.automaticRefreshDelay = automaticRefreshDelay ?? new TimeProviderDelay(TimeProvider.System);
         this.automaticRefreshInterval = automaticRefreshInterval ?? TimeSpan.FromSeconds(5);
         this.licenseGate = licenseGate;
+        this.endService = endService;
+        this.dialogService = dialogService;
         if (this.automaticRefreshInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(automaticRefreshInterval));
         Batches = [];
         LoadSelectedBatchCommand = new AsyncRelayCommand(LoadSelectedBatchAsync, () => CanLoadSelectedBatch);
         PauseCommand = new AsyncRelayCommand(PauseAsync, () => CanPause);
         ResumeCommand = new AsyncRelayCommand(ResumeAsync, () => CanResume);
+        PauseResumeCommand = new AsyncRelayCommand(
+            () => CanResume ? ResumeAsync() : PauseAsync(), () => CanPause || CanResume);
+        EndBatchCommand = new AsyncRelayCommand(EndBatchAsync, () => CanEndBatch);
         RetryFailedTransferCommand = new AsyncRelayCommand(
             RetryFailedTransferAsync,
             () => CanRetryFailedTransfer);
@@ -120,10 +132,18 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     public bool CanResume => CanUseBatchActions && SelectedBatch!.BatchStatus == "Paused";
     public bool CanRetryFailedTransfer => CanUseBatchActions &&
         Results.SelectedItem is { CanSafelyRetryTransfer: true };
+    /// <summary>与采集页一致：一个按钮，运行时显示「暂停」，暂停后显示「继续」。</summary>
+    public string PauseResumeText => CanResume ? "继续" : "暂停";
+    public bool CanEndBatch => endService is not null && dialogService is not null && CanUseBatchActions &&
+        !IsTerminal(SelectedBatch!.BatchStatus);
+    /// <summary>已发出结束、正在等正在提交的几条收尾。</summary>
+    public bool IsEndingBatch => endWatch is not null;
     public IAsyncRelayCommand LoadSelectedBatchCommand { get; }
     public IAsyncRelayCommand PauseCommand { get; }
     public IAsyncRelayCommand ResumeCommand { get; }
     public IAsyncRelayCommand RetryFailedTransferCommand { get; }
+    public IAsyncRelayCommand PauseResumeCommand { get; }
+    public IAsyncRelayCommand EndBatchCommand { get; }
 
     public Task ReloadHistoryAsync(CancellationToken cancellationToken = default)
     {
@@ -212,22 +232,34 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
             ? LoadBatchAsync(selected.BatchJobId, cancellationToken)
             : Task.CompletedTask;
 
-    public Task PauseAsync(CancellationToken cancellationToken = default) =>
-        !CanPause ? Task.CompletedTask :
-        RunBatchActionAsync(
+    public Task PauseAsync(CancellationToken cancellationToken = default)
+    {
+        if (!CanPause) return Task.CompletedTask;
+        // 结束后正在等收尾时用户又点了暂停：听用户的，不再自动结束（否则下一次结束会把它重新排队）。
+        StopEndWatch();
+        return RunBatchActionAsync(
             (batch, token) => pauseService.PauseAsync(batch, token),
             MapPause,
             value => value is PauseBatchDisposition.Paused or PauseBatchDisposition.AlreadyPaused ? "Paused" : null,
             cancellationToken);
+    }
 
     public async Task ResumeAsync(CancellationToken cancellationToken = default)
     {
         if (!CanResume || !await IsRemoteOperationAuthorizedAsync(cancellationToken).ConfigureAwait(true)) return;
+        // 用户改主意继续跑了：不再等着把它结束。
+        StopEndWatch();
+        var resumed = SelectedBatch?.BatchJobId;
         await RunBatchActionAsync(
             (batch, token) => resumeService.ResumeAsync(batch, token),
             MapResume,
             value => value is ResumeBatchDisposition.Queued or ResumeBatchDisposition.AlreadyResumed ? "Queued" : null,
             cancellationToken).ConfigureAwait(true);
+        // 同一时间只跑一个批次。前面还有没跑完的批次时，点了「继续」也要排队，看起来就像没反应。
+        if (resumed is { } id && SelectedBatch?.BatchJobId == id && SelectedBatch.BatchStatus == "Queued" &&
+            Batches.FirstOrDefault(item => item.BatchJobId != id && item.BatchStatus == "Active") is { } running)
+            StatusMessage = $"批次已恢复，正在排队：{running.DisplayText} 还没跑完，同一时间只运行一个批次，" +
+                "它跑完后这一批会自动开始。不想等它可以先在列表里选中它，点「停止」。";
     }
 
     public async Task RetryFailedTransferAsync(CancellationToken cancellationToken = default)
@@ -264,6 +296,145 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// 结束所选批次。还没开始的标为已取消，已转存成功的不受影响；正在提交的不能中途打断，
+    /// 等它们收尾后自动结束。结束后批次不能再继续，但可以用「清空转存历史」删掉。
+    /// </summary>
+    public async Task EndBatchAsync(CancellationToken cancellationToken = default)
+    {
+        if (!CanEndBatch || SelectedBatch is not { } selected) return;
+        bool confirmed;
+        try
+        {
+            confirmed = await dialogService!.ConfirmAsync(
+                "停止转存",
+                "确定停止这一批转存吗？\n\n" +
+                "· 还没开始的记录会标为「已取消」，停止后不能再继续这一批；\n" +
+                "· 已经转存成功的不受影响，网盘里的文件不会被删除；\n" +
+                "· 正在提交的那几条不能中途打断，会等它们完成后再停下。\n\n" +
+                "停止后可以用「清空转存历史」删除这批记录。只想暂时停一下，请用「暂停」，暂停后关掉软件下次也能继续。",
+                cancellationToken).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
+        if (!confirmed || !CanEndBatch || SelectedBatch?.BatchJobId != selected.BatchJobId) return;
+
+        var operation = BeginOperation(cancellationToken);
+        if (operation is null) return;
+        IsBusy = true;
+        try
+        {
+            var result = await endService!.EndAsync(selected.BatchJobId, operation.Token).ConfigureAwait(true);
+            if (!IsCurrent(operation)) return;
+            await ApplyEndResultAsync(selected.BatchJobId, result, operation.Token).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (operation.IsCancellationRequested) { }
+        catch (Exception)
+        {
+            if (IsCurrent(operation)) StatusMessage = "停止批次失败，请稍后重试。";
+        }
+        finally
+        {
+            if (!isClosed && ReferenceEquals(currentOperation, operation)) IsBusy = false;
+            operation.Dispose();
+        }
+    }
+
+    private async Task ApplyEndResultAsync(Guid batchJobId, EndBatchResult result, CancellationToken cancellationToken)
+    {
+        switch (result.Disposition)
+        {
+            case EndBatchDisposition.Ended:
+            case EndBatchDisposition.AlreadyEnded:
+                StatusMessage = result.Disposition == EndBatchDisposition.AlreadyEnded
+                    ? "这一批已经结束了。"
+                    : result.CancelledCount > 0
+                        ? $"批次已停止：{result.CancelledCount:N0} 条未开始的记录已取消。需要时可用「清空转存历史」删除这批记录。"
+                        : "批次已停止。需要时可用「清空转存历史」删除这批记录。";
+                if (SelectedBatch?.BatchJobId == batchJobId) UpdateSelectedBatchStatus("Cancelled");
+                var statisticsRead = false;
+                if (Results.BatchJobId == batchJobId)
+                {
+                    await Results.RefreshAsync(cancellationToken).ConfigureAwait(true);
+                    statisticsRead = true;
+                }
+                if (notifiedTerminalBatches.Add(batchJobId))
+                    BatchTerminal?.Invoke(this, new(batchJobId, "Cancelled",
+                        statisticsRead ? Results.CompleteSuccessCount : null,
+                        statisticsRead ? Results.TerminalProblemCount : null,
+                        statisticsRead ? Results.CancelledCount : null));
+                // 放在最后：自动结束时传进来的令牌就是它，先停会让上面的刷新被取消。
+                StopEndWatch();
+                break;
+            case EndBatchDisposition.Stopping:
+                StatusMessage = $"未开始的 {result.CancelledCount:N0} 条记录已取消，不会再开始新的转存；" +
+                    $"还有 {result.InFlightCount:N0} 条已经提交、正在收尾或等待核对结果，不能中途打断，完成后这一批自动停止。" +
+                    "分享结果核对不到的，约 2 分钟后按未创建处理。";
+                // 批次照常运行（只剩收尾），让自动刷新继续显示进度。
+                if (SelectedBatch?.BatchJobId == batchJobId) UpdateSelectedBatchStatus("Active");
+                if (Results.BatchJobId == batchJobId) await Results.RefreshAsync(cancellationToken).ConfigureAwait(true);
+                StartEndWatch(batchJobId);
+                break;
+            default:
+                StopEndWatch();
+                StatusMessage = "未找到所选批次，请刷新后重试。";
+                break;
+        }
+    }
+
+    // 正在提交的几条收尾之前，隔一会儿再结束一次；一旦结束（或用户点了「继续」）就停。
+    private void StartEndWatch(Guid batchJobId)
+    {
+        if (endWatch is not null || isClosed) return;
+        var watch = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        endWatch = watch;
+        OnPropertyChanged(nameof(IsEndingBatch));
+        _ = RunEndWatchAsync(batchJobId, watch);
+    }
+
+    private void StopEndWatch()
+    {
+        if (endWatch is not { } watch) return;
+        endWatch = null;
+        watch.Cancel();
+        OnPropertyChanged(nameof(IsEndingBatch));
+    }
+
+    private async Task RunEndWatchAsync(Guid batchJobId, CancellationTokenSource watch)
+    {
+        try
+        {
+            while (!watch.IsCancellationRequested)
+            {
+                await automaticRefreshDelay.DelayAsync(automaticRefreshInterval, watch.Token).ConfigureAwait(true);
+                if (isClosed || watch.IsCancellationRequested) return;
+                if (IsBusy || IsHistoryCleanupBusy) continue;
+                try
+                {
+                    var result = await endService!.EndAsync(batchJobId, watch.Token).ConfigureAwait(true);
+                    if (isClosed || watch.IsCancellationRequested) return;
+                    if (result.Disposition == EndBatchDisposition.Stopping) continue;
+                    await ApplyEndResultAsync(batchJobId, result, watch.Token).ConfigureAwait(true);
+                    return;
+                }
+                catch (OperationCanceledException) when (watch.IsCancellationRequested) { return; }
+                catch (Exception)
+                {
+                    if (!isClosed) StatusMessage = "暂时无法停止批次，稍后将再次尝试。";
+                }
+            }
+        }
+        catch (OperationCanceledException) when (watch.IsCancellationRequested) { }
+        finally
+        {
+            if (ReferenceEquals(endWatch, watch))
+            {
+                endWatch = null;
+                OnPropertyChanged(nameof(IsEndingBatch));
+            }
+            watch.Dispose();
+        }
+    }
+
     private async Task<bool> IsRemoteOperationAuthorizedAsync(CancellationToken cancellationToken)
     {
         if (licenseGate is null) return true;
@@ -280,6 +451,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         if (isClosed) return;
         isClosed = true;
         automaticRefresh?.Cancel();
+        endWatch?.Cancel();
         lifetime.Cancel();
         OnPropertyChanged(nameof(IsClosed));
         NotifyCommandState();
@@ -370,6 +542,10 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CanPause));
         OnPropertyChanged(nameof(CanResume));
         OnPropertyChanged(nameof(CanRetryFailedTransfer));
+        OnPropertyChanged(nameof(PauseResumeText));
+        OnPropertyChanged(nameof(CanEndBatch));
+        PauseResumeCommand.NotifyCanExecuteChanged();
+        EndBatchCommand.NotifyCanExecuteChanged();
         LoadSelectedBatchCommand.NotifyCanExecuteChanged();
         PauseCommand.NotifyCanExecuteChanged();
         ResumeCommand.NotifyCanExecuteChanged();
@@ -441,7 +617,8 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
                     {
                         BatchTerminal?.Invoke(this, new(expectedBatchJobId, latest!.BatchStatus,
                             statisticsRead ? Results.CompleteSuccessCount : null,
-                            statisticsRead ? Results.TerminalProblemCount : null));
+                            statisticsRead ? Results.TerminalProblemCount : null,
+                            statisticsRead ? Results.CancelledCount : null));
                     }
 
                     if (latest is null || latest.BatchStatus is not ("Queued" or "Active")) return;

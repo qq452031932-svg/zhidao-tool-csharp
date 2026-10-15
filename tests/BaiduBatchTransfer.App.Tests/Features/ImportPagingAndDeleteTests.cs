@@ -388,6 +388,133 @@ public sealed class ImportPagingAndDeleteTests
         Assert.False(vm.ShowConflictsOnly);
     }
 
+    [Fact]
+    public async Task SeveralSelectedRowsAreDeletedTogetherAfterOneConfirmation()
+    {
+        var (vm, draft, dialog) = await CreateAsync(rows: 250);
+        await vm.LoadNextPageCommand.ExecuteAsync(null);
+        var before = vm.Rows.Select(row => row.RowId).ToArray();
+        var targets = new[] { vm.Rows[2], vm.Rows[3], vm.Rows[40] };
+        vm.SelectedRow = targets[0];
+        vm.SetSelectedRows(targets);
+
+        Assert.Equal("删除所选 3 条记录", vm.DeleteMenuText);
+        await vm.DeleteSelectedRowCommand.ExecuteAsync(null);
+
+        Assert.Equal([targets.Select(row => row.RowId).ToArray()], draft.DeletedTogether);
+        Assert.Empty(draft.Deleted);
+        Assert.Contains("选中的 3 条", Assert.Single(dialog.Confirmations));
+        Assert.Equal("已删除 3 条记录。", vm.StatusMessage);
+        Assert.Equal(2, vm.PageNumber);
+        Assert.Equal(247, vm.TotalRows);
+        Assert.Empty(vm.SelectedRows);
+        Assert.Equal("删除这条记录", vm.DeleteMenuText);
+        // 其余行一行没少，后面补上来 3 行，序号仍然连续。
+        Assert.Equal(before.Except(targets.Select(row => row.RowId)), vm.Rows.Select(row => row.RowId).Take(97));
+        Assert.Equal(Enumerable.Range(101, 100).Select(value => (long)value), vm.Rows.Select(row => row.DisplayOrdinal));
+    }
+
+    [Fact]
+    public async Task SelectingAllConflictsAndDeletingThemClearsTheFilterInOneStep()
+    {
+        var (vm, draft, _) = await CreateAsync(rows: 250);
+        draft.MarkConflict(3, 77, 140, 141, 249);
+        vm.ShowConflictsOnly = true;
+        Assert.Equal(5, vm.Rows.Count);
+
+        vm.SetSelectedRows(vm.Rows.ToArray());
+        await vm.DeleteSelectedRowCommand.ExecuteAsync(null);
+
+        Assert.Equal(5, Assert.Single(draft.DeletedTogether).Length);
+        Assert.False(vm.ShowConflictsOnly);
+        Assert.Equal("没有冲突记录了，已显示全部记录。", vm.StatusMessage);
+        Assert.Equal(245, vm.TotalRows);
+        Assert.DoesNotContain(draft.Rows, row => row.Disposition == "Conflict");
+    }
+
+    [Fact]
+    public async Task EditingIsOnlyOfferedWhileASingleRowIsSelected()
+    {
+        var (vm, _, _) = await CreateAsync(rows: 5);
+        vm.SelectedRow = vm.Rows[0];
+        vm.SetSelectedRows([vm.Rows[0]]);
+        Assert.True(vm.CanEditSelectedRow);
+        Assert.True(vm.SaveSelectedRowCommand.CanExecute(null));
+        Assert.True(vm.ToggleSelectedExclusionCommand.CanExecute(null));
+
+        vm.SetSelectedRows([vm.Rows[0], vm.Rows[1]]);
+
+        Assert.False(vm.CanEditSelectedRow);
+        Assert.False(vm.SaveSelectedRowCommand.CanExecute(null));
+        Assert.False(vm.ToggleSelectedExclusionCommand.CanExecute(null));
+        Assert.True(vm.DeleteSelectedRowCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task AFailedBatchDeleteRemovesNothingAndSaysWhy()
+    {
+        var (vm, draft, _) = await CreateAsync(rows: 5);
+        draft.DeleteError = new BaiduBatchTransfer.Application.Imports.DraftWorkflowException("DRAFT_ROW_NOT_FOUND", "x");
+        vm.SetSelectedRows([vm.Rows[0], vm.Rows[1]]);
+
+        await vm.DeleteSelectedRowCommand.ExecuteAsync(null);
+
+        Assert.Equal(5, draft.Rows.Count);
+        Assert.Equal(5, vm.Rows.Count);
+        Assert.Equal("无法删除记录：这条记录已不在当前导入中，请点「刷新」。（DRAFT_ROW_NOT_FOUND）", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task SelectionChangedWhileConfirmingDeletesNothing()
+    {
+        var (vm, draft, dialog) = await CreateAsync(rows: 5);
+        vm.SetSelectedRows([vm.Rows[0], vm.Rows[1]]);
+        dialog.OnConfirm = () => vm.SetSelectedRows([vm.Rows[3]]);
+
+        await vm.DeleteSelectedRowCommand.ExecuteAsync(null);
+
+        Assert.Empty(draft.DeletedTogether);
+        Assert.Empty(draft.Deleted);
+        Assert.Equal(5, draft.Rows.Count);
+    }
+
+    [Fact]
+    public void InTheRealTableSeveralRowsCanBeSelectedAndDeletedTogether() => TransferPendingSelectionTests.OnSta(() =>
+    {
+        var draft = new Draft(250);
+        using var vm = new ImportViewModel(draft, draft, new Dialog());
+        vm.AttachSession(draft.SessionId);
+        vm.LoadFirstPageAsync().GetAwaiter().GetResult();
+        var view = TransferPendingSelectionTests.LoadPendingTable(vm);
+        var grid = TransferPendingSelectionTests.Descendants(view).OfType<System.Windows.Controls.DataGrid>().Single();
+        void Pump() => view.Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
+        Assert.Equal(System.Windows.Controls.DataGridSelectionMode.Extended, grid.SelectionMode);
+        // 这里只加载了 XAML，选中项回报给界面模型的那段代码要手动接上（真实窗口由 TransferWorkspaceView 接）。
+        BaiduBatchTransfer.App.Features.Transfers.PendingRowContextMenu.Attach(grid, vm.SetSelectedRows);
+
+        grid.SelectedItems.Add(vm.Rows[1]);
+        grid.SelectedItems.Add(vm.Rows[4]);
+        grid.SelectedItems.Add(vm.Rows[9]);
+        Pump();
+        var chosen = new[] { vm.Rows[1].RowId, vm.Rows[4].RowId, vm.Rows[9].RowId };
+        Assert.Equal(chosen, vm.SelectedRows.Select(row => row.RowId));
+        Assert.Equal("删除所选 3 条记录", vm.DeleteMenuText);
+
+        vm.DeleteSelectedRowCommand.ExecuteAsync(null).GetAwaiter().GetResult();
+        Pump();
+        Assert.Equal([chosen], draft.DeletedTogether);
+        Assert.Empty(grid.SelectedItems);
+        Assert.Empty(vm.SelectedRows);
+
+        // 删完再单选一行删除，落在所选的那一行上。
+        var next = vm.Rows[0];
+        grid.SelectedItem = next;
+        Pump();
+        vm.DeleteSelectedRowCommand.ExecuteAsync(null).GetAwaiter().GetResult();
+        Pump();
+        Assert.Equal([next.RowId], draft.Deleted);
+    });
+
     private static async Task<(ImportViewModel Model, Draft Draft, Dialog Dialog)> CreateAsync(int rows)
     {
         var draft = new Draft(rows);
@@ -413,6 +540,7 @@ public sealed class ImportPagingAndDeleteTests
         public Guid SessionId { get; } = Guid.NewGuid();
         public List<ImportPreviewRow> Rows { get; }
         public List<Guid> Deleted { get; } = [];
+        public List<Guid[]> DeletedTogether { get; } = [];
         public bool FailNextLoad { get; set; }
         public bool RejectDelete { get; set; }
         public Exception? DeleteError { get; set; }
@@ -452,6 +580,14 @@ public sealed class ImportPagingAndDeleteTests
             return Result();
         }
 
+        public Task<ImportWorkflowResult> DeleteRowsAsync(IReadOnlyList<Guid> rowIds, CancellationToken cancellationToken)
+        {
+            if (DeleteError is not null) throw DeleteError;
+            foreach (var rowId in rowIds) Assert.Equal(1, Rows.RemoveAll(row => row.RowId == rowId));
+            DeletedTogether.Add(rowIds.ToArray());
+            return Result();
+        }
+
         public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken)
         {
             var index = Rows.FindIndex(row => row.RowId == rowId);
@@ -473,9 +609,11 @@ public sealed class ImportPagingAndDeleteTests
     {
         public bool Answer { get; set; } = true;
         public List<string> Confirmations { get; } = [];
+        public Action? OnConfirm { get; set; }
         public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
         {
             Confirmations.Add(message);
+            OnConfirm?.Invoke();
             return Task.FromResult(Answer);
         }
         public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) => Task.CompletedTask;

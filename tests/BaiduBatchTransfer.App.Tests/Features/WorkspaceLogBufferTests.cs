@@ -187,6 +187,32 @@ public sealed class WorkspaceLogBufferTests
         Assert.Equal(WorkspaceLogLevel.Error, Assert.Single(buffer.Entries).Level);
     }
 
+    [Theory]
+    [InlineData("进度 9,525/9,526：成功 4，失败 0，已取消 9,521，剩余 1。", WorkspaceLogLevel.Warning)]
+    [InlineData("进度 9,526/9,526：成功 4，失败 1，已取消 9,521，剩余 0。", WorkspaceLogLevel.Error)]
+    public void ClassifiesStoppedProgressByRealFailuresNotCancellations(string message, WorkspaceLogLevel expected)
+    {
+        // 用户 10-14：停止一批后显示一行红色「错误」，其实 9,521 条只是没开始被取消。
+        var buffer = new WorkspaceLogBuffer();
+
+        buffer.AppendSafe(message);
+
+        Assert.Equal(expected, Assert.Single(buffer.Entries).Level);
+    }
+
+    [Fact]
+    public void AnEntryThatIsNotPersistedStillShowsButSkipsTheRunLog()
+    {
+        var persisted = new List<string>();
+        var buffer = new WorkspaceLogBuffer(appended: entry => persisted.Add(entry.Message));
+
+        buffer.AppendSafe("只显示", WorkspaceLogLevel.Warning, persist: false);
+        buffer.AppendSafe("也落盘");
+
+        Assert.Equal(["只显示", "也落盘"], buffer.Entries.Select(entry => entry.Message));
+        Assert.Equal(["也落盘"], persisted);
+    }
+
     [Fact]
     public void PreservesOrdinaryStatusAfterAPunctuationDelimitedSpacedSecret()
     {

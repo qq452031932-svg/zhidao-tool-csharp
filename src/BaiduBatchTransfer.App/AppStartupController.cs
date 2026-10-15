@@ -2,6 +2,7 @@
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.App.Features.Licensing;
+using BaiduBatchTransfer.App.Services;
 using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App;
@@ -18,7 +19,9 @@ public sealed class StartupRecoveryRunner(
     StartupRecoveryService recoveryService,
     IRemoteSelectionSessionStore remoteSelectionSessions,
     ILocalResultExportCoordinator localResultExports,
-    TimeProvider timeProvider) : IAppRecoveryRunner
+    TimeProvider timeProvider,
+    IRunLog? runLog = null,
+    StartupNotices? notices = null) : IAppRecoveryRunner
 {
     public bool IsAvailable => true;
     public string UnavailableMessage => string.Empty;
@@ -31,6 +34,17 @@ public sealed class StartupRecoveryRunner(
         var result = await recoveryService.RecoverPreparedAsync(cancellationToken).ConfigureAwait(false);
         if (!result.CoordinatorMayStart)
             throw new InvalidOperationException("启动恢复未允许调度器运行。");
+        // 只在这次真取消了东西时提示：已经停止、还在收尾的批次每次启动都会再过一遍，不必重复说。
+        if (result.StoppedLeftRunning is { } stopped && stopped.CancelledOperations > 0)
+        {
+            var message = $"上次关闭软件时有 {stopped.Ended + stopped.StillRunning} 个转存批次没有暂停，已按停止处理" +
+                $"（{stopped.CancelledOperations:N0} 条未开始的已取消" +
+                (stopped.StillRunning > 0 ? $"，{stopped.StillRunning} 个批次还有已提交的记录在收尾" : string.Empty) +
+                "）。只有暂停的批次关掉软件后还能继续。";
+            runLog?.Write("转存", message);
+            // 只写文件时用户在界面上看不到（10-14 实测），转存页日志里也要有。
+            notices?.Post(message);
+        }
         await remoteSelectionSessions.RecoverIncompleteAsync(
             timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
         await localResultExports.RecoverAsync(cancellationToken).ConfigureAwait(false);

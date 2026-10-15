@@ -160,6 +160,15 @@ public sealed class SqliteLocalTerminalHistoryStore : ILocalTerminalHistoryStore
         SqliteConnection c, SqliteTransaction tx, LocalHistoryKind kind, CancellationToken token)
     {
         if (kind != LocalHistoryKind.Transfer) return 0;
+        // 可重试的失败分享与可重试的失败转存一样：不再挡住清空，只在确认框里说明清空后不能再重试。
+        // 例如分享结果一直核对不到、按未创建处理的那一条（批次已收尾，只差重试分享）。
+        await using var shares = Command(c, tx, $"""
+            SELECT count(*) FROM ShareOperations operation
+            WHERE operation.Id IN ({Shares}) AND operation.Status='Failed'
+              AND ({SqliteShareRequeueSafety.Predicate("operation")})
+            """);
+        var retryableShares = checked(Convert.ToInt32(
+            await shares.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture));
         var safeRetryPredicate = SqliteRetryFailedTransferSafety.Predicate(
             "o", "b", "r", "allocation", "account", "output", "settings");
         await using var command = Command(c, tx, $"""
@@ -172,7 +181,8 @@ public sealed class SqliteLocalTerminalHistoryStore : ILocalTerminalHistoryStore
             LEFT JOIN BatchShareSettings settings ON settings.BatchJobId=o.BatchJobId
             WHERE o.Id IN ({Transfers}) AND b.AcceptanceOnly=0 AND ({safeRetryPredicate})
             """);
-        return checked(Convert.ToInt32(await command.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture));
+        return checked(retryableShares +
+            Convert.ToInt32(await command.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture));
     }
 
     private static async Task<bool> HasConflictsAsync(SqliteConnection c, SqliteTransaction tx, LocalHistoryKind kind, DateTimeOffset now, CancellationToken token)
@@ -215,9 +225,6 @@ public sealed class SqliteLocalTerminalHistoryStore : ILocalTerminalHistoryStore
                             OR SubmitStartedAt IS NOT NULL OR AdapterRequestId IS NOT NULL OR RemoteItemIdsJson IS NOT NULL))
                     OR (Status='Cancelled' AND (SubmitStartedAt IS NOT NULL OR AdapterRequestId IS NOT NULL
                         OR ConfirmationDescriptorJson IS NOT NULL OR DailyCountedAt IS NOT NULL)))
-                UNION ALL
-                SELECT 1 FROM ShareOperations operation WHERE operation.Id IN ({Shares})
-                  AND operation.Status='Failed' AND ({SqliteShareRequeueSafety.Predicate("operation")})
                 UNION ALL
                 SELECT 1 FROM ShareOperations WHERE Id IN ({Shares}) AND (
                     Status NOT IN ('Succeeded','ReusedExisting','Failed','Cancelled') OR {ActiveLease}

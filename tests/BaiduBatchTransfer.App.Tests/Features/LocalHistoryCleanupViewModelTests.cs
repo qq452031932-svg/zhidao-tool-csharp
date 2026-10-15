@@ -191,6 +191,144 @@ public sealed class LocalHistoryCleanupViewModelTests
     }
 }
 
+public sealed class LocalHistoryCleanupUnfinishedBatchTests
+{
+    [Fact]
+    public async Task WhenOnlyUnfinishedBatchesExistTheButtonStillWorksAndEndsThemFirst()
+    {
+        // 其他用户的情况：导入错了、整批都还在「等待」，原来按钮点了也清不掉。
+        var history = new CleanupStore { Preview = new(LocalHistoryKind.Transfer, 0, false, "empty") };
+        var batches = new RunControlStore([Guid.NewGuid()]);
+        batches.OnEnded = () => history.Preview = new(LocalHistoryKind.Transfer, 1, false, "after-end");
+        var interaction = new CleanupInteraction { UnfinishedChoice = UnfinishedBatchChoice.EndThenClear };
+        string? status = null;
+        var reloads = 0;
+        using var vm = Create(history, interaction, batches, text => status = text, () => reloads++);
+
+        await vm.RefreshPreviewAsync();
+        Assert.True(vm.CanClear);
+        Assert.Equal(1, vm.UnfinishedBatchCount);
+        Assert.Contains("1 个批次还没结束", vm.ClearBlockedReason);
+
+        await vm.ClearAsync();
+
+        Assert.Equal([(1, 0)], interaction.UnfinishedQuestions);
+        Assert.Single(batches.Ended);
+        Assert.Equal("after-end", Assert.Single(history.Deleted).SnapshotToken);
+        Assert.True(reloads >= 2);
+        Assert.Contains("已清空 1 个已结束的转存批次历史", status);
+        Assert.DoesNotContain("予以保留", status);
+    }
+
+    [Fact]
+    public async Task ChoosingToClearOnlyEndedBatchesLeavesUnfinishedOnesRunning()
+    {
+        var history = new CleanupStore();
+        var batches = new RunControlStore([Guid.NewGuid(), Guid.NewGuid()]);
+        var interaction = new CleanupInteraction { UnfinishedChoice = UnfinishedBatchChoice.ClearEndedOnly };
+        string? status = null;
+        using var vm = Create(history, interaction, batches, text => status = text);
+
+        await vm.ClearAsync();
+
+        Assert.Equal([(2, 7)], interaction.UnfinishedQuestions);
+        Assert.Empty(batches.Ended);
+        Assert.Single(history.Deleted);
+        Assert.Contains("予以保留", status);
+    }
+
+    [Fact]
+    public async Task CancellingTheUnfinishedQuestionDoesNothing()
+    {
+        var history = new CleanupStore();
+        var batches = new RunControlStore([Guid.NewGuid()]);
+        var interaction = new CleanupInteraction { UnfinishedChoice = UnfinishedBatchChoice.Cancel };
+        string? status = null;
+        using var vm = Create(history, interaction, batches, text => status = text);
+
+        await vm.ClearAsync();
+
+        Assert.Empty(batches.Ended);
+        Assert.Empty(history.Deleted);
+        Assert.Empty(interaction.Confirmed);
+        Assert.Equal("已取消清空历史。", status);
+    }
+
+    [Fact]
+    public async Task ABatchStillSubmittingIsStoppedAndTheUserIsToldToClearAgainLater()
+    {
+        var history = new CleanupStore { Preview = new(LocalHistoryKind.Transfer, 0, false, "empty") };
+        var batches = new RunControlStore([Guid.NewGuid()]) { InFlight = 2 };
+        var interaction = new CleanupInteraction { UnfinishedChoice = UnfinishedBatchChoice.EndThenClear };
+        string? status = null;
+        using var vm = Create(history, interaction, batches, text => status = text);
+
+        await vm.ClearAsync();
+
+        Assert.Empty(history.Deleted);
+        Assert.Empty(interaction.Confirmed);
+        Assert.Contains("1 个批次还有正在提交的记录", status);
+        Assert.Contains("再点一次「清空转存历史」", status);
+    }
+
+    [Fact]
+    public async Task WithNothingAtAllTheButtonStaysOff()
+    {
+        var history = new CleanupStore { Preview = new(LocalHistoryKind.Transfer, 0, false, "empty") };
+        using var vm = Create(history, new CleanupInteraction(), new RunControlStore([]), _ => { });
+
+        await vm.RefreshPreviewAsync();
+
+        Assert.False(vm.CanClear);
+        Assert.Equal("没有可清空的记录。", vm.ClearBlockedReason);
+    }
+
+    [Fact]
+    public async Task ShareHistoryIgnoresTransferBatches()
+    {
+        var history = new CleanupStore { Preview = new(LocalHistoryKind.StandaloneShare, 3, false, "share") };
+        var batches = new RunControlStore([Guid.NewGuid()]);
+        var interaction = new CleanupInteraction { UnfinishedChoice = UnfinishedBatchChoice.EndThenClear };
+        using var vm = new LocalHistoryCleanupViewModel(new(history), interaction, LocalHistoryKind.StandaloneShare,
+            () => true, _ => Task.CompletedTask, _ => { }, new InlineBackgroundOperationRunner(),
+            unfinishedBatches: new EndBatchService(batches));
+
+        await vm.ClearAsync();
+
+        Assert.Empty(interaction.UnfinishedQuestions);
+        Assert.Empty(batches.Ended);
+        Assert.Single(history.Deleted);
+    }
+
+    private static LocalHistoryCleanupViewModel Create(CleanupStore history, CleanupInteraction interaction,
+        RunControlStore batches, Action<string> report, Action? reloaded = null) =>
+        new(new(history), interaction, LocalHistoryKind.Transfer, () => true,
+            _ => { reloaded?.Invoke(); return Task.CompletedTask; }, report, new InlineBackgroundOperationRunner(),
+            unfinishedBatches: new EndBatchService(batches));
+
+    /// <summary>内存里的批次：结束时按 <see cref="InFlight"/> 决定是直接结束还是要等提交收尾。</summary>
+    private sealed class RunControlStore(IEnumerable<Guid> unfinished) : IBatchRunControlStore
+    {
+        private readonly List<Guid> unfinished = unfinished.ToList();
+        public List<Guid> Ended { get; } = [];
+        public int InFlight { get; set; }
+        public Action? OnEnded { get; set; }
+        public Task<IReadOnlyList<Guid>> ListUnfinishedBatchIdsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<Guid>>(unfinished.ToArray());
+        public Task<EndBatchResult> TryEndBatchAsync(Guid batchJobId, DateTimeOffset endedAt, CancellationToken cancellationToken = default)
+        {
+            if (InFlight > 0) return Task.FromResult(new EndBatchResult(EndBatchDisposition.Stopping, 3, InFlight));
+            unfinished.Remove(batchJobId);
+            Ended.Add(batchJobId);
+            OnEnded?.Invoke();
+            return Task.FromResult(new EndBatchResult(EndBatchDisposition.Ended, 3, 0));
+        }
+        public Task<PauseBatchDisposition> TryPauseBatchAsync(Guid batchJobId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<ResumeBatchDisposition> TryResumeBatchAsync(Guid batchJobId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<RetryFailedTransferDisposition> TryRetryFailedTransferAsync(Guid operationId, DateTimeOffset retriedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+}
+
 internal sealed class CleanupStore : ILocalTerminalHistoryStore
 {
     public Func<Task<LocalHistoryCleanupPreview>>? PreviewOverride { get; set; }
@@ -220,6 +358,13 @@ internal sealed class CleanupInteraction : ILocalHistoryCleanupInteraction
     public bool Accept { get; set; } = true;
     public List<LocalHistoryCleanupPreview> Confirmed { get; } = [];
     public Func<LocalHistoryCleanupPreview, CancellationToken, Task<bool>>? Confirm { get; set; }
+    public UnfinishedBatchChoice UnfinishedChoice { get; set; } = UnfinishedBatchChoice.ClearEndedOnly;
+    public List<(int Unfinished, int Ended)> UnfinishedQuestions { get; } = [];
+    public Task<UnfinishedBatchChoice> ChooseUnfinishedAsync(int unfinishedBatchCount, int endedBatchCount, CancellationToken cancellationToken = default)
+    {
+        UnfinishedQuestions.Add((unfinishedBatchCount, endedBatchCount));
+        return Task.FromResult(UnfinishedChoice);
+    }
     public Task<bool> ConfirmAsync(LocalHistoryCleanupPreview preview, CancellationToken cancellationToken = default)
     {
         Confirmed.Add(preview);

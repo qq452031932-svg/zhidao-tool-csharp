@@ -15,21 +15,23 @@ public partial class TransferWorkspaceView : UserControl
         DataContext = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         ResultsHost.Content = new JobResultsView(viewModel.RunPanel.Results);
         _ = new WorkspaceLogAutoScroll(this, TransferLogsList, viewModel.Logs);
-        PendingRowContextMenu.Attach(PendingLinksGrid);
+        PendingRowContextMenu.Attach(PendingLinksGrid, viewModel.Import.SetSelectedRows);
     }
 }
 
 /// <summary>
-/// 待处理列表的右键菜单只针对鼠标指着的那一行：右键先选中它，指在空白处则不弹菜单，
-/// 免得「删除这条记录」落到之前选中的另一行上。
+/// 待处理列表的右键菜单针对鼠标指着的行：指着已选中的行时保留整组选择（批量删除），
+/// 指着未选中的行时改为只选它，指在空白处则不弹菜单，免得删除落到之前选中的别的行上。
 /// </summary>
 internal static class PendingRowContextMenu
 {
-    public static void Attach(DataGrid grid)
+    public static void Attach(DataGrid grid, Action<IEnumerable<ImportPreviewRow>>? selectionChanged = null)
     {
+        if (selectionChanged is not null)
+            grid.SelectionChanged += (_, _) => selectionChanged(grid.SelectedItems.OfType<ImportPreviewRow>().ToArray());
         grid.PreviewMouseRightButtonDown += (_, e) =>
         {
-            if (RowUnder(e.OriginalSource) is { } row) grid.SelectedItem = row.Item;
+            if (RowUnder(e.OriginalSource) is { } row && !row.IsSelected) grid.SelectedItem = row.Item;
         };
         grid.ContextMenuOpening += (_, e) =>
         {

@@ -133,7 +133,8 @@ public sealed record AccountBatchStatisticsRecord(
     long PendingCount,
     long PausedCount,
     long CompleteSuccessCount = 0,
-    long TerminalProblemCount = 0)
+    long TerminalProblemCount = 0,
+    long CancelledCount = 0)
 {
     public override string ToString() =>
         $"AccountBatchStatisticsRecord {{ AccountId = {AccountId}, PriorityOrder = {PriorityOrder}, NewCount = {NewCount}, ExistingCount = {ExistingCount}, FailedCount = {FailedCount}, PendingCount = {PendingCount}, PausedCount = {PausedCount}, DisplayName = [REDACTED] }}";

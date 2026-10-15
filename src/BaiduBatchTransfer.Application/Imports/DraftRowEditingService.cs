@@ -194,6 +194,33 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
             await unit.Imports.DeleteRowAsync(rowId, cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
 
+    /// <summary>
+    /// 一次删除多行，全在同一个事务里：任何一行不合法（不存在、不属于这批导入）就一行都不删，
+    /// 免得用户以为删掉了 N 条、实际只删了一部分。
+    /// </summary>
+    public Task<DraftMutationResult> DeleteManyAsync(
+        Guid sessionId,
+        IReadOnlyCollection<Guid> rowIds,
+        TransferMode transferMode,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(rowIds);
+        if (rowIds.Count == 0) throw new ArgumentException("至少需要一条记录。", nameof(rowIds));
+        var distinct = rowIds.Distinct().ToArray();
+        return MutateAsync(sessionId, transferMode, async (unit, session) =>
+        {
+            foreach (var rowId in distinct)
+            {
+                var row = await unit.Imports.GetRowByIdAsync(rowId, cancellationToken).ConfigureAwait(false)
+                    ?? throw new DraftWorkflowException("DRAFT_ROW_NOT_FOUND", "草稿记录不存在。");
+                if (row.ImportSessionId != sessionId)
+                    throw new DraftWorkflowException("DRAFT_ROW_SESSION_MISMATCH", "草稿记录不属于当前导入。");
+            }
+            foreach (var rowId in distinct)
+                await unit.Imports.DeleteRowAsync(rowId, cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
+    }
+
     public Task<DraftMutationResult> RestoreAsync(
         Guid sessionId,
         Guid rowId,
