@@ -5,14 +5,64 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Threading;
+using BaiduBatchTransfer.App.Features.ShareAnalytics;
 using BaiduBatchTransfer.App.Services;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 
 namespace BaiduBatchTransfer.App.Features.Collect;
 
-/// <summary>结果表格里的一行。</summary>
-public sealed record CollectedRow(int Ordinal, string Name, string Link, string Pwd, string Source);
+/// <summary>结果表格里的一行。按引用区分记录：检测结果只写回发起检测时的那一行。</summary>
+public sealed class CollectedRow(int ordinal, string name, string link, string pwd, string source) : ObservableObject
+{
+    private CollectLinkStatus linkStatus;
+    private string linkStatusDetail = "尚未检测。右键可「检测链接有效性」。";
+
+    public int Ordinal { get; } = ordinal;
+    public string Name { get; } = name;
+    public string Link { get; } = link;
+    public string Pwd { get; } = pwd;
+    public string Source { get; } = source;
+
+    public CollectLinkStatus LinkStatus
+    {
+        get => linkStatus;
+        private set { if (SetProperty(ref linkStatus, value)) OnPropertyChanged(nameof(LinkStatusText)); }
+    }
+
+    public string LinkStatusText => LinkStatus switch
+    {
+        CollectLinkStatus.Checking => "检测中",
+        CollectLinkStatus.Accessible => "可访问",
+        CollectLinkStatus.Invalid => "已失效",
+        CollectLinkStatus.PasswordProblem => "提取码问题",
+        CollectLinkStatus.Undetermined => "暂无法判断",
+        _ => "未检测",
+    };
+
+    /// <summary>提示里显示的原因与检测时间。</summary>
+    public string LinkStatusDetail { get => linkStatusDetail; private set => SetProperty(ref linkStatusDetail, value); }
+
+    internal (CollectLinkStatus Status, string Detail) SnapshotStatus() => (LinkStatus, LinkStatusDetail);
+
+    internal void MarkChecking()
+    {
+        LinkStatus = CollectLinkStatus.Checking;
+        LinkStatusDetail = "正在检测…";
+    }
+
+    internal void RestoreStatus((CollectLinkStatus Status, string Detail) snapshot)
+    {
+        LinkStatus = snapshot.Status;
+        LinkStatusDetail = snapshot.Detail;
+    }
+
+    internal void ApplyCheck(ShareLinkCheckResult result, DateTimeOffset checkedAt)
+    {
+        LinkStatus = result.Status;
+        LinkStatusDetail = $"{result.Reason}\n检测时间：{checkedAt.LocalDateTime:yyyy-MM-dd HH:mm:ss}（只代表当时的结果）";
+    }
+}
 
 /// <summary>选择关键词文件；取消返回 null。</summary>
 public interface IKeywordFileDialog
@@ -69,14 +119,24 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
     private bool isPaused;
     private bool pausePending;
     private readonly IRunLog? runLog;
+    private readonly IShareLinkChecker? linkChecker;
+    private readonly IShareLinkLauncher? linkLauncher;
+    private readonly Func<CancellationToken, Task> linkCheckDelay;
+    private CancellationTokenSource? linkCheckLifetime;
+    private bool isCheckingLinks;
 
     public CollectViewModel(ICollectHelperSession session, Action<Action>? dispatch = null,
         IKeywordFileDialog? keywordFileDialog = null, IZhidaoCookieValidator? cookieValidator = null,
         ICollectResultActions? resultActions = null, ICollectPauseStore? pauseStore = null,
-        IRunLog? runLog = null)
+        IRunLog? runLog = null, IShareLinkChecker? linkChecker = null, IShareLinkLauncher? linkLauncher = null,
+        Func<CancellationToken, Task>? linkCheckDelay = null)
     {
         this.session = session ?? throw new ArgumentNullException(nameof(session));
         this.runLog = runLog;
+        this.linkChecker = linkChecker;
+        this.linkLauncher = linkLauncher;
+        // 逐条检测之间留一点间隔，避免短时间大量请求触发百度验证。
+        this.linkCheckDelay = linkCheckDelay ?? (token => Task.Delay(TimeSpan.FromSeconds(1), token));
         this.keywordFileDialog = keywordFileDialog;
         this.resultActions = resultActions;
         this.pauseStore = pauseStore;
@@ -112,10 +172,13 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         CopyLinksCommand = new AsyncRelayCommand(() => RunResultActionAsync("复制链接", rows => resultActions!.CopyLinksAsync(rows)), CanUseResults);
         ExportResultsCommand = new AsyncRelayCommand(() => RunResultActionAsync("导出结果", rows => resultActions!.ExportAsync(rows)), CanUseResults);
         SendToTransferCommand = new AsyncRelayCommand(() => RunResultActionAsync("送入转存", rows => resultActions!.SendToTransferAsync(rows)), CanUseResults);
+        CheckSelectedLinksCommand = new AsyncRelayCommand(CheckSelectedLinksAsync, CanCheckLinks);
+        StopLinkCheckCommand = new RelayCommand(() => linkCheckLifetime?.Cancel(), () => IsCheckingLinks);
         Resources.CollectionChanged += (_, _) =>
         {
             selectedResults.IntersectWith(Resources);
             OnPropertyChanged(nameof(ResultScopeText));
+            OnPropertyChanged(nameof(SelectedResultCount));
             RefreshCommands();
         };
         RestorePausedTask();
@@ -148,6 +211,119 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         selectedResults.Clear();
         selectedResults.UnionWith(rows.Where(Resources.Contains));
         OnPropertyChanged(nameof(ResultScopeText));
+        OnPropertyChanged(nameof(SelectedResultCount));
+        CheckSelectedLinksCommand.NotifyCanExecuteChanged();
+    }
+
+    public int SelectedResultCount => selectedResults.Count;
+
+    /// <summary>检测选中的链接；没有选中时不检测（要检测全部请先全选）。</summary>
+    public AsyncRelayCommand CheckSelectedLinksCommand { get; }
+
+    public RelayCommand StopLinkCheckCommand { get; }
+
+    public bool CanOpenLinks => linkLauncher is not null;
+
+    public bool CanCheckLinksAtAll => linkChecker is not null;
+
+    public bool IsCheckingLinks
+    {
+        get => isCheckingLinks;
+        private set
+        {
+            if (!SetProperty(ref isCheckingLinks, value)) return;
+            StopLinkCheckCommand.NotifyCanExecuteChanged();
+        }
+    }
+
+    private bool CanCheckLinks() => !disposed && linkChecker is not null && selectedResults.Count > 0 &&
+        !IsBusy && !IsCollecting && !resultActionBusy;
+
+    /// <summary>在默认浏览器打开这一条；有提取码且链接里没有时补上。</summary>
+    public void OpenLink(CollectedRow? row)
+    {
+        if (row is null || !Resources.Contains(row) || linkLauncher is null) return;
+        var uri = BaiduShareLink.BuildOpenUri(row.Link, row.Pwd, out var conflict);
+        string message;
+        if (uri is null) message = $"第 {row.Ordinal} 条不是可识别的百度网盘分享链接，未打开。";
+        else
+        {
+            linkLauncher.TryOpen(uri, out var launcherMessage);
+            message = $"第 {row.Ordinal} 条：{launcherMessage}" +
+                (conflict ? "链接里自带的提取码与提取码列不一致，已按链接原样打开；打不开时请改用提取码列的值。" : string.Empty);
+        }
+        ResultActionMessage = message;
+        AppendLog(message);
+    }
+
+    private async Task CheckSelectedLinksAsync()
+    {
+        if (!CanCheckLinks()) return;
+        // 按表格顺序取选中的行，检测期间结果只写回这些行本身。
+        var rows = Resources.Where(selectedResults.Contains).ToArray();
+        using var cancellation = new CancellationTokenSource();
+        linkCheckLifetime = cancellation;
+        resultActionBusy = true;
+        IsCheckingLinks = true;
+        RefreshCommands();
+        var counts = new Dictionary<CollectLinkStatus, int>();
+        var done = 0;
+        var limitedInARow = 0;
+        string? autoStopReason = null;
+        AppendLog($"开始检测 {rows.Length} 条链接（只读取分享信息，不转存、不下载）。");
+        try
+        {
+            foreach (var row in rows)
+            {
+                if (cancellation.IsCancellationRequested || disposed) break;
+                if (done > 0)
+                {
+                    try { await linkCheckDelay(cancellation.Token).ConfigureAwait(true); }
+                    catch (OperationCanceledException) { break; }
+                }
+                ResultActionMessage = $"正在检测链接 {done + 1}/{rows.Length}…";
+                var before = row.SnapshotStatus();
+                row.MarkChecking();
+                ShareLinkCheckResult result;
+                try { result = await linkChecker!.CheckAsync(row.Link, row.Pwd, cancellation.Token).ConfigureAwait(true); }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+                {
+                    // 停止时这一条没检测完：恢复原状态，不能标成失效。
+                    row.RestoreStatus(before);
+                    break;
+                }
+                catch (Exception error)
+                {
+                    result = new(CollectLinkStatus.Undetermined, $"检测出错（{error.GetType().Name}），未能确认。");
+                }
+                row.ApplyCheck(result, DateTimeOffset.Now);
+                done++;
+                counts[result.Status] = counts.GetValueOrDefault(result.Status) + 1;
+                runLog?.Write(RunLogSource, $"链接检测 第 {row.Ordinal} 条：{row.LinkStatusText}。{result.Reason}");
+                limitedInARow = result.LooksRateLimited ? limitedInARow + 1 : 0;
+                if (limitedInARow >= 3)
+                {
+                    autoStopReason = "连续 3 条遇到百度验证或请求受限，已自动停止，请过一段时间再检测剩下的。";
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            linkCheckLifetime = null;
+            IsCheckingLinks = false;
+            resultActionBusy = false;
+            RefreshCommands();
+        }
+        if (disposed) return;
+        var summary = $"可访问 {counts.GetValueOrDefault(CollectLinkStatus.Accessible)}，" +
+            $"已失效 {counts.GetValueOrDefault(CollectLinkStatus.Invalid)}，" +
+            $"提取码问题 {counts.GetValueOrDefault(CollectLinkStatus.PasswordProblem)}，" +
+            $"暂无法判断 {counts.GetValueOrDefault(CollectLinkStatus.Undetermined)}";
+        ResultActionMessage = done == rows.Length
+            ? $"链接检测完成（{done} 条）：{summary}。鼠标停在「链接状态」上可看原因。"
+            : $"{autoStopReason ?? "链接检测已停止。"}已检测 {done}/{rows.Length} 条：{summary}；未检测的保持原状态。";
+        AppendLog(ResultActionMessage);
     }
 
     private bool CanUseResults() => !disposed && resultActions is not null && Resources.Count > 0 &&
@@ -750,12 +926,15 @@ public sealed class CollectViewModel : ObservableObject, IAsyncDisposable
         CopyLinksCommand.NotifyCanExecuteChanged();
         ExportResultsCommand.NotifyCanExecuteChanged();
         SendToTransferCommand.NotifyCanExecuteChanged();
+        CheckSelectedLinksCommand.NotifyCanExecuteChanged();
+        StopLinkCheckCommand.NotifyCanExecuteChanged();
     }
 
     public async ValueTask DisposeAsync()
     {
         disposed = true;
         cookieValidationLifetime?.Cancel();
+        linkCheckLifetime?.Cancel();
         lifetime?.Cancel();
         lifetime?.Dispose();
         lifetime = null;

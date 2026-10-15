@@ -169,6 +169,8 @@
                     <Button Content="复制链接" Command="{Binding CopyLinksCommand}" Margin="0,0,8,0" />
                     <Button Content="导出 Excel" Command="{Binding ExportResultsCommand}" Margin="0,0,8,0" />
                     <Button Content="送入批量转存" Command="{Binding SendToTransferCommand}" Margin="0,0,12,0" />
+                    <Button Content="停止检测" Command="{Binding StopLinkCheckCommand}" Margin="0,0,12,0"
+                            Visibility="{Binding IsCheckingLinks, Converter={StaticResource BoolToVisibility}}" />
                     <TextBlock Text="{Binding ResultScopeText}" VerticalAlignment="Center" FontSize="11"
                                Foreground="{StaticResource MutedBrush}" ToolTip="按住 Ctrl 或 Shift 可多选；未选中时操作全部结果。" />
                 </WrapPanel>
@@ -214,6 +216,29 @@
                         <DataGridTextColumn Header="资源名称" Binding="{Binding Name}" Width="2*" MinWidth="140" />
                         <DataGridTextColumn Header="资源链接" Binding="{Binding Link}" Width="3*" MinWidth="180" />
                         <DataGridTextColumn Header="提取码" Binding="{Binding Pwd}" Width="80" />
+                        <!-- 右键「检测链接有效性」后更新；原因和检测时间放在提示里 -->
+                        <DataGridTextColumn Header="链接状态" Binding="{Binding LinkStatusText}" Width="92">
+                            <DataGridTextColumn.ElementStyle>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="ToolTip" Value="{Binding LinkStatusDetail}" />
+                                    <Setter Property="Padding" Value="4,0" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding LinkStatus}" Value="Unchecked">
+                                            <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding LinkStatus}" Value="Accessible">
+                                            <Setter Property="Background" Value="{StaticResource SuccessRowBrush}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding LinkStatus}" Value="Invalid">
+                                            <Setter Property="Background" Value="{StaticResource FailureRowBrush}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding LinkStatus}" Value="PasswordProblem">
+                                            <Setter Property="Background" Value="{StaticResource WarningRowBrush}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </DataGridTextColumn.ElementStyle>
+                        </DataGridTextColumn>
                         <!-- 来源保留原帖链接：可疑资源要能点回去看是谁发的 -->
                         <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="2*" MinWidth="100" />
                     </DataGrid.Columns>

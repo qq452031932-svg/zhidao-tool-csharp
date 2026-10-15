@@ -1153,7 +1153,9 @@ public sealed class AppShellFactory(
                     mainViewModel?.ShowBatchTransferCommand.Execute(null);
                 }),
             pauseStore: collectPauseStore,
-            runLog: runLog);
+            runLog: runLog,
+            linkChecker: new ShareLinkChecker(),
+            linkLauncher: shareLinkLauncher);
         var collectWorkspace = new CollectView { DataContext = collectViewModel };
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),
