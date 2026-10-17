@@ -174,11 +174,14 @@ public sealed class AddAccountService
             }
 
             var duplicate = await unit.Accounts.GetByBaiduUserIdAsync(identity.UserId, cancellationToken).ConfigureAwait(false);
-            if (duplicate is not null)
+            if (duplicate is not null && !duplicate.IsRemovedTombstone)
             {
                 await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
-                return new(AddAccountStatus.DuplicateIdentity, duplicate.Id, "This Baidu identity already exists in account history.");
+                return new(AddAccountStatus.DuplicateIdentity, duplicate.Id, "This Baidu identity is already an account.");
             }
+            // 退出过的账号重新登录：和新账号一起提交，失败时一起回滚。
+            if (duplicate is not null)
+                await unit.Accounts.UpsertAsync(duplicate.WithReleasedIdentity(), cancellationToken).ConfigureAwait(false);
 
             var boundSession = request.Session.Bind(request.AccountId, identity.UserId);
             var protection = sessionProtector.Protect(boundSession);

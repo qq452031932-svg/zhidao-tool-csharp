@@ -24,8 +24,11 @@ public sealed partial class SqliteManagedBrowserStateStore
             if (addNew)
             {
                 if (account is not null || expectedCurrent is not null) return ManagedBrowserBindingStatus.Conflict;
-                if (await accounts.GetByBaiduUserIdAsync(session.StableBaiduUserId, token).ConfigureAwait(false) is not null)
+                var duplicate = await accounts.GetByBaiduUserIdAsync(session.StableBaiduUserId, token).ConfigureAwait(false);
+                if (duplicate is not null && !duplicate.IsRemovedTombstone)
                     return ManagedBrowserBindingStatus.DuplicateIdentity;
+                if (duplicate is not null)
+                    await accounts.UpsertAsync(duplicate.WithReleasedIdentity(), token).ConfigureAwait(false);
             }
             else
             {

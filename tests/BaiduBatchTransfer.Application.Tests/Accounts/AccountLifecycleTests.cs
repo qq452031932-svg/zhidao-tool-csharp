@@ -12,10 +12,10 @@ public sealed class AccountLifecycleTests : IDisposable
     private static readonly Guid ProfileToken = Guid.Parse("f545802a-d747-431c-b953-b76e5fe559ca");
 
     [Fact]
-    public async Task AddRejectsDuplicateIdentityIncludingTombstoneHistory()
+    public async Task AddRejectsIdentityThatIsStillAnAccount()
     {
         var repository = new FakeAccountRepository();
-        repository.Seed(Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former Name")));
+        repository.Seed(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former Name"));
         var events = new List<string>();
         var profiles = new FakeProfileStore(events);
         var service = CreateAddService(repository, new FakeProtector(), profiles);
@@ -26,6 +26,43 @@ public sealed class AccountLifecycleTests : IDisposable
         Assert.Equal(ProfileCleanupStatus.Completed, result.ProfileCleanupStatus);
         Assert.Equal(new[] { "close", "delete" }, events);
         Assert.Single(repository.Records);
+    }
+
+    [Fact]
+    public async Task ReloginAfterExitAddsNewAccountAndKeepsOldHistoryRecord()
+    {
+        var repository = new FakeAccountRepository();
+        var former = Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former Name"));
+        repository.Seed(former);
+        var events = new List<string>();
+        var service = CreateAddService(repository, new FakeProtector(), new FakeProfileStore(events));
+        var request = CreateAddRequest();
+
+        var result = await service.AddAsync(request, CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.Added, result.Status);
+        Assert.Equal(2, repository.Records.Count);
+        var added = Assert.Single(repository.Records, x => x.Id == request.AccountId);
+        Assert.Equal("stable-user", added.BaiduUserId);
+        Assert.False(added.IsDeleted);
+        var old = Assert.Single(repository.Records, x => x.Id == former.Id);
+        Assert.Equal($"removed:{former.Id:N}", old.BaiduUserId);
+        Assert.True(old.IsRemovedTombstone);
+        Assert.DoesNotContain("delete", events);
+    }
+
+    [Fact]
+    public async Task FailedReloginAfterExitLeavesOldRecordUntouched()
+    {
+        var repository = new FakeAccountRepository();
+        var former = Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former Name"));
+        repository.Seed(former);
+        var service = CreateAddService(repository, new FakeProtector { FailProtection = true }, new FakeProfileStore([]));
+
+        var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.SessionRejected, result.Status);
+        Assert.Equal(former, Assert.Single(repository.Records));
     }
 
     [Fact]
@@ -112,7 +149,7 @@ public sealed class AccountLifecycleTests : IDisposable
     public async Task FailedAddDoesNotDeleteProfileWhoseOwnershipChangedAfterDatabaseCheck()
     {
         var repository = new FakeAccountRepository();
-        repository.Seed(Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former")));
+        repository.Seed(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former"));
         var request = CreateAddRequest();
         var replacement = AccountRecord.Create(request.AccountId, "replacement-user", "Replacement");
         FakeProfileStore? profiles = null;
@@ -196,7 +233,7 @@ public sealed class AccountLifecycleTests : IDisposable
     public async Task CleanupFailureDoesNotReplaceDuplicateBusinessResult()
     {
         var repository = new FakeAccountRepository();
-        repository.Seed(Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former")));
+        repository.Seed(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former"));
         var profiles = new FakeProfileStore([]) { FailDelete = true };
         var service = CreateAddService(repository, new FakeProtector(), profiles);
 
@@ -210,7 +247,7 @@ public sealed class AccountLifecycleTests : IDisposable
     public async Task CloseFailureStillAttemptsSafeDeleteAndReportsCleanupPending()
     {
         var repository = new FakeAccountRepository();
-        repository.Seed(Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former")));
+        repository.Seed(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former"));
         var events = new List<string>();
         var profiles = new FakeProfileStore(events) { CloseFailure = new IOException("close failed") };
         var service = CreateAddService(repository, new FakeProtector(), profiles);

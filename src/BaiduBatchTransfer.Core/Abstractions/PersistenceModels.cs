@@ -212,6 +212,15 @@ public sealed record AccountRecord(
         new(id, baiduUserId, displayName, null, null, "WebView2", "Active", null, null, 0, 0, 0, true, null,
             DateTimeOffset.Now.ToString("yyyy-MM-dd"), false, null);
 
+    /// <summary>已退出且清理完成的账号：只剩历史记录，不再占用百度身份。</summary>
+    public bool IsRemovedTombstone => IsDeleted && Status == "Deleted";
+
+    /// <summary>
+    /// 同一个百度账号退出后重新登录时，把旧记录的百度身份让出来（BaiduUserId 唯一），
+    /// 新登录按新账号保存；旧任务历史仍挂在旧记录上。
+    /// </summary>
+    public AccountRecord WithReleasedIdentity() => this with { BaiduUserId = $"removed:{Id:N}" };
+
     public override string ToString() =>
         $"AccountRecord {{ Id = {Id}, Identity = [REDACTED], DisplayName = [REDACTED], EncryptedSession = [REDACTED], Status = {Status} }}";
 }

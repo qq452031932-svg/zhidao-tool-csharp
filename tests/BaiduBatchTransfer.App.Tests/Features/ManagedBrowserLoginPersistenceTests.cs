@@ -62,6 +62,33 @@ public sealed class ManagedBrowserLoginPersistenceTests
     }
 
     [Fact]
+    public async Task ReloginAfterExitReleasesTombstoneIdentityInSameTransaction()
+    {
+        var factory = await CreateDatabaseAsync();
+        var units = new SqliteUnitOfWorkFactory(factory);
+        var formerId = Guid.NewGuid();
+        await using (var unit = await units.BeginAsync())
+        {
+            await unit.Accounts.UpsertAsync(AccountRecord.Create(formerId, "123", "已退出账号") with
+            {
+                Status = "Deleted", IsEnabled = false, IsDeleted = true, DeletedAt = DateTimeOffset.UtcNow
+            });
+            await unit.CommitAsync();
+        }
+        var reserved = Guid.NewGuid();
+        var installation = Installation();
+        var result = await new SqliteManagedBrowserStateStore(factory).BindLoginAsync(
+            true, installation, Session(reserved, installation, "123"), null, default);
+        Assert.Equal("Bound", result.ToString());
+        await using var read = await units.BeginAsync();
+        Assert.Equal(reserved, (await read.Accounts.GetByBaiduUserIdAsync("123"))!.Id);
+        var former = (await read.Accounts.GetByIdAsync(formerId))!;
+        Assert.Equal($"removed:{formerId:N}", former.BaiduUserId);
+        Assert.True(former.IsRemovedTombstone);
+        await read.RollbackAsync();
+    }
+
+    [Fact]
     public async Task DuplicateIdentityCannotLeaveAnAccountOrSessionBehind()
     {
         var factory = await CreateDatabaseAsync();
