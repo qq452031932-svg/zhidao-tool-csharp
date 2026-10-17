@@ -15,6 +15,22 @@ public sealed class EndBatchService(IBatchRunControlStore store, TimeProvider? t
         return store.TryEndBatchAsync(batchJobId, timeProvider.GetUtcNow(), cancellationToken);
     }
 
+    public Task<StuckBatchSnapshot?> GetStuckSnapshotAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch ID is required.", nameof(batchJobId));
+        return store.GetStuckSnapshotAsync(batchJobId, timeProvider.GetUtcNow(), cancellationToken);
+    }
+
+    public Task<StuckBatchSnapshot?> GetActiveStuckSnapshotAsync(CancellationToken cancellationToken = default) =>
+        store.GetActiveStuckSnapshotAsync(timeProvider.GetUtcNow(), cancellationToken);
+
+    /// <summary>用户点「放弃收尾」：不等账号重新登录，按「结果未确认」结束剩下的，让后面的批次开始。</summary>
+    public Task<AbandonBatchResult> AbandonAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch ID is required.", nameof(batchJobId));
+        return store.TryAbandonUnfinishedAsync(batchJobId, timeProvider.GetUtcNow(), onlyIfBlocked: false, cancellationToken);
+    }
+
     public async Task<int> CountUnfinishedAsync(CancellationToken cancellationToken = default) =>
         (await store.ListUnfinishedBatchIdsAsync(cancellationToken).ConfigureAwait(false)).Count;
 

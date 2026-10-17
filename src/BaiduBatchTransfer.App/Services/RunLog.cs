@@ -25,8 +25,8 @@ public sealed class FileRunLog : IRunLog
     private const long DefaultMaximumBytes = 5 * 1024 * 1024;
 
     private readonly object sync = new();
-    private readonly string path;
-    private readonly string previousPath;
+    private string path;
+    private string previousPath;
     private readonly TimeProvider timeProvider;
     private readonly long maximumBytes;
     private string? lastLine;
@@ -42,7 +42,23 @@ public sealed class FileRunLog : IRunLog
         this.maximumBytes = maximumBytes;
     }
 
-    public string FilePath => path;
+    public string FilePath
+    {
+        get { lock (sync) return path; }
+    }
+
+    /// <summary>用户另选了保存位置：之后的日志写到新文件夹，已经写过的留在原处。</summary>
+    public void MoveTo(string directory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(directory);
+        var fullDirectory = Path.GetFullPath(directory);
+        lock (sync)
+        {
+            path = Path.Combine(fullDirectory, FileName);
+            previousPath = Path.Combine(fullDirectory, PreviousFileName);
+            lastLine = null;
+        }
+    }
 
     public void Write(string source, string? message)
     {

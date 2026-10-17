@@ -16,7 +16,10 @@ public static class BaiduLoginUiText
     public const string Duplicate = "这个百度账号已经添加，无需重复登录。";
     public const string Rejected = "登录状态未通过验证，请重新扫码后再试。";
     public const string ProfileFailed = "独立账号目录无法安全创建，请关闭窗口后重试。";
-    public const string InitializationFailed = "登录页面无法打开，请安装或更新微软官方网页运行组件后重试。";
+    public const string RuntimeStartFailed =
+        "登录页面组件启动失败，具体原因已写入运行日志。可以重新安装微软网页运行组件，或暂时关闭安全软件后关闭窗口重试。";
+    public const string NavigationFailed =
+        "百度网盘登录页打不开（{0}）。请检查网络、代理或安全软件，能用浏览器打开百度网盘网页后，关闭窗口重试。";
     public const string CaptureFailed = "登录状态读取失败，窗口会继续等待，请重新扫码确认。";
     public const string LoginButtonMissing = "等待百度网盘首页加载超时，未能自动打开登录框。请在上方页面中手动点击「去登录」，或关闭窗口后重试。";
     public const string CleanupPending = "账号没有保存，本机登录目录仍待清理；下次启动会继续处理。";
@@ -25,11 +28,21 @@ public static class BaiduLoginUiText
 public sealed class BaiduLoginViewModel : ObservableObject
 {
     private string status = BaiduLoginUiText.Preparing;
+    private bool showRuntimeDownload;
 
     public string WindowTitle => BaiduLoginUiText.WindowTitle;
     public string Heading => BaiduLoginUiText.Heading;
     public string Instructions => BaiduLoginUiText.Instructions;
     public string Status { get => status; private set => SetProperty(ref status, value); }
+
+    /// <summary>没装 WebView2 时显示「下载 WebView2」按钮。</summary>
+    public bool ShowRuntimeDownload { get => showRuntimeDownload; private set => SetProperty(ref showRuntimeDownload, value); }
+
+    public void ReportRuntimeMissing()
+    {
+        Status = Services.WebView2RuntimeText.Missing;
+        ShowRuntimeDownload = true;
+    }
 
     public void ReportWaiting() => Status = BaiduLoginUiText.Waiting;
     public void ReportSettling() => Status = BaiduLoginUiText.Settling;

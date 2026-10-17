@@ -238,13 +238,20 @@ public sealed class RunLogTests : IDisposable
     }
 
     [Fact]
-    public void HostWritesTheRunLogUnderTheDataDirectory()
+    public void HostWritesTheRunLogUnderTheSoftwareDirectory()
     {
+        // 用户 10-16：日志放在软件目录下（原来在数据目录，路径太长找不到）；写不进去才退回数据目录。
         using var host = AppBootstrap.CreateHost(directory);
         var log = Assert.IsType<FileRunLog>(host.Services.GetRequiredService<IRunLog>());
+        var location = host.Services.GetRequiredService<RunLogLocation>();
 
-        Assert.Equal(LogPath, log.FilePath);
-        Assert.False(Directory.Exists(Path.Combine(directory, "logs")), "只注册不写入时不该动磁盘");
+        var expected = location.IsFallback
+            ? Path.Combine(directory, "logs")
+            : Path.Combine(RunLogLocation.ResolveSoftwareDirectory(AppContext.BaseDirectory), "logs");
+        Assert.Equal(Path.Combine(expected, FileRunLog.FileName), log.FilePath);
+        Assert.Same(log, host.Services.GetRequiredService<FileRunLog>());
+        if (!location.IsFallback)
+            Assert.False(Directory.Exists(Path.Combine(directory, "logs")), "能写软件目录时不该再往数据目录写");
     }
 
     private static async Task WaitUntil(Func<bool> condition)

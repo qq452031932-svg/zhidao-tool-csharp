@@ -9,7 +9,8 @@ public sealed class BaiduLoginWindowPresenter(
     LoginProfileBootstrapper profileBootstrapper,
     BaiduLoginSessionRegistrar sessionRegistrar,
     WebView2ProfileCloser profileCloser,
-    WebViewCookieSessionBridge cookieBridge) : IBaiduLoginWindowPresenter
+    WebViewCookieSessionBridge cookieBridge,
+    IRunLog? runLog = null) : IBaiduLoginWindowPresenter
 {
     public async Task ShowAsync(BaiduLoginWindowRequest request, CancellationToken cancellationToken)
     {
@@ -28,7 +29,8 @@ public sealed class BaiduLoginWindowPresenter(
                 profileBootstrapper,
                 sessionRegistrar,
                 profileCloser,
-                cookieBridge)
+                cookieBridge,
+                runLog)
             {
                 Owner = application.MainWindow,
             };

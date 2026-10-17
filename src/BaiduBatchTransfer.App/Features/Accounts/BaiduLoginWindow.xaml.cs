@@ -34,6 +34,9 @@ public partial class BaiduLoginWindow : Window
     private bool pollInProgress;
     private bool cleanupInProgress;
     private bool allowClose;
+    private readonly IRunLog? runLog;
+    private string? blockedNavigationHost;
+    private const string RunLogSource = "账号登录";
 
     public BaiduLoginWindow(
         Guid accountId,
@@ -42,8 +45,10 @@ public partial class BaiduLoginWindow : Window
         LoginProfileBootstrapper profileBootstrapper,
         BaiduLoginSessionRegistrar sessionRegistrar,
         WebView2ProfileCloser profileCloser,
-        WebViewCookieSessionBridge cookieBridge)
+        WebViewCookieSessionBridge cookieBridge,
+        IRunLog? runLog = null)
     {
+        this.runLog = runLog;
         if (accountId == Guid.Empty) throw new ArgumentException("An account ID is required.", nameof(accountId));
         if (ownershipToken == Guid.Empty) throw new ArgumentException("An ownership token is required.", nameof(ownershipToken));
         this.accountId = accountId;
@@ -112,13 +117,41 @@ public partial class BaiduLoginWindow : Window
             // The owned attempt profile is cleaned only after the window has actually closed,
             // so WebView2 has released its remaining file handles.
         }
-        catch (Exception)
+        catch (WebView2RuntimeNotFoundException)
         {
-            viewModel.ReportFailure(profilePrepared
-                ? BaiduLoginUiText.InitializationFailed
-                : BaiduLoginUiText.ProfileFailed);
+            ReportRuntimeMissing();
+        }
+        catch (Exception error)
+        {
+            if (!profilePrepared)
+            {
+                runLog?.Write(RunLogSource, $"【错误】登录窗口打不开：独立登录目录创建失败（{DescribeError(error)}）。");
+                viewModel.ReportFailure(BaiduLoginUiText.ProfileFailed);
+                return;
+            }
+            // 有的电脑没装组件时抛的不是 WebView2RuntimeNotFoundException，再确认一次。
+            if (new WebView2RuntimeProbe().Check().IsMissing)
+            {
+                ReportRuntimeMissing();
+                return;
+            }
+            var detail = DescribeError(error);
+            runLog?.Write(RunLogSource, $"【错误】登录窗口的网页组件启动失败（{detail}，组件版本 {RuntimeVersion()}）。");
+            viewModel.ReportFailure(BaiduLoginUiText.RuntimeStartFailed);
         }
     }
+
+    private void ReportRuntimeMissing()
+    {
+        runLog?.Write(RunLogSource,
+            "【错误】登录窗口打不开：这台电脑没有安装 WebView2 运行组件（Microsoft Edge WebView2 Runtime）。");
+        viewModel.ReportRuntimeMissing();
+    }
+
+    // 只记异常类型和错误码，不记消息原文（可能带本机路径）。
+    private static string DescribeError(Exception error) => $"{error.GetType().Name}，0x{error.HResult:X8}";
+
+    private static string RuntimeVersion() => new WebView2RuntimeProbe().Check().Version ?? "未知";
 
     private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
@@ -126,13 +159,50 @@ public partial class BaiduLoginWindow : Window
         var decision = BaiduNavigationPolicy.Evaluate(destination);
         if (decision.IsAllowed) return;
         e.Cancel = true;
+        // 只记域名：被运营商、公司网络认证页或百度验证页带走时，一看就知道是哪儿。
+        blockedNavigationHost = destination?.IdnHost is { Length: > 0 } host ? host : "无法识别的地址";
+        runLog?.Write(RunLogSource, $"【错误】登录页面被跳转到非百度网盘页面，已阻止（{blockedNavigationHost}）。");
         viewModel.ReportFailure(decision.SafeMessage ?? "已阻止不安全的页面跳转。");
     }
 
     private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
     {
-        if (!e.IsSuccess)
-            viewModel.ReportFailure(BaiduLoginUiText.InitializationFailed);
+        if (e.IsSuccess)
+        {
+            blockedNavigationHost = null;
+            return;
+        }
+        // 被中止的加载不是故障：我们拦下的跳转、重新扫码时的 Stop、页面自己又跳到下一页，都会这样结束。
+        // 拦下跳转时保留「已阻止」的说明，不再盖成别的提示（原来一律盖成「请安装组件」）。
+        if (blockedNavigationHost is not null || e.WebErrorStatus == CoreWebView2WebErrorStatus.OperationCanceled)
+        {
+            blockedNavigationHost = null;
+            return;
+        }
+        var reason = DescribeNavigationError(e.WebErrorStatus);
+        runLog?.Write(RunLogSource,
+            $"【错误】百度网盘登录页打不开：{reason}（{e.WebErrorStatus}，HTTP {e.HttpStatusCode}，组件版本 {RuntimeVersion()}）。");
+        viewModel.ReportFailure(string.Format(BaiduLoginUiText.NavigationFailed, reason));
+    }
+
+    internal static string DescribeNavigationError(CoreWebView2WebErrorStatus status) => status switch
+    {
+        CoreWebView2WebErrorStatus.HostNameNotResolved => "域名解析失败",
+        CoreWebView2WebErrorStatus.Timeout => "连接超时",
+        CoreWebView2WebErrorStatus.Disconnected or CoreWebView2WebErrorStatus.ConnectionAborted or
+            CoreWebView2WebErrorStatus.ConnectionReset => "网络连接中断",
+        CoreWebView2WebErrorStatus.CannotConnect or CoreWebView2WebErrorStatus.ServerUnreachable => "连不上百度服务器",
+        CoreWebView2WebErrorStatus.CertificateCommonNameIsIncorrect or CoreWebView2WebErrorStatus.CertificateExpired or
+            CoreWebView2WebErrorStatus.ClientCertificateContainsErrors or CoreWebView2WebErrorStatus.CertificateRevoked or
+            CoreWebView2WebErrorStatus.CertificateIsInvalid => "安全证书有问题，可能被代理或安全软件拦截",
+        CoreWebView2WebErrorStatus.ErrorHttpInvalidServerResponse => "服务器返回异常",
+        _ => "网络错误",
+    };
+
+    private void OnDownloadWebView2Click(object sender, RoutedEventArgs e)
+    {
+        if (!WebView2RuntimeText.TryOpenDownloadPage())
+            viewModel.ReportFailure($"无法自动打开浏览器，请手动访问：{WebView2RuntimeText.DownloadPage}");
     }
 
     private async void OnPollTimer(object? sender, EventArgs e)

@@ -301,6 +301,16 @@
                                         Margin="0,0,10,0" Padding="12,4"
                                         ToolTip="这一批不要了（例如导入错了）：没开始的记录标为已取消，已转存成功的不受影响。停止后不能再继续，可以用「清空转存历史」删除。"
                                         ToolTipService.ShowOnDisabled="True" />
+                                <!-- 只在批次收不了尾时出现（账号登录失效、结果核对不了，或停止后还在等收尾）：
+                                     不等了，剩下的按「结果未确认」结束，后面排队的批次马上开始。 -->
+                                <Button x:Name="AbandonTransferBatchButton"
+                                        Content="放弃收尾"
+                                        Command="{Binding RunPanel.AbandonBatchCommand}"
+                                        Visibility="{Binding RunPanel.ShowAbandonBatch, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                        AutomationProperties.Name="放弃收尾"
+                                        Margin="0,0,10,0" Padding="12,4"
+                                        ToolTip="这一批剩下的几条在等账号重新登录或核对结果，走不下去。放弃后：没开始的取消，已提交过的不再核对、记为失败（结果未确认，请到网盘核对），这一批随即结束，后面排队的批次马上开始。"
+                                        ToolTipService.ShowOnDisabled="True" />
                                 <Button x:Name="RetryFailedTransferButton"
                                         Content="重试所选失败项"
                                         Command="{Binding RunPanel.RetryFailedTransferCommand}"

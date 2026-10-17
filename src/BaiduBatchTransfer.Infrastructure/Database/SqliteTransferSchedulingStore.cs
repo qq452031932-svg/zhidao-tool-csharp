@@ -230,7 +230,21 @@ public sealed class SqliteTransferSchedulingStore :
         // 停住它们就永远收不了尾（用户 10-14 实测：结束后一直清不掉）。改为把还能领取的
         // 全部取消、把成功数配额收口，批次照常运行，只剩收尾的活。下面整个事务里完成，
         // 调度器领取操作也走同样的立即事务，二者不会交错。
+        var cancelled = await CancelUntouchedOperationsAsync(connection, transaction, batchJobId, endedAt, cancellationToken)
+            .ConfigureAwait(false);
+        var inFlight = await SettleEndedBatchAsync(connection, transaction, batchJobId, status, endedAt, cancellationToken)
+            .ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new(inFlight == 0 ? EndBatchDisposition.Ended : EndBatchDisposition.Stopping, cancelled, inFlight);
+    }
 
+    private async Task<int> CancelUntouchedOperationsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchJobId,
+        DateTimeOffset endedAt,
+        CancellationToken cancellationToken)
+    {
         // 只取消可以证明从未向网盘提交过的操作：与单条取消（CancelBeforeSubmissionAsync）同样的证据判断。
         // 排队中的（Waiting）不占名额；因账号需要处理而停住的（Paused）还占着一个名额，取消时要还回去。
         const string untouched = "SubmitState IN ('NotPrepared','PreparingToSubmit') AND DailyCountedAt IS NULL AND ConfirmationDescriptorJson IS NULL AND SubmitStartedAt IS NULL AND AdapterRequestId IS NULL AND RemoteItemIdsJson IS NULL";
@@ -335,7 +349,20 @@ public sealed class SqliteTransferSchedulingStore :
                   AND operation.Id IN (SELECT Id FROM temp.EndBatchOperations)
                   AND operation.SubmitState='NotPrepared');
             """, cancellationToken, ("$now", Time(endedAt))).ConfigureAwait(false);
+        await ExecuteAsync(connection, transaction, "DROP TABLE IF EXISTS temp.EndBatchOperations;", cancellationToken)
+            .ConfigureAwait(false);
+        return cancelled;
+    }
 
+    /// <summary>没有在进行的了就结束批次；还有的话，停着的批次重新排队，让它们能被核对、收尾。</summary>
+    private async Task<int> SettleEndedBatchAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchJobId,
+        string status,
+        DateTimeOffset endedAt,
+        CancellationToken cancellationToken)
+    {
         var inFlight = checked((int)await ScalarLongAsync(connection, transaction, """
             SELECT (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND Status NOT IN ('Succeeded','Failed','Cancelled'))
                  + (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND Status NOT IN ('Succeeded','ReusedExisting','Failed','Cancelled'));
@@ -357,11 +384,253 @@ public sealed class SqliteTransferSchedulingStore :
             RequireOne(await requeue.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
                 "The batch changed while it was being ended.");
         }
-        await ExecuteAsync(connection, transaction, "DROP TABLE IF EXISTS temp.EndBatchOperations;", cancellationToken)
-            .ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return new(inFlight == 0 ? EndBatchDisposition.Ended : EndBatchDisposition.Stopping, cancelled, inFlight);
+        return inFlight;
     }
+
+    // 账号已失效、停用或删除：它名下的活谁也领不走，只能等用户处理。
+    private const string UnusableAccountPredicate =
+        "NOT EXISTS(SELECT 1 FROM Accounts account WHERE account.Id={0} AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0)";
+    private const string UnfinishedTransferStatuses = "('Waiting','Reserved','Preparing','Submitting','ResultPending','Paused')";
+    // 等转存完成的分享（WaitingTransfer）跟着转存走：转存失败或取消时由触发器删掉，不单独算。
+    private const string UnfinishedShareStatuses = "('WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused')";
+    private const string LiveLeasePredicate =
+        "Status IN ('Reserved','Preparing','Submitting') AND LeaseExpiresAt IS NOT NULL AND LeaseExpiresAt>$now";
+
+    public async Task<StuckBatchSnapshot?> GetStuckSnapshotAsync(
+        Guid batchJobId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch ID is required.", nameof(batchJobId));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        var status = await ScalarStringOrNullAsync(connection, transaction,
+            "SELECT Status FROM BatchJobs WHERE Id=$batch AND AcceptanceOnly=0;", cancellationToken, ("$batch", Id(batchJobId)))
+            .ConfigureAwait(false);
+        var snapshot = string.IsNullOrEmpty(status) || IsTerminalBatchStatus(status)
+            ? null
+            : await ReadStuckSnapshotAsync(connection, transaction, batchJobId, now, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return snapshot;
+    }
+
+    public async Task<StuckBatchSnapshot?> GetActiveStuckSnapshotAsync(
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        var directPredicate = directBackgroundOnly ? " AND DirectBackground=1" : string.Empty;
+        var idText = await ScalarStringOrNullAsync(connection, transaction,
+            $"SELECT Id FROM BatchJobs WHERE Status='Active' AND AcceptanceOnly=0{directPredicate} ORDER BY QueueOrder,Id LIMIT 1;",
+            cancellationToken).ConfigureAwait(false);
+        var snapshot = string.IsNullOrEmpty(idText)
+            ? null
+            : await ReadStuckSnapshotAsync(connection, transaction, Guid.Parse(idText), now, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return snapshot;
+    }
+
+    private async Task<StuckBatchSnapshot> ReadStuckSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchJobId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var transferUnusable = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            UnusableAccountPredicate, "TransferOperations.AssignedAccountId");
+        var shareUnusable = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            UnusableAccountPredicate, "ShareOperations.AccountId");
+        int unfinished, stuck, running;
+        await using (var counts = Command(connection, transaction, $"""
+            SELECT
+              (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND Status IN {UnfinishedTransferStatuses})
+              + (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND Status IN {UnfinishedShareStatuses}),
+              (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND Status IN {UnfinishedTransferStatuses}
+                AND NOT ({LiveLeasePredicate}) AND (Status IN ('ResultPending','Paused') OR {transferUnusable}))
+              + (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND Status IN {UnfinishedShareStatuses}
+                AND NOT ({LiveLeasePredicate}) AND (Status IN ('ResultPending','Paused') OR {shareUnusable})),
+              (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND {LiveLeasePredicate})
+              + (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND {LiveLeasePredicate});
+            """))
+        {
+            Add(counts, "$batch", Id(batchJobId)); Add(counts, "$now", Time(now));
+            await using var reader = await counts.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                throw new InvalidOperationException("The batch counts could not be read.");
+            unfinished = checked((int)reader.GetInt64(0));
+            stuck = checked((int)reader.GetInt64(1));
+            running = checked((int)reader.GetInt64(2));
+        }
+
+        var names = new List<string>();
+        await using (var accounts = Command(connection, transaction, $"""
+            SELECT DisplayName FROM Accounts account
+            WHERE NOT (account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0)
+              AND (EXISTS(SELECT 1 FROM TransferOperations WHERE BatchJobId=$batch AND AssignedAccountId=account.Id
+                    AND Status IN {UnfinishedTransferStatuses})
+                OR EXISTS(SELECT 1 FROM ShareOperations WHERE BatchJobId=$batch AND AccountId=account.Id
+                    AND Status IN {UnfinishedShareStatuses}))
+            ORDER BY account.SortOrder,account.DisplayName LIMIT 3;
+            """))
+        {
+            Add(accounts, "$batch", Id(batchJobId));
+            await using var reader = await accounts.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) names.Add(reader.GetString(0));
+        }
+
+        var wasStopped = await ScalarLongAsync(connection, transaction,
+            "SELECT EXISTS(SELECT 1 FROM TransferOperations WHERE BatchJobId=$batch AND Status='Cancelled' AND OutcomeKind='Cancelled');",
+            cancellationToken, ("$batch", Id(batchJobId))).ConfigureAwait(false) != 0;
+        var directPredicate = directBackgroundOnly ? " AND DirectBackground=1" : string.Empty;
+        var queuedBehind = checked((int)await ScalarLongAsync(connection, transaction,
+            $"SELECT COUNT(*) FROM BatchJobs WHERE Status='Queued' AND AcceptanceOnly=0 AND Id<>$batch{directPredicate};",
+            cancellationToken, ("$batch", Id(batchJobId))).ConfigureAwait(false));
+        return new(batchJobId, unfinished, stuck, running, wasStopped, names, queuedBehind);
+    }
+
+    public async Task<AbandonBatchResult> TryAbandonUnfinishedAsync(
+        Guid batchJobId,
+        DateTimeOffset now,
+        bool onlyIfBlocked,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch ID is required.", nameof(batchJobId));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        try
+        {
+            var status = await ScalarStringOrNullAsync(connection, transaction,
+                "SELECT Status FROM BatchJobs WHERE Id=$batch AND AcceptanceOnly=0;", cancellationToken, ("$batch", Id(batchJobId)))
+                .ConfigureAwait(false);
+            if (string.IsNullOrEmpty(status) || IsTerminalBatchStatus(status))
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new(string.IsNullOrEmpty(status) ? AbandonBatchDisposition.NotFound : AbandonBatchDisposition.AlreadyEnded,
+                    0, 0, 0);
+            }
+            // 自动处理：查和改在同一个立即事务里，用户刚好重新登录了账号就不动。
+            if (onlyIfBlocked && !(await ReadStuckSnapshotAsync(connection, transaction, batchJobId, now, cancellationToken)
+                    .ConfigureAwait(false)).IsBlocked)
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new(AbandonBatchDisposition.NotBlocked, 0, 0, 0);
+            }
+
+            var cancelled = await CancelUntouchedOperationsAsync(connection, transaction, batchJobId, now, cancellationToken)
+                .ConfigureAwait(false);
+            var abandoned = await AbandonTransfersAsync(connection, transaction, batchJobId, now, cancellationToken)
+                .ConfigureAwait(false);
+            abandoned += await AbandonSharesAsync(connection, transaction, batchJobId, now, cancellationToken)
+                .ConfigureAwait(false);
+            var inFlight = await SettleEndedBatchAsync(connection, transaction, batchJobId, status, now, cancellationToken)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new(inFlight == 0 ? AbandonBatchDisposition.Ended : AbandonBatchDisposition.Stopping,
+                cancelled, abandoned, inFlight);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    // 已经碰过网盘的（或账号不能用而停住的）转存：不再核对，记为失败。可能其实已经转存成功，
+    // 所以说明里让用户去网盘核对；有提交痕迹的也不会被「重试所选失败项」重新提交。
+    private async Task<int> AbandonTransfersAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchJobId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        await ExecuteAsync(connection, transaction, $"""
+            DROP TABLE IF EXISTS temp.AbandonOperations;
+            CREATE TEMP TABLE AbandonOperations AS
+              SELECT Id,ResourceItemId,AssignedAccountId,TargetSlotState FROM TransferOperations
+              WHERE BatchJobId=$batch AND Status IN {UnfinishedTransferStatuses} AND NOT ({LiveLeasePredicate});
+            """, cancellationToken, ("$batch", Id(batchJobId)), ("$now", Time(now))).ConfigureAwait(false);
+        var count = checked((int)await ScalarLongAsync(connection, transaction,
+            "SELECT COUNT(*) FROM temp.AbandonOperations;", cancellationToken).ConfigureAwait(false));
+        if (count > 0)
+        {
+            var perAccount = new List<(Guid AccountId, int Reserved, int Failed)>();
+            await using (var read = Command(connection, transaction,
+                "SELECT AssignedAccountId,SUM(CASE WHEN TargetSlotState='Reserved' THEN 1 ELSE 0 END),COUNT(*) FROM temp.AbandonOperations GROUP BY AssignedAccountId;"))
+            await using (var reader = await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    perAccount.Add((Guid.Parse(reader.GetString(0)), reader.GetInt32(1), reader.GetInt32(2)));
+
+            await using (var operations = Command(connection, transaction, """
+                UPDATE TransferOperations
+                SET Status='Failed',OutcomeKind='Failed',
+                    SubmitState=CASE WHEN SubmitState IN ('Submitting','PendingConfirmation') THEN 'ResultReceived' ELSE SubmitState END,
+                    TargetSlotState=CASE WHEN TargetSlotState='Reserved' THEN 'Released' ELSE TargetSlotState END,
+                    TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode='ResultUnconfirmed',
+                    LastErrorMessage=CASE
+                      WHEN ConfirmationDescriptorJson IS NOT NULL OR SubmitStartedAt IS NOT NULL OR AdapterRequestId IS NOT NULL
+                        OR RemoteItemIdsJson IS NOT NULL OR DailyCountedAt IS NOT NULL
+                      THEN '已提交过，但账号无法核对结果，已放弃核对。可能已经转存成功，请到网盘核对。'
+                      ELSE '账号登录失效或不可用，未转存，已放弃。' END,
+                    UpdatedAt=$now
+                WHERE Id IN (SELECT Id FROM temp.AbandonOperations);
+                """))
+            {
+                Add(operations, "$now", Time(now));
+                if (await operations.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != count)
+                    throw new InvalidOperationException("Batch operations changed while the batch was being abandoned.");
+            }
+            foreach (var account in perAccount)
+            {
+                await using var release = Command(connection, transaction,
+                    "UPDATE AccountAllocations SET ReservedSlotCount=MAX(ReservedSlotCount-$reserved,0),FailedItemCount=FailedItemCount+$failed WHERE BatchJobId=$batch AND AccountId=$account;");
+                Add(release, "$reserved", account.Reserved); Add(release, "$failed", account.Failed);
+                Add(release, "$batch", Id(batchJobId)); Add(release, "$account", Id(account.AccountId));
+                await release.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            await using (var resources = Command(connection, transaction, """
+                UPDATE ResourceItems
+                SET CandidateStatus=CASE WHEN CandidateStatus='Reserved' THEN 'Expanded' ELSE CandidateStatus END,
+                    ReservedAccountId=NULL,ReservationExpiresAt=NULL,UpdatedAt=$now
+                WHERE Id IN (SELECT ResourceItemId FROM temp.AbandonOperations)
+                  AND NOT EXISTS(SELECT 1 FROM TransferOperations live WHERE live.ResourceItemId=ResourceItems.Id
+                    AND live.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused'));
+                """))
+            {
+                Add(resources, "$now", Time(now));
+                await resources.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+        await ExecuteAsync(connection, transaction, "DROP TABLE IF EXISTS temp.AbandonOperations;", cancellationToken)
+            .ConfigureAwait(false);
+        return count;
+    }
+
+    private async Task<int> AbandonSharesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchJobId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        await using var shares = Command(connection, transaction, $"""
+            UPDATE ShareOperations
+            SET Status='Failed',LeaseExpiresAt=NULL,NextReconcileAt=NULL,LastErrorCode='ResultUnconfirmed',
+                LastErrorMessage=CASE
+                  WHEN RequestDescriptorJson IS NOT NULL OR AdapterRequestId IS NOT NULL OR SubmitStartedAt IS NOT NULL
+                  THEN '已提交过分享，但账号无法核对结果，已放弃核对。可能已经创建了分享，请到网盘「我的分享」核对。'
+                  ELSE '账号登录失效或不可用，未分享，已放弃。' END,
+                UpdatedAt=$now
+            WHERE BatchJobId=$batch AND Status IN {UnfinishedShareStatuses} AND NOT ({LiveLeasePredicate});
+            """);
+        Add(shares, "$batch", Id(batchJobId)); Add(shares, "$now", Time(now));
+        return await shares.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static bool IsTerminalBatchStatus(string status) =>
+        status is "Completed" or "CompletedWithShortfall" or "Cancelled";
 
     public async Task<RetryFailedTransferDisposition> TryRetryFailedTransferAsync(
         Guid operationId,

@@ -763,6 +763,140 @@ public sealed class WorkspaceRunPanelViewModelTests
     }
 
     [Fact]
+    public async Task AStuckBatchExplainsWhatItWaitsForAndCanBeAbandonedAfterConfirmation()
+    {
+        // 用户 10-15 晚：停止后剩 2 条在等失效账号重新登录，后面的批次全都排队不动。
+        var batch = Guid.NewGuid();
+        var store = new StuckRunControlStore
+        {
+            Snapshot = new(batch, 2, 2, 0, true, ["小号A"], 4),
+            AbandonResult = new(AbandonBatchDisposition.Ended, 0, 2, 0),
+        };
+        var dialog = new ConfirmDialog();
+        var delay = new OneRefreshDelay();
+        using var vm = new WorkspaceRunPanelViewModel(
+            CreateResults(new FakeResultsWorkflow()), new PauseBatchService(store), new ResumeBatchService(store),
+            new RetryFailedTransferService(store),
+            historySource: new MutableHistorySource(new(batch, "卡住的批次", "Active")),
+            automaticRefreshDelay: delay, endService: new EndBatchService(store), dialogService: dialog);
+        var messages = new List<string>();
+        vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(vm.StatusMessage)) messages.Add(vm.StatusMessage);
+        };
+        Assert.False(vm.ShowAbandonBatch);
+        vm.PresentBatch(batch, batchStatus: "Active");
+
+        await WaitUntilAsync(() => vm.ShowAbandonBatch);
+
+        Assert.True(vm.AbandonBatchCommand.CanExecute(null));
+        var hint = Assert.Single(messages, message => message.Contains("走不下去"));
+        Assert.Contains("「小号A」", hint);
+        Assert.Contains("后面 4 个批次在排队", hint);
+        Assert.Contains("放弃收尾", hint);
+        Assert.Contains("10 分钟", hint);
+        var terminals = new List<WorkspaceBatchTerminalEvent>();
+        vm.BatchTerminal += (_, e) => terminals.Add(e);
+
+        await vm.AbandonBatchCommand.ExecuteAsync(null);
+
+        var question = Assert.Single(dialog.Messages);
+        Assert.Contains("还有 2 条", question);
+        Assert.Contains("结果未确认", question);
+        Assert.Contains("重新登录", question);
+        Assert.Equal([batch], store.AbandonedBatches);
+        Assert.Equal("Cancelled", vm.SelectedBatch!.BatchStatus);
+        Assert.Contains("已放弃收尾", vm.StatusMessage);
+        Assert.Contains("请到网盘核对", vm.StatusMessage);
+        Assert.Equal("Cancelled", Assert.Single(terminals).BatchStatus);
+        Assert.False(vm.ShowAbandonBatch);
+    }
+
+    [Fact]
+    public async Task DecliningToAbandonChangesNothing()
+    {
+        var batch = Guid.NewGuid();
+        var store = new StuckRunControlStore { Snapshot = new(batch, 1, 1, 0, true, [], 0) };
+        var delay = new OneRefreshDelay();
+        using var vm = new WorkspaceRunPanelViewModel(
+            CreateResults(new FakeResultsWorkflow()), new PauseBatchService(store), new ResumeBatchService(store),
+            new RetryFailedTransferService(store),
+            historySource: new MutableHistorySource(new(batch, "卡住的批次", "Active")),
+            automaticRefreshDelay: delay, endService: new EndBatchService(store),
+            dialogService: new ConfirmDialog { Answer = false });
+        vm.PresentBatch(batch, batchStatus: "Active");
+        await WaitUntilAsync(() => vm.ShowAbandonBatch);
+
+        await vm.AbandonBatchCommand.ExecuteAsync(null);
+
+        Assert.Empty(store.AbandonedBatches);
+        Assert.Equal("Active", vm.SelectedBatch!.BatchStatus);
+    }
+
+    [Fact]
+    public async Task AQueuedBatchSaysWhichStuckBatchIsHoldingItUp()
+    {
+        var queued = Guid.NewGuid();
+        var stuck = Guid.NewGuid();
+        var store = new StuckRunControlStore { Snapshot = new(stuck, 1, 1, 0, false, ["小号A"], 1) };
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(
+            CreateResults(new FakeResultsWorkflow()), new PauseBatchService(store), new ResumeBatchService(store),
+            new RetryFailedTransferService(store),
+            historySource: new MutableHistorySource(new(queued, "新建的批次", "Queued")),
+            automaticRefreshDelay: delay, endService: new EndBatchService(store), dialogService: new ConfirmDialog());
+        vm.PresentBatch(queued, batchStatus: "Queued");
+
+        delay.Release();
+        await WaitUntilAsync(() => vm.StatusMessage.Contains("前面正在运行的批次卡住了"));
+
+        Assert.Contains("「小号A」", vm.StatusMessage);
+        Assert.Contains("30 分钟", vm.StatusMessage);
+        // 放弃收尾要在卡住的那一批上点，排队的这一批不显示。
+        Assert.False(vm.ShowAbandonBatch);
+    }
+
+    [Fact]
+    public async Task AStoreThatCannotInspectBatchesDoesNotBreakTheAutomaticRefresh()
+    {
+        var batch = Guid.NewGuid();
+        var store = new FakeRunControlStore();
+        var delay = new ControlledDelay();
+        var history = new MutableHistorySource(new(batch, "运行批次", "Active"));
+        using var vm = new WorkspaceRunPanelViewModel(
+            CreateResults(new FakeResultsWorkflow()), new PauseBatchService(store), new ResumeBatchService(store),
+            new RetryFailedTransferService(store), historySource: history,
+            automaticRefreshDelay: delay, endService: new EndBatchService(store), dialogService: new ConfirmDialog());
+        vm.PresentBatch(batch, batchStatus: "Active");
+
+        delay.Release();
+        await history.SecondRead.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.DoesNotContain("自动刷新失败", vm.StatusMessage);
+        Assert.False(vm.ShowAbandonBatch);
+    }
+
+    private sealed class StuckRunControlStore : FakeRunControlStore, IBatchRunControlStore
+    {
+        public StuckBatchSnapshot? Snapshot { get; set; }
+        public AbandonBatchResult AbandonResult { get; init; } = new(AbandonBatchDisposition.Ended, 0, 1, 0);
+        public List<Guid> AbandonedBatches { get; } = [];
+
+        public Task<StuckBatchSnapshot?> GetStuckSnapshotAsync(Guid batchJobId, DateTimeOffset now, CancellationToken cancellationToken = default) =>
+            Task.FromResult(Snapshot is { } snapshot && snapshot.BatchJobId == batchJobId && AbandonedBatches.Count == 0 ? snapshot : null);
+
+        public Task<StuckBatchSnapshot?> GetActiveStuckSnapshotAsync(DateTimeOffset now, CancellationToken cancellationToken = default) =>
+            Task.FromResult(AbandonedBatches.Count == 0 ? Snapshot : null);
+
+        public Task<AbandonBatchResult> TryAbandonUnfinishedAsync(
+            Guid batchJobId, DateTimeOffset now, bool onlyIfBlocked, CancellationToken cancellationToken = default)
+        {
+            AbandonedBatches.Add(batchJobId);
+            return Task.FromResult(AbandonResult);
+        }
+    }
+
+    [Fact]
     public async Task PausingWhileWaitingToEndStopsTheAutomaticEnd()
     {
         var store = new FakeRunControlStore();
@@ -840,11 +974,17 @@ public sealed class WorkspaceRunPanelViewModelTests
             Assert.Equal("True", (string?)button.Attribute("ToolTipService.ShowOnDisabled"));
         }
         Assert.Equal("停止", (string?)end.Attribute("Content"));
-        // 与重试、清空历史在同一行，顺序：暂停/继续、停止、重试所选失败项、清空转存历史。
+        // 「放弃收尾」只在批次收不了尾时出现，紧跟在「停止」后面。
+        var abandon = Button("AbandonTransferBatchButton");
+        Assert.Equal("放弃收尾", (string?)abandon.Attribute("Content"));
+        Assert.Equal("{Binding RunPanel.AbandonBatchCommand}", (string?)abandon.Attribute("Command"));
+        Assert.Contains("RunPanel.ShowAbandonBatch", (string?)abandon.Attribute("Visibility"));
+        Assert.NotNull(abandon.Attribute("ToolTip"));
+        // 与重试、清空历史在同一行，顺序：暂停/继续、停止、放弃收尾、重试所选失败项、清空转存历史。
         var row = toggle.Parent!.Elements().Where(node => node.Name.LocalName == "Button").ToArray();
-        Assert.Equal(["PauseResumeTransferButton", "EndTransferBatchButton", "RetryFailedTransferButton"],
-            row.Take(3).Select(node => (string?)node.Attribute(x + "Name")));
-        Assert.Equal("清空转存历史", (string?)row[3].Attribute("Content"));
+        Assert.Equal(["PauseResumeTransferButton", "EndTransferBatchButton", "AbandonTransferBatchButton", "RetryFailedTransferButton"],
+            row.Take(4).Select(node => (string?)node.Attribute(x + "Name")));
+        Assert.Equal("清空转存历史", (string?)row[4].Attribute("Content"));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)
@@ -1012,6 +1152,16 @@ public sealed class WorkspaceRunPanelViewModelTests
             if (Interlocked.Increment(ref readCount) >= 2) SecondRead.TrySetResult();
             return Task.FromResult<IReadOnlyList<WorkspaceBatchItem>>([Current]);
         }
+    }
+
+    // 自动刷新只放行第一轮，之后一直等到取消：测试里不会有第二轮刷新和用户操作交错。
+    private sealed class OneRefreshDelay : IAsyncDelay
+    {
+        private int calls;
+        public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken) =>
+            Interlocked.Increment(ref calls) == 1
+                ? Task.CompletedTask
+                : Task.Delay(Timeout.Infinite, cancellationToken);
     }
 
     private sealed class ControlledDelay : IAsyncDelay

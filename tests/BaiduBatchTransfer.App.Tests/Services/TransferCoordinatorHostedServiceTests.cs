@@ -1,3 +1,4 @@
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.Application.Scheduling;
@@ -83,6 +84,76 @@ public sealed class TransferCoordinatorHostedServiceTests
     }
 
     [Fact]
+    public async Task APendingTransferThatCannotBeSettledDoesNotStarveTheScheduler()
+    {
+        // 账号没有登录信息时核对得不出结论、也不改状态：原来会原地反复核对同一条，
+        // 调度、分享核对和卡住检测都轮不到。
+        var store = new ControllableAllocationStore();
+        var pending = new StuckPendingTransferSource();
+        var reconciler = new InconclusiveTransferReconciler();
+        var service = Service(
+            store, new RecordingExecutor(), TimeSpan.FromMilliseconds(100),
+            RemoteWriteExecutionMode.DirectBackground, pending, reconciler);
+
+        await service.StartAsync(CancellationToken.None);
+        await store.FirstRecovery.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Delay(300);
+        await service.StopAsync(CancellationToken.None);
+
+        Assert.InRange(reconciler.Count, 2, 20);
+        Assert.True(store.RecoveryCount >= 1);
+    }
+
+    [Fact]
+    public async Task TheStuckBatchWatchdogRunsWhenTheSchedulerIsIdle()
+    {
+        var store = new ControllableAllocationStore();
+        var runControl = new WatchedRunControlStore();
+        var watchdog = new StuckBatchWatchdog(runControl, TimeProvider.System,
+            new StuckBatchWatchdogOptions(TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(10), TimeSpan.FromMilliseconds(1)));
+        var service = Service(store, new RecordingExecutor(), TimeSpan.FromMilliseconds(20), watchdog: watchdog);
+
+        await service.StartAsync(CancellationToken.None);
+        await runControl.Inspected.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await service.StopAsync(CancellationToken.None);
+    }
+
+    private sealed class StuckPendingTransferSource : IPendingTransferReconciliationSource
+    {
+        public Guid OperationId { get; } = Guid.NewGuid();
+        public Task<Guid?> TryGetPendingDirectOperationAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult<Guid?>(OperationId);
+    }
+
+    private sealed class InconclusiveTransferReconciler : ITransferResultReconciler
+    {
+        private int count;
+        public int Count => Volatile.Read(ref count);
+        public Task<TransferConfirmation> ReconcileAsync(Guid operationId, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref count);
+            return Task.FromResult(TransferConfirmation.Ambiguous);
+        }
+    }
+
+    private sealed class WatchedRunControlStore : IBatchRunControlStore
+    {
+        public TaskCompletionSource Inspected { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task<StuckBatchSnapshot?> GetActiveStuckSnapshotAsync(DateTimeOffset now, CancellationToken cancellationToken = default)
+        {
+            Inspected.TrySetResult();
+            return Task.FromResult<StuckBatchSnapshot?>(null);
+        }
+        public Task<PauseBatchDisposition> TryPauseBatchAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<ResumeBatchDisposition> TryResumeBatchAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<RetryFailedTransferDisposition> TryRetryFailedTransferAsync(
+            Guid operationId, DateTimeOffset retriedAt, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+    }
+
+    [Fact]
     public async Task StartRunsAnInitialCycleWithoutBusySpinningWhileIdle()
     {
         var store = new ControllableAllocationStore();
@@ -157,7 +228,8 @@ public sealed class TransferCoordinatorHostedServiceTests
         RemoteWriteExecutionMode mode = RemoteWriteExecutionMode.Full,
         IPendingTransferReconciliationSource? pendingTransfers = null,
         ITransferResultReconciler? reconciler = null,
-        LicenseRuntimeAuthorizationState? authorizationState = null) => new(
+        LicenseRuntimeAuthorizationState? authorizationState = null,
+        StuckBatchWatchdog? watchdog = null) => new(
             new TransferCoordinator(
                 new AllocationTransactionService(store),
                 executor,
@@ -168,7 +240,8 @@ public sealed class TransferCoordinatorHostedServiceTests
             mode,
             pendingTransfers,
             reconciler,
-            authorizationState);
+            authorizationState,
+            watchdog);
 
     private sealed class RecordingPendingTransferSource : IPendingTransferReconciliationSource
     {

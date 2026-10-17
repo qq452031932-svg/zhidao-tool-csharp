@@ -134,7 +134,10 @@ public static class AppBootstrap
         services.AddSingleton<IApplicationUpdateService>(sp =>
             sp.GetRequiredService<ApplicationUpdateService>());
         services.AddSingleton(paths);
-        services.AddSingleton<IRunLog>(_ => new FileRunLog(Path.Combine(paths.RootDirectory, "logs")));
+        services.AddSingleton(_ => RunLogLocation.Resolve(AppContext.BaseDirectory, paths.RootDirectory));
+        services.AddSingleton(sp => new FileRunLog(sp.GetRequiredService<RunLogLocation>().Directory));
+        services.AddSingleton<IRunLog>(sp => sp.GetRequiredService<FileRunLog>());
+        services.AddSingleton<IWebView2RuntimeProbe, WebView2RuntimeProbe>();
         services.AddSingleton<StartupNotices>();
         services.AddSingleton<ICollectPauseStore>(_ => new FileCollectPauseStore(
             Path.Combine(paths.RootDirectory, "collect", "paused-task.json")));
@@ -187,7 +190,11 @@ public static class AppBootstrap
         services.AddSingleton<ImportPageQuery>();
         services.AddSingleton<IImportPreviewPageSource, ImportPreviewPageSource>();
         services.AddSingleton<TextImportParser>();
-        services.AddSingleton<IAccountShareAnalyticsClient, BaiduAccountShareAnalyticsClient>();
+        services.AddSingleton<IAccountShareAnalyticsClient>(sp =>
+        {
+            var runLog = sp.GetService<IRunLog>();
+            return new BaiduAccountShareAnalyticsClient(message => runLog?.Write("监控反馈", message));
+        });
         services.AddSingleton<SqliteAccountShareAnalyticsRepository>();
         services.AddSingleton<IAccountShareAnalyticsRepository>(sp =>
             sp.GetRequiredService<SqliteAccountShareAnalyticsRepository>());
@@ -263,6 +270,12 @@ public static class AppBootstrap
         services.AddSingleton<PauseBatchService>();
         services.AddSingleton<ResumeBatchService>();
         services.AddSingleton<EndBatchService>();
+        services.AddSingleton<IStuckBatchNotifier>(sp => new StuckBatchNotifier(
+            sp.GetService<IRunLog>(), sp.GetRequiredService<StartupNotices>()));
+        services.AddSingleton(sp => new StuckBatchWatchdog(
+            sp.GetRequiredService<IBatchRunControlStore>(),
+            sp.GetRequiredService<TimeProvider>(),
+            notifier: sp.GetRequiredService<IStuckBatchNotifier>()));
         services.AddSingleton<RetryFailedTransferService>();
         services.AddSingleton<SqliteBatchResultProjectionRepository>();
         services.AddSingleton<IBatchResultProjectionRepository>(sp =>
@@ -1077,7 +1090,8 @@ public sealed class AppShellFactory(
             shareAnalyticsDelay,
             shareAnalyticsExportService,
             resultSaveDialog,
-            licenseGate: licenseGate);
+            licenseGate: licenseGate,
+            runLog: runLog);
         var shareDataWorkspace = new ShareAnalyticsView(shareAnalyticsViewModel);
         var adInsertionWorkspace = new DeferredWorkspaceView(
             new DeferredWorkspaceViewModel("广告插入", "功能建设中"));

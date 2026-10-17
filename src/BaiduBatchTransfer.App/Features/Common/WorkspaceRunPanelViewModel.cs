@@ -49,6 +49,8 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     private bool isHistoryCleanupBusy;
     private bool isClosed;
     private readonly HashSet<Guid> notifiedTerminalBatches = [];
+    private StuckBatchSnapshot? selectedStuck;
+    private string? lastStuckHintKey;
 
     public WorkspaceRunPanelViewModel(
         JobResultsViewModel results,
@@ -85,6 +87,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         PauseResumeCommand = new AsyncRelayCommand(
             () => CanResume ? ResumeAsync() : PauseAsync(), () => CanPause || CanResume);
         EndBatchCommand = new AsyncRelayCommand(EndBatchAsync, () => CanEndBatch);
+        AbandonBatchCommand = new AsyncRelayCommand(AbandonBatchAsync, () => CanAbandonBatch);
         RetryFailedTransferCommand = new AsyncRelayCommand(
             RetryFailedTransferAsync,
             () => CanRetryFailedTransfer);
@@ -101,6 +104,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         set
         {
             if (!SetProperty(ref selectedBatch, value)) return;
+            if (selectedStuck is { } stuck && stuck.BatchJobId != value?.BatchJobId) selectedStuck = null;
             NotifyCommandState();
             RestartAutomaticRefresh();
         }
@@ -138,6 +142,15 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         !IsTerminal(SelectedBatch!.BatchStatus);
     /// <summary>已发出结束、正在等正在提交的几条收尾。</summary>
     public bool IsEndingBatch => endWatch is not null;
+    /// <summary>
+    /// 所选批次剩下的活走不下去（账号失效、结果核对不了），或者点了「停止」还在等收尾：
+    /// 这时才显示「放弃收尾」，平时不出现，免得和「停止」混淆。
+    /// </summary>
+    public bool ShowAbandonBatch => endService is not null && dialogService is not null && SelectedBatch is { } batch &&
+        !IsTerminal(batch.BatchStatus) &&
+        (IsEndingBatch || selectedStuck is { IsBlocked: true } stuck && stuck.BatchJobId == batch.BatchJobId);
+    public bool CanAbandonBatch => ShowAbandonBatch && CanUseBatchActions;
+    public IAsyncRelayCommand AbandonBatchCommand { get; }
     public IAsyncRelayCommand LoadSelectedBatchCommand { get; }
     public IAsyncRelayCommand PauseCommand { get; }
     public IAsyncRelayCommand ResumeCommand { get; }
@@ -339,17 +352,140 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         }
     }
 
-    private async Task ApplyEndResultAsync(Guid batchJobId, EndBatchResult result, CancellationToken cancellationToken)
+    /// <summary>
+    /// 放弃收尾：不等账号重新登录、不再核对，剩下的按「结果未确认」记为失败，这一批就此结束，
+    /// 后面排队的批次马上开始。正在提交的那几条仍然不打断。
+    /// </summary>
+    public async Task AbandonBatchAsync(CancellationToken cancellationToken = default)
+    {
+        if (!CanAbandonBatch || SelectedBatch is not { } selected) return;
+        var stuck = selectedStuck is { } known && known.BatchJobId == selected.BatchJobId ? known : null;
+        var waitingFor = stuck is { UnavailableAccountNames.Count: > 0 }
+            ? $"它们在等账号{StuckBatchText.AccountList(stuck.UnavailableAccountNames)}重新登录后核对结果。"
+            : "它们的结果还没核对清楚。";
+        bool confirmed;
+        try
+        {
+            confirmed = await dialogService!.ConfirmAsync(
+                "放弃收尾",
+                $"这一批还有{(stuck is null ? "" : $" {stuck.UnfinishedCount:N0} 条")}记录没收尾，{waitingFor}\n\n" +
+                "放弃后：\n" +
+                "· 还没开始的标为「已取消」；\n" +
+                "· 已经提交过的不再核对，记为失败（结果未确认）。它们可能其实已经转存或分享成功，请到网盘核对；\n" +
+                "· 正在提交的那几条仍会做完；\n" +
+                "· 这一批随即结束，后面排队的批次马上开始。\n\n" +
+                "如果能重新登录账号，建议先在「账号管理」里点「重新登录」，结果能核对清楚。确定放弃收尾吗？",
+                cancellationToken).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
+        if (!confirmed || !CanAbandonBatch || SelectedBatch?.BatchJobId != selected.BatchJobId) return;
+
+        var operation = BeginOperation(cancellationToken);
+        if (operation is null) return;
+        IsBusy = true;
+        try
+        {
+            var result = await endService!.AbandonAsync(selected.BatchJobId, operation.Token).ConfigureAwait(true);
+            if (!IsCurrent(operation)) return;
+            selectedStuck = null;
+            lastStuckHintKey = null;
+            switch (result.Disposition)
+            {
+                case AbandonBatchDisposition.Ended:
+                case AbandonBatchDisposition.AlreadyEnded:
+                    await ApplyEndResultAsync(selected.BatchJobId,
+                        new(result.Disposition == AbandonBatchDisposition.Ended ? EndBatchDisposition.Ended : EndBatchDisposition.AlreadyEnded,
+                            result.CancelledCount, 0),
+                        operation.Token,
+                        result.Disposition == AbandonBatchDisposition.Ended
+                            ? $"已放弃收尾，这一批已结束：{StuckBatchText.Outcome(result)}。需要时可用「清空转存历史」删除这批记录。"
+                            : null).ConfigureAwait(true);
+                    break;
+                case AbandonBatchDisposition.Stopping:
+                    StatusMessage = $"已放弃收尾：{StuckBatchText.Outcome(result)}。";
+                    if (Results.BatchJobId == selected.BatchJobId) await Results.RefreshAsync(operation.Token).ConfigureAwait(true);
+                    StartEndWatch(selected.BatchJobId);
+                    break;
+                default:
+                    StatusMessage = "未找到所选批次，请刷新后重试。";
+                    break;
+            }
+        }
+        catch (OperationCanceledException) when (operation.IsCancellationRequested) { }
+        catch (Exception)
+        {
+            if (IsCurrent(operation)) StatusMessage = "放弃收尾失败，请稍后重试。";
+        }
+        finally
+        {
+            if (!isClosed && ReferenceEquals(currentOperation, operation)) IsBusy = false;
+            operation.Dispose();
+            NotifyCommandState();
+        }
+    }
+
+    /// <summary>
+    /// 自动刷新时看一眼卡没卡住：所选批次卡住了，说明在等什么、怎么办；所选批次在排队而前面那批卡住了，
+    /// 告诉用户是被谁挡住的。同样的情况只说一次，免得刷屏。
+    /// </summary>
+    private async Task RefreshStuckHintAsync(WorkspaceBatchItem latest, CancellationToken cancellationToken)
+    {
+        if (endService is null) return;
+        StuckBatchSnapshot? snapshot;
+        try
+        {
+            snapshot = latest.BatchStatus switch
+            {
+                "Active" => await endService.GetStuckSnapshotAsync(latest.BatchJobId, cancellationToken).ConfigureAwait(true),
+                "Queued" => await endService.GetActiveStuckSnapshotAsync(cancellationToken).ConfigureAwait(true),
+                _ => null,
+            };
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception)
+        {
+            // 只是辅助提示，查不了就不提示，不影响进度刷新。
+            return;
+        }
+        if (isClosed || cancellationToken.IsCancellationRequested || SelectedBatch?.BatchJobId != latest.BatchJobId) return;
+        var own = snapshot is not null && snapshot.BatchJobId == latest.BatchJobId ? snapshot : null;
+        var changed = !Equals(selectedStuck?.IsBlocked, own?.IsBlocked);
+        selectedStuck = own;
+        if (changed) NotifyCommandState();
+
+        if (snapshot is not { IsBlocked: true })
+        {
+            lastStuckHintKey = null;
+            return;
+        }
+        var key = $"{latest.BatchJobId:N}|{snapshot.BatchJobId:N}|{snapshot.UnfinishedCount}";
+        if (key == lastStuckHintKey) return;
+        lastStuckHintKey = key;
+        var limit = snapshot.WasStopped
+            ? StuckBatchWatchdogOptions.Default.StoppedBatchLimit
+            : StuckBatchWatchdogOptions.Default.RunningBatchLimit;
+        StatusMessage = own is not null
+            ? StuckBatchText.BlockedHint(snapshot, limit)
+            : "这一批在排队：前面正在运行的批次卡住了（" +
+              (snapshot.UnavailableAccountNames.Count > 0
+                  ? $"在等账号{StuckBatchText.AccountList(snapshot.UnavailableAccountNames)}重新登录"
+                  : "结果一直核对不了") +
+              $"），同一时间只运行一个批次。可以在列表里选中前面那一批，重新登录账号或点「放弃收尾」；" +
+              $"一直没有进展的，约 {limit.TotalMinutes:0} 分钟后会自动放弃收尾，这一批随后开始。";
+    }
+
+    private async Task ApplyEndResultAsync(Guid batchJobId, EndBatchResult result, CancellationToken cancellationToken,
+        string? endedMessage = null)
     {
         switch (result.Disposition)
         {
             case EndBatchDisposition.Ended:
             case EndBatchDisposition.AlreadyEnded:
-                StatusMessage = result.Disposition == EndBatchDisposition.AlreadyEnded
+                StatusMessage = endedMessage ?? (result.Disposition == EndBatchDisposition.AlreadyEnded
                     ? "这一批已经结束了。"
                     : result.CancelledCount > 0
                         ? $"批次已停止：{result.CancelledCount:N0} 条未开始的记录已取消。需要时可用「清空转存历史」删除这批记录。"
-                        : "批次已停止。需要时可用「清空转存历史」删除这批记录。";
+                        : "批次已停止。需要时可用「清空转存历史」删除这批记录。");
                 if (SelectedBatch?.BatchJobId == batchJobId) UpdateSelectedBatchStatus("Cancelled");
                 var statisticsRead = false;
                 if (Results.BatchJobId == batchJobId)
@@ -368,7 +504,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
             case EndBatchDisposition.Stopping:
                 StatusMessage = $"未开始的 {result.CancelledCount:N0} 条记录已取消，不会再开始新的转存；" +
                     $"还有 {result.InFlightCount:N0} 条已经提交、正在收尾或等待核对结果，不能中途打断，完成后这一批自动停止。" +
-                    "分享结果核对不到的，约 2 分钟后按未创建处理。";
+                    "分享结果核对不到的，约 2 分钟后按未创建处理；账号登录失效等原因一直收不了尾时，可以点「放弃收尾」。";
                 // 批次照常运行（只剩收尾），让自动刷新继续显示进度。
                 if (SelectedBatch?.BatchJobId == batchJobId) UpdateSelectedBatchStatus("Active");
                 if (Results.BatchJobId == batchJobId) await Results.RefreshAsync(cancellationToken).ConfigureAwait(true);
@@ -388,6 +524,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         var watch = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         endWatch = watch;
         OnPropertyChanged(nameof(IsEndingBatch));
+        NotifyCommandState();
         _ = RunEndWatchAsync(batchJobId, watch);
     }
 
@@ -397,6 +534,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         endWatch = null;
         watch.Cancel();
         OnPropertyChanged(nameof(IsEndingBatch));
+        NotifyCommandState();
     }
 
     private async Task RunEndWatchAsync(Guid batchJobId, CancellationTokenSource watch)
@@ -430,6 +568,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
             {
                 endWatch = null;
                 OnPropertyChanged(nameof(IsEndingBatch));
+                NotifyCommandState();
             }
             watch.Dispose();
         }
@@ -544,7 +683,10 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CanRetryFailedTransfer));
         OnPropertyChanged(nameof(PauseResumeText));
         OnPropertyChanged(nameof(CanEndBatch));
+        OnPropertyChanged(nameof(ShowAbandonBatch));
+        OnPropertyChanged(nameof(CanAbandonBatch));
         PauseResumeCommand.NotifyCanExecuteChanged();
+        AbandonBatchCommand.NotifyCanExecuteChanged();
         EndBatchCommand.NotifyCanExecuteChanged();
         LoadSelectedBatchCommand.NotifyCanExecuteChanged();
         PauseCommand.NotifyCanExecuteChanged();
@@ -622,6 +764,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
                     }
 
                     if (latest is null || latest.BatchStatus is not ("Queued" or "Active")) return;
+                    if (!IsHistoryCleanupBusy) await RefreshStuckHintAsync(latest, refresh.Token).ConfigureAwait(true);
                 }
                 catch (OperationCanceledException) when (refresh.IsCancellationRequested)
                 {

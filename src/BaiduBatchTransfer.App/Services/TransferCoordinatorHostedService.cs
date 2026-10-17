@@ -1,3 +1,4 @@
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.App.Features.Licensing;
 using Microsoft.Extensions.Hosting;
@@ -14,6 +15,7 @@ public sealed class TransferCoordinatorHostedService : BackgroundService
     private readonly IPendingTransferReconciliationSource? pendingTransfers;
     private readonly ITransferResultReconciler? transferReconciler;
     private readonly LicenseRuntimeAuthorizationState? authorizationState;
+    private readonly StuckBatchWatchdog? stuckBatchWatchdog;
 
     public TransferCoordinatorHostedService(
         TransferCoordinator coordinator,
@@ -23,8 +25,10 @@ public sealed class TransferCoordinatorHostedService : BackgroundService
         RemoteWriteExecutionMode remoteWriteMode = RemoteWriteExecutionMode.Full,
         IPendingTransferReconciliationSource? pendingTransfers = null,
         ITransferResultReconciler? transferReconciler = null,
-        LicenseRuntimeAuthorizationState? authorizationState = null)
+        LicenseRuntimeAuthorizationState? authorizationState = null,
+        StuckBatchWatchdog? stuckBatchWatchdog = null)
     {
+        this.stuckBatchWatchdog = stuckBatchWatchdog;
         this.coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         this.availability = availability ?? throw new ArgumentNullException(nameof(availability));
         this.timeProvider = timeProvider ?? TimeProvider.System;
@@ -55,6 +59,7 @@ public sealed class TransferCoordinatorHostedService : BackgroundService
                 return;
             }
         }
+        Guid? lastPendingOperationId = null;
         while (!stoppingToken.IsCancellationRequested)
         {
             if (remoteWriteMode == RemoteWriteExecutionMode.DirectBackground && pendingTransfers is not null)
@@ -65,8 +70,13 @@ public sealed class TransferCoordinatorHostedService : BackgroundService
                 {
                     await transferReconciler!.ReconcileAsync(pendingOperationId.Value, stoppingToken)
                         .ConfigureAwait(false);
-                    continue;
+                    // 同一条核对完还是它（例如账号没有登录信息，核对不出结论也没改状态）：
+                    // 不能原地连转，否则分享核对、卡住检测和后面的调度永远轮不到。往下走，空闲时歇一下。
+                    var repeated = pendingOperationId == lastPendingOperationId;
+                    lastPendingOperationId = pendingOperationId;
+                    if (!repeated) continue;
                 }
+                else lastPendingOperationId = null;
             }
 
             int scheduled;
@@ -80,6 +90,21 @@ public sealed class TransferCoordinatorHostedService : BackgroundService
             }
 
             if (scheduled > 0) continue;
+            if (stuckBatchWatchdog is not null)
+            {
+                try
+                {
+                    await stuckBatchWatchdog.CheckAsync(stoppingToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception)
+                {
+                    // 卡住检测只是兜底，查不了这一轮就跳过，不能让调度循环跟着停掉。
+                }
+            }
             try
             {
                 await Task.Delay(idleScanInterval, timeProvider, stoppingToken).ConfigureAwait(false);
