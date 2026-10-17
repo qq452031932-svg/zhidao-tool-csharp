@@ -294,8 +294,97 @@ public sealed class BaiduAccountShareAnalyticsClientTests
         Assert.Equal(BaiduErrorKind.UnknownResponse, result.ErrorKind);
     }
 
+    [Fact]
+    public async Task RejectedPageReportsPageNumberAndErrnoWithoutCookie()
+    {
+        var reports = new List<string>();
+        var handler = new ScriptedHandler(Json("""{"errno":9019,"list":[]}"""));
+        using var client = new BaiduAccountShareAnalyticsClient(handler, reportFailure: reports.Add);
+
+        var result = await client.ReadPageAsync(Session(), "7", default);
+
+        Assert.False(result.IsSuccess);
+        var report = Assert.Single(reports);
+        Assert.Contains("第 7 页", report);
+        Assert.Contains("errno=9019", report);
+        Assert.DoesNotContain("private-cookie", report);
+    }
+
+    [Fact]
+    public async Task InvalidItemReportsWhichFieldWithoutItsContent()
+    {
+        var reports = new List<string>();
+        var handler = new ScriptedHandler(Json("""
+            {"errno":0,"count":2,"nextpage":0,"list":[
+              {"shareId":10001,"shortlink":"https://pan.baidu.com/s/synthetic-a","ctime":1788278400,"status":0},
+              {"shareId":10002,"shortlink":"http://example.invalid/secret-path","ctime":1788278400,"status":0}
+            ]}
+            """));
+        using var client = new BaiduAccountShareAnalyticsClient(handler, reportFailure: reports.Add);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.False(result.IsSuccess);
+        var report = Assert.Single(reports);
+        Assert.Contains("第 1 页", report);
+        Assert.Contains("本页第 2 条", report);
+        Assert.Contains("shortlink", report);
+        Assert.DoesNotContain("secret-path", report);
+    }
+
+    [Fact]
+    public async Task SuccessfulPageReportsNothing()
+    {
+        var reports = new List<string>();
+        var handler = new ScriptedHandler(Json(Fixture()));
+        using var client = new BaiduAccountShareAnalyticsClient(handler, reportFailure: reports.Add);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.True(result.IsSuccess);
+        Assert.Empty(reports);
+    }
+
     private static string Fixture() => File.ReadAllText(Path.Combine(
         AppContext.BaseDirectory, "Fixtures", "ShareAnalytics", "share-page.synthetic.json"));
+
+    [Fact]
+    public async Task UnansweredRequestTimesOutAsTransientAfterOneRetry()
+    {
+        var handler = new HangingHandler();
+        using var client = new BaiduAccountShareAnalyticsClient(handler, TimeSpan.FromMilliseconds(50));
+
+        var result = await client.ReadPageAsync(Session(), null, default).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.TransientService, result.ErrorKind);
+        Assert.Equal(2, handler.Calls);
+    }
+
+    [Fact]
+    public async Task CallerCancellationIsNotReportedAsTimeout()
+    {
+        using var client = new BaiduAccountShareAnalyticsClient(new HangingHandler(), TimeSpan.FromMinutes(5));
+        using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => client.ReadPageAsync(Session(), null, cancel.Token).WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    private sealed class HangingHandler : HttpMessageHandler
+    {
+        private int calls;
+        public int Calls => Volatile.Read(ref calls);
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref calls);
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            throw new InvalidOperationException("Unreachable.");
+        }
+    }
 
     private static AccountSession Session() => new(
         Guid.NewGuid(),

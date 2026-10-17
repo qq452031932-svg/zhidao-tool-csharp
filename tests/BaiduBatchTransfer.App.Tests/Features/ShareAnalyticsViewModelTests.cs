@@ -28,6 +28,45 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public async Task ManualRefreshSuccessShowsCountAndTimeAndIsLogged()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now));
+        var log = new RecordingRunLog();
+        var viewModel = Create(service, runLog: log);
+        viewModel.SelectAccount(account, "账号甲");
+        await viewModel.EnterAsync();
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        var expected = $"分享数据已更新：共 1 条（{Now.ToLocalTime():HH:mm}）。";
+        Assert.Equal(expected, viewModel.StatusMessage);
+        Assert.Contains($"[监控反馈] 账号甲：{expected}", log.Lines);
+        Assert.False(viewModel.IsRefreshing);
+    }
+
+    [Fact]
+    public async Task ManualRefreshFailureAndUnlicensedReasonsAreLogged()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now)) { SyncResults = [FailureResult] };
+        var log = new RecordingRunLog();
+        var viewModel = Create(service, runLog: log);
+        viewModel.SelectAccount(account, "账号甲");
+        await viewModel.EnterAsync();
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+        Assert.Contains("[监控反馈] 账号甲：分享数据获取失败，请稍后重试。", log.Lines);
+
+        var unlicensedLog = new RecordingRunLog();
+        var unlicensed = Create(new FakeSync(account, Snapshot(account, "cached", Now)),
+            licenseGate: new RecordingLicenseGate(false), runLog: unlicensedLog);
+        unlicensed.SelectAccount(account, "账号甲");
+        await unlicensed.EnterAsync();
+        await unlicensed.RefreshCommand.ExecuteAsync(null);
+        Assert.Contains(unlicensedLog.Lines, line => line.StartsWith("[监控反馈] 账号甲：软件尚未激活", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task ManualRefreshGatesBeforeCreatingRemoteWork()
     {
         var account = Guid.NewGuid();
@@ -1614,11 +1653,12 @@ public sealed class ShareAnalyticsViewModelTests
         IShareAnalyticsBulkScheduler? bulkScheduler = null,
         IShareAnalyticsWorkbookExportService? exportService = null,
         IResultSaveDialog? saveDialog = null,
-        ILicenseAuthorizationGate? licenseGate = null) =>
+        ILicenseAuthorizationGate? licenseGate = null,
+        IRunLog? runLog = null) =>
         new(service, new AccountShareAnalyticsProjector(), new FakeLauncher(),
             timeProvider ?? new FrozenTimeProvider(Now), delay ?? new FakeDelay(),
             exportService ?? new RecordingExporter(), saveDialog ?? new ImmediateSaveDialog(null), bulkScheduler,
-            licenseGate);
+            licenseGate, runLog);
 
     private static AccountShareCachedSnapshot Snapshot(Guid account, string title, DateTimeOffset? syncedAt = null) =>
         new(account, syncedAt ?? Now, [Record(title, AccountShareRemoteStatus.Valid, 10)]);
@@ -1703,6 +1743,12 @@ public sealed class ShareAnalyticsViewModelTests
 
         public async Task WaitForSyncCallsAsync(int expected) =>
             await WaitUntilAsync(() => SyncCalls >= expected);
+    }
+
+    private sealed class RecordingRunLog : IRunLog
+    {
+        public List<string> Lines { get; } = [];
+        public void Write(string source, string? message) => Lines.Add($"[{source}] {message}");
     }
 
     private sealed class RecordingLicenseGate(params bool[] decisions) : ILicenseAuthorizationGate

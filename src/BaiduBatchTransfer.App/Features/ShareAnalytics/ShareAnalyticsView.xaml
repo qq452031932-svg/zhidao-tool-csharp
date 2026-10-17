@@ -174,9 +174,11 @@
                         <TextBlock Text="{Binding ValidCount, StringFormat=有效 {0:N0}}" Foreground="#067647" Margin="8,0,0,0" />
                         <TextBlock Text="{Binding InvalidCount, StringFormat=失效 {0:N0}}" Foreground="#B42318" Margin="8,0,0,0" />
                     </StackPanel>
-                    <Button Grid.Column="3" Content="刷新数据" Command="{Binding RefreshCommand}"
+                    <Button Grid.Column="3" Command="{Binding RefreshCommand}"
                             ToolTip="{Binding StatusMessage}" AutomationProperties.HelpText="{Binding StatusMessage}"
-                            Style="{StaticResource PrimaryButton}" Margin="0" Padding="10,4" />
+                            Margin="0" Padding="10,4">
+                        <Button.Style><Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}"><Setter Property="Content" Value="刷新数据" /><Style.Triggers><DataTrigger Binding="{Binding IsRefreshing}" Value="True"><Setter Property="Content" Value="刷新中…" /></DataTrigger></Style.Triggers></Style></Button.Style>
+                    </Button>
                 </Grid>
                 <Grid x:Name="SelectionToolbar" Grid.Row="1" Margin="0,6,0,0">
                     <Grid.ColumnDefinitions>
@@ -229,6 +231,11 @@
         </Border>
 
         <Border Grid.Row="1" Style="{StaticResource BorderedPanelStyle}" Padding="8">
+            <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
             <DataGrid ItemsSource="{Binding VisibleItems}" AutoGenerateColumns="False" IsReadOnly="True"
                       CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column"
                       ColumnHeaderStyle="{StaticResource ShareAnalyticsColumnHeaderStyle}"
@@ -459,6 +466,11 @@
                     </DataGridTemplateColumn>
                 </DataGrid.Columns>
             </DataGrid>
+            <!-- 刷新结果（成功、失败原因、未激活）原来只在鼠标悬停提示里，点了像没反应。 -->
+            <TextBlock x:Name="ShareAnalyticsStatus" Grid.Row="1" Margin="2,6,2,0" FontSize="12"
+                       Text="{Binding StatusMessage}" ToolTip="{Binding StatusMessage}"
+                       Foreground="{StaticResource MutedBrush}" TextTrimming="CharacterEllipsis" />
+            </Grid>
         </Border>
     </Grid>
 </UserControl>

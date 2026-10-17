@@ -29,6 +29,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private readonly IResultSaveDialog saveDialog;
     private readonly IShareAnalyticsBulkScheduler bulkScheduler;
     private readonly ILicenseAuthorizationGate? licenseGate;
+    private readonly IRunLog? runLog;
     private readonly CancellationTokenSource lifetime = new();
     private readonly object refreshSync = new();
     private HashSet<string> selectedShareIds = new(StringComparer.Ordinal);
@@ -74,7 +75,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         IShareAnalyticsWorkbookExportService exportService,
         IResultSaveDialog saveDialog,
         IShareAnalyticsBulkScheduler? bulkScheduler = null,
-        ILicenseAuthorizationGate? licenseGate = null)
+        ILicenseAuthorizationGate? licenseGate = null,
+        IRunLog? runLog = null)
     {
         this.service = service ?? throw new ArgumentNullException(nameof(service));
         this.projector = projector ?? throw new ArgumentNullException(nameof(projector));
@@ -85,6 +87,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         this.saveDialog = saveDialog ?? throw new ArgumentNullException(nameof(saveDialog));
         this.bulkScheduler = bulkScheduler ?? new ThreadPoolShareAnalyticsBulkScheduler();
         this.licenseGate = licenseGate;
+        this.runLog = runLog;
         RefreshCommand = new AsyncRelayCommand(RefreshAsync, () => accountId is not null && isActive);
         SelectMetricCommand = new RelayCommand<AccountShareMetric>(SelectMetric);
         SortCommand = new RelayCommand<AccountShareSortColumn>(Sort);
@@ -138,7 +141,16 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         }
     }
     public string CurrentAccountName { get => currentAccountName; private set => SetProperty(ref currentAccountName, value); }
-    public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
+    public string StatusMessage
+    {
+        get => statusMessage;
+        private set
+        {
+            if (!SetProperty(ref statusMessage, value)) return;
+            // 刷新失败的原因以前只在界面上一闪而过，写进运行日志方便排查。
+            runLog?.Write("监控反馈", accountId is null ? value : $"{CurrentAccountName}：{value}");
+        }
+    }
     public string RangeStartText { get => rangeStartText; set => SetProperty(ref rangeStartText, value ?? string.Empty); }
     public string RangeEndText { get => rangeEndText; set => SetProperty(ref rangeEndText, value ?? string.Empty); }
     public bool IsSelectionBusy => isSelectionBusy;
@@ -382,11 +394,18 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
                 var refreshed = await service.LoadCachedAsync(selected, cancellationToken);
                 if (!CanApply(selected, selection, navigation)) return;
                 Apply(refreshed);
-                StatusMessage = result.SafeMessage;
+                if (!string.IsNullOrWhiteSpace(result.Detail))
+                    runLog?.Write("监控反馈", $"{CurrentAccountName}：{result.Detail}");
+                // 数据没变化时也要让人看出刷新过了。
+                StatusMessage = result.Disposition == AccountShareSyncDisposition.Updated
+                    ? $"{result.SafeMessage.TrimEnd('。')}：共 {TotalCount:N0} 条（{timeProvider.GetLocalNow():HH:mm}）。"
+                    : result.SafeMessage;
                 ScheduleAfterSuccess(selected, selection, navigation, cancellationToken);
                 return;
             }
 
+            if (!string.IsNullOrWhiteSpace(result.Detail))
+                runLog?.Write("监控反馈", $"{CurrentAccountName}：刷新失败原因：{result.Detail}");
             StatusMessage = string.IsNullOrWhiteSpace(result.SafeMessage) ? RefreshFailureMessage : result.SafeMessage;
             ScheduleAfterFailure(selected, selection, navigation, cancellationToken, flight);
         }

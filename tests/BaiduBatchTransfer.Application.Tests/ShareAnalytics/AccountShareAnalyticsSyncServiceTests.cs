@@ -54,19 +54,59 @@ public sealed class AccountShareAnalyticsSyncServiceTests
     }
 
     [Fact]
-    public async Task RepeatedCursorOrDuplicateIdentityFailsWithoutCommit()
+    public async Task RepeatedCursorFailsWithoutCommit()
     {
         var repeated = new FakeClient(new() { ["first"] = Success([Item("one")], "2"), ["2"] = Success([Item("two")], "2") });
         var repeatedRepository = new FakeRepository();
         Assert.Equal(AccountShareSyncDisposition.Unavailable,
             (await Service(repeated, repeatedRepository).SyncAsync(accountId, default)).Disposition);
         Assert.Empty(repeatedRepository.Commits);
+    }
 
-        var duplicate = new FakeClient(new() { ["first"] = Success([Item("same")], "2"), ["2"] = Success([Item("same")], null) });
-        var duplicateRepository = new FakeRepository();
-        Assert.Equal(AccountShareSyncDisposition.Unavailable,
-            (await Service(duplicate, duplicateRepository).SyncAsync(accountId, default)).Disposition);
-        Assert.Empty(duplicateRepository.Commits);
+    [Fact]
+    public async Task ShareRepeatedAcrossPageBoundaryIsCountedOnceAndStillCommits()
+    {
+        // 同一秒批量创建的分享排在页边界上，前后两页各出现一次（用户 10-17 实测第 66 页）。
+        var duplicate = new FakeClient(new()
+        {
+            ["first"] = Success([Item("a"), Item("same")], "2"),
+            ["2"] = Success([Item("same"), Item("b")], null),
+        });
+        var repository = new FakeRepository();
+        var result = await Service(duplicate, repository).SyncAsync(accountId, default);
+
+        Assert.Equal(AccountShareSyncDisposition.Updated, result.Disposition);
+        Assert.Equal(new[] { "a", "same", "b" }, Assert.Single(repository.Commits).Items.Select(item => item.ShareId));
+        Assert.Contains("1 条分享前后两页重复出现", result.Detail);
+    }
+
+    [Fact]
+    public async Task MoreThanAPageOfDuplicatesStillFailsWithoutCommit()
+    {
+        var page = Enumerable.Range(0, 101).Select(index => Item($"s{index}")).ToArray();
+        var client = new FakeClient(new() { ["first"] = Success(page, "2"), ["2"] = Success(page, null) });
+        var repository = new FakeRepository();
+        var result = await Service(client, repository).SyncAsync(accountId, default);
+
+        Assert.Equal(AccountShareSyncDisposition.Unavailable, result.Disposition);
+        Assert.Contains("翻页重复超过 100 条", result.Detail);
+        Assert.Empty(repository.Commits);
+    }
+
+    [Fact]
+    public async Task FailureDetailNamesThePageAndHowFarItGotButStaysOutOfSafeMessage()
+    {
+        var rejected = new FakeClient(new()
+        {
+            ["first"] = Success([Item("one"), Item("two")], "2"),
+            ["2"] = BaiduAdapterResult<AccountSharePage>.Failure(BaiduErrorKind.UnknownResponse, "private"),
+        });
+        var result = await Service(rejected, new FakeRepository()).SyncAsync(accountId, default);
+        Assert.Equal(AccountShareSyncDisposition.Unavailable, result.Disposition);
+        Assert.Contains("第 2 页", result.Detail);
+        Assert.Contains("UnknownResponse", result.Detail);
+        Assert.Contains("已读 2 条", result.Detail);
+        Assert.DoesNotContain("第 2 页", result.SafeMessage);
     }
 
     [Fact]

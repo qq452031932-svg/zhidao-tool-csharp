@@ -20,6 +20,22 @@ public sealed class ShareAnalyticsViewStructureTests
     private static readonly XNamespace Xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
 
     [Fact]
+    public void RefreshResultIsVisibleUnderTheTableAndButtonShowsProgress()
+    {
+        var (document, _, _) = LoadView();
+        var status = Assert.Single(document.Descendants(Presentation + "TextBlock"), element =>
+            Attribute(element, Xaml + "Name") == "ShareAnalyticsStatus");
+        Assert.Equal("{Binding StatusMessage}", Attribute(status, "Text"));
+        Assert.Equal("1", Attribute(status, "Grid.Row"));
+        Assert.Contains(status.Parent!.Elements(), element => element.Name == Presentation + "DataGrid");
+        var refresh = Assert.Single(document.Descendants(Presentation + "Button"), element =>
+            Attribute(element, "Command") == "{Binding RefreshCommand}");
+        Assert.Contains("IsRefreshing", refresh.ToString(), StringComparison.Ordinal);
+        Assert.Contains("刷新中…", refresh.ToString(), StringComparison.Ordinal);
+        Assert.Contains("刷新数据", refresh.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void HeaderUsesOneCompactTwoRowToolbarWithDelayedTitleSearch()
     {
         var (document, _, _) = LoadView();

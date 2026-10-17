@@ -15,9 +15,11 @@ public enum AccountShareSyncDisposition
     Unavailable,
 }
 
+/// <param name="Detail">失败时给运行日志的原因（第几页、已读多少条、哪种异常），不含 Cookie 和链接；界面不显示。</param>
 public sealed record AccountShareSyncResult(
     AccountShareSyncDisposition Disposition,
-    string SafeMessage)
+    string SafeMessage,
+    string? Detail = null)
 {
     public override string ToString() => $"AccountShareSyncResult {{ Disposition = {Disposition} }}";
 }
@@ -35,6 +37,12 @@ public sealed class AccountShareAnalyticsSyncService(
     TimeProvider timeProvider) : IShareAnalyticsWorkspaceService
 {
     private const int MaximumPages = 10_000;
+    /// <summary>
+    /// 跨页重复的上限。百度按创建时间翻页，批量分享时很多条同一秒创建，排在页边界上的那几条
+    /// 前后两页可能各出现一次（实测 6,798 条里 907 条同秒、3 处跨页边界）。少量重复按同一条去重；
+    /// 多到一整页都是重复，说明翻页本身不对，仍然作废。
+    /// </summary>
+    private const int MaximumDuplicateItems = 100;
     private readonly IBaiduSessionStore sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
     private readonly IAccountShareAnalyticsClient client = client ?? throw new ArgumentNullException(nameof(client));
     private readonly IAccountShareAnalyticsRepository repository = repository ?? throw new ArgumentNullException(nameof(repository));
@@ -78,38 +86,49 @@ public sealed class AccountShareAnalyticsSyncService(
             var items = new List<AccountShareObservation>();
             var identities = new HashSet<string>(StringComparer.Ordinal);
             var continuations = new HashSet<string>(StringComparer.Ordinal);
+            var duplicates = 0;
             string? cursor = null;
             for (var pageNumber = 1; pageNumber <= MaximumPages; pageNumber++)
             {
                 var response = await client.ReadPageAsync(session, cursor, cancellationToken).ConfigureAwait(false);
-                if (!response.IsSuccess) return Result(Map(response.ErrorKind));
+                if (!response.IsSuccess)
+                    return Result(Map(response.ErrorKind),
+                        $"第 {pageNumber} 页读取失败（{response.ErrorKind}），之前已读 {items.Count} 条");
                 var page = response.Value!;
                 foreach (var item in page.Items)
                 {
-                    if (!identities.Add(item.ShareId)) return Result(AccountShareSyncDisposition.Unavailable);
+                    if (!identities.Add(item.ShareId))
+                    {
+                        if (++duplicates > MaximumDuplicateItems)
+                            return Result(AccountShareSyncDisposition.Unavailable,
+                                $"翻页重复超过 {MaximumDuplicateItems} 条（到第 {pageNumber} 页），之前已读 {items.Count} 条");
+                        continue;
+                    }
                     items.Add(item);
                 }
                 if (page.NextCursor is null)
                 {
                     var commit = new AccountShareSyncCommit(
                         accountId, generation, timeProvider.GetUtcNow(), items);
+                    // 有重复时，同一秒里可能有相同条数这次没读到（会暂时不显示），下次刷新通常能补上。
+                    var note = duplicates == 0 ? null : $"翻页时 {duplicates} 条分享前后两页重复出现，已按同一条计；可能有同样条数这次没读到";
                     return await repository.CommitCompleteSyncAsync(commit, cancellationToken).ConfigureAwait(false)
-                        ? Result(AccountShareSyncDisposition.Updated)
-                        : Result(AccountShareSyncDisposition.StaleResultIgnored);
+                        ? Result(AccountShareSyncDisposition.Updated, note)
+                        : Result(AccountShareSyncDisposition.StaleResultIgnored, note);
                 }
                 if (!continuations.Add(page.NextCursor))
-                    return Result(AccountShareSyncDisposition.Unavailable);
+                    return Result(AccountShareSyncDisposition.Unavailable, $"第 {pageNumber} 页的下一页游标重复");
                 cursor = page.NextCursor;
             }
-            return Result(AccountShareSyncDisposition.Unavailable);
+            return Result(AccountShareSyncDisposition.Unavailable, $"超过 {MaximumPages} 页上限");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch
+        catch (Exception error)
         {
-            return Result(AccountShareSyncDisposition.TemporarilyUnavailable);
+            return Result(AccountShareSyncDisposition.TemporarilyUnavailable, $"读取或保存时出错：{error.GetType().Name}");
         }
     }
 
@@ -121,7 +140,7 @@ public sealed class AccountShareAnalyticsSyncService(
         _ => AccountShareSyncDisposition.Unavailable,
     };
 
-    private static AccountShareSyncResult Result(AccountShareSyncDisposition disposition) =>
+    private static AccountShareSyncResult Result(AccountShareSyncDisposition disposition, string? detail = null) =>
         new(disposition, disposition switch
         {
             AccountShareSyncDisposition.Updated => "分享数据已更新。",
@@ -130,7 +149,7 @@ public sealed class AccountShareAnalyticsSyncService(
             AccountShareSyncDisposition.VerificationRequired => "请先完成百度安全验证。",
             AccountShareSyncDisposition.TemporarilyUnavailable => "分享数据获取失败，请稍后重试。",
             _ => "暂时无法读取分享数据。",
-        });
+        }, detail);
 
     private static void ValidateAccountId(Guid accountId)
     {
