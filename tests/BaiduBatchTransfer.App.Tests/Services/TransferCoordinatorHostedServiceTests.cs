@@ -3,6 +3,7 @@ using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Domain;
+using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.App.Tests.Services;
 
@@ -210,7 +211,8 @@ public sealed class TransferCoordinatorHostedServiceTests
     {
         var failure = new InvalidOperationException("corrupt scheduling invariant");
         var store = new ControllableAllocationStore { RecoveryFailure = failure };
-        var service = Service(store, new RecordingExecutor(), TimeSpan.FromMilliseconds(10));
+        var runLog = new RecordingRunLog();
+        var service = Service(store, new RecordingExecutor(), TimeSpan.FromMilliseconds(10), runLog: runLog);
 
         await service.StartAsync(CancellationToken.None);
         var observed = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
@@ -219,6 +221,35 @@ public sealed class TransferCoordinatorHostedServiceTests
 
         Assert.Same(failure, observed);
         Assert.Equal(1, store.RecoveryCount);
+        // 软件随后会关闭：原因必须留在运行日志里（用户 10-23 闪退时日志里什么都没有）。
+        var line = Assert.Single(runLog.Lines);
+        Assert.Contains("转存调度出错", line);
+        Assert.Contains("corrupt scheduling invariant", line);
+    }
+
+    [Fact]
+    public async Task ABusyDatabaseIsRetriedInsteadOfStoppingTheApplication()
+    {
+        // 用户 10-23：建几千条的批次或监控反馈同步时数据库被占住，调度器拿不到锁抛 SQLite 5，软件随即退出。
+        var store = new ControllableAllocationStore
+        {
+            TransientRecoveryFailure = new SqliteException("SQLite Error 5: 'database is locked'.", 5),
+            TransientRecoveryFailureCount = 3,
+        };
+        var runLog = new RecordingRunLog();
+        var service = Service(store, new RecordingExecutor(), TimeSpan.FromMilliseconds(10),
+            runLog: runLog, busyRetryDelay: TimeSpan.FromMilliseconds(10));
+
+        await service.StartAsync(CancellationToken.None);
+        await store.RecoveredAfterTransientFailures.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Delay(50);
+        await service.StopAsync(CancellationToken.None);
+
+        Assert.False(service.ExecuteTask!.IsFaulted);
+        Assert.True(store.RecoveryCount > 4);
+        Assert.Equal(2, runLog.Lines.Count);
+        Assert.Contains("数据库正被其他操作占用", runLog.Lines[0]);
+        Assert.Contains("期间等了 3 次", runLog.Lines[1]);
     }
 
     private static TransferCoordinatorHostedService Service(
@@ -229,7 +260,9 @@ public sealed class TransferCoordinatorHostedServiceTests
         IPendingTransferReconciliationSource? pendingTransfers = null,
         ITransferResultReconciler? reconciler = null,
         LicenseRuntimeAuthorizationState? authorizationState = null,
-        StuckBatchWatchdog? watchdog = null) => new(
+        StuckBatchWatchdog? watchdog = null,
+        IRunLog? runLog = null,
+        TimeSpan? busyRetryDelay = null) => new(
             new TransferCoordinator(
                 new AllocationTransactionService(store),
                 executor,
@@ -241,7 +274,17 @@ public sealed class TransferCoordinatorHostedServiceTests
             pendingTransfers,
             reconciler,
             authorizationState,
-            watchdog);
+            watchdog,
+            runLog,
+            busyRetryDelay);
+
+    private sealed class RecordingRunLog : IRunLog
+    {
+        private readonly object sync = new();
+        private readonly List<string> lines = [];
+        public IReadOnlyList<string> Lines { get { lock (sync) return lines.ToArray(); } }
+        public void Write(string source, string? message) { lock (sync) lines.Add($"[{source}] {message}"); }
+    }
 
     private sealed class RecordingPendingTransferSource : IPendingTransferReconciliationSource
     {
@@ -300,6 +343,9 @@ public sealed class TransferCoordinatorHostedServiceTests
         public int RecoveryCount { get; private set; }
         public bool BlockRecovery { get; init; }
         public Exception? RecoveryFailure { get; init; }
+        public Exception? TransientRecoveryFailure { get; init; }
+        public int TransientRecoveryFailureCount { get; init; }
+        public TaskCompletionSource RecoveredAfterTransientFailures { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool RecoveryCancellationObserved { get; private set; }
 
         public void QueueOne() => Volatile.Write(ref queued, 1);
@@ -311,6 +357,11 @@ public sealed class TransferCoordinatorHostedServiceTests
             RecoveryCount++;
             FirstRecovery.TrySetResult();
             if (RecoveryFailure is not null) throw RecoveryFailure;
+            if (TransientRecoveryFailure is not null)
+            {
+                if (RecoveryCount <= TransientRecoveryFailureCount) throw TransientRecoveryFailure;
+                RecoveredAfterTransientFailures.TrySetResult();
+            }
             if (BlockRecovery)
             {
                 try { await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken); }

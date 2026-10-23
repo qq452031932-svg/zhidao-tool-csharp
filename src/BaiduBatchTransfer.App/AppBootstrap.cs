@@ -143,7 +143,9 @@ public static class AppBootstrap
             Path.Combine(paths.RootDirectory, "collect", "paused-task.json")));
         services.AddSingleton<IZhidaoAccountStore>(_ => new DpapiZhidaoAccountStore(
             Path.Combine(paths.RootDirectory, "collect", "zhidao-accounts.dat")));
-        services.AddSingleton(_ => new SqliteConnectionFactory(paths.DatabasePath));
+        // 等锁 30 秒（原 5 秒）：用户 10-23 建几千条批次、监控反馈同步时一次写很多，在慢一些的电脑上
+        // 占写锁超过 5 秒，其他地方等不到就报「database is locked」。
+        services.AddSingleton(_ => new SqliteConnectionFactory(paths.DatabasePath, busyTimeoutMilliseconds: 30_000));
         services.AddSingleton<IUnitOfWorkFactory, SqliteUnitOfWorkFactory>();
         services.AddSingleton<SqliteAccountCapacityStore>();
         services.AddSingleton<IAccountCapacityStore>(sp =>
