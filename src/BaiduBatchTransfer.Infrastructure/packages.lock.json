@@ -87,7 +87,7 @@
       "baidubatchtransfer.application": {
         "type": "Project",
         "dependencies": {
-          "BaiduBatchTransfer.Core": "[1.1.14, )"
+          "BaiduBatchTransfer.Core": "[1.1.15, )"
         }
       },
       "baidubatchtransfer.core": {

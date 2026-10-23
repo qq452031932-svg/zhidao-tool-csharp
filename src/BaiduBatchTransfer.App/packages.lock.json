@@ -398,13 +398,13 @@
       "baidubatchtransfer.application": {
         "type": "Project",
         "dependencies": {
-          "BaiduBatchTransfer.Core": "[1.1.14, )"
+          "BaiduBatchTransfer.Core": "[1.1.15, )"
         }
       },
       "baidubatchtransfer.baiduadapter": {
         "type": "Project",
         "dependencies": {
-          "BaiduBatchTransfer.Core": "[1.1.14, )"
+          "BaiduBatchTransfer.Core": "[1.1.15, )"
         }
       },
       "baidubatchtransfer.core": {
@@ -413,8 +413,8 @@
       "baidubatchtransfer.infrastructure": {
         "type": "Project",
         "dependencies": {
-          "BaiduBatchTransfer.Application": "[1.1.14, )",
-          "BaiduBatchTransfer.Core": "[1.1.14, )",
+          "BaiduBatchTransfer.Application": "[1.1.15, )",
+          "BaiduBatchTransfer.Core": "[1.1.15, )",
           "DocumentFormat.OpenXml": "[3.5.1, )",
           "Microsoft.Data.Sqlite": "[10.0.11, )",
           "System.Security.Cryptography.ProtectedData": "[10.0.11, )"
