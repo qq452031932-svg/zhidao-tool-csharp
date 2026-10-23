@@ -14,6 +14,11 @@ public static class ApplicationChangelog
 {
     public static IReadOnlyList<ChangelogEntry> Entries { get; } =
     [
+        new("1.1.15", "2026-10-23",
+        [
+            "修复导入几千条链接建批次、或监控反馈同步分享较多的账号时，软件突然关闭（闪退）的问题",
+            "数据库暂时被占用时转存会自动稍等再继续，不再关闭软件；出错时原因会写进运行日志",
+        ]),
         new("1.1.14", "2026-10-17",
         [
             "运行日志改为保存在软件所在文件夹的 logs 里，打开软件目录就能找到；写不进去时会提醒并让你选择保存位置",
